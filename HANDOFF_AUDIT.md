@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT (pre-v2, 2026-06-26).** This file describes the v1 JSON-file orchestrator, which was replaced by the ERKG + pivot engine. Current architecture: [README.md](README.md) and [DSH_STATE.md](DSH_STATE.md).
+
 # HANDOFF_AUDIT.md — AI OS Autonomous Agent Runtime
 
 > **For:** new auditor with zero prior context.

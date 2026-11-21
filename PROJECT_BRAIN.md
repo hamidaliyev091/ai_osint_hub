@@ -1,3 +1,5 @@
+> **HISTORICAL DOCUMENT (pre-v2, 2026-06-26).** This file describes the v1 JSON-file orchestrator, which was replaced by the ERKG + pivot engine. Current architecture: [README.md](README.md) and [DSH_STATE.md](DSH_STATE.md).
+
 # PROJECT_BRAIN.md — AI OS Internal Knowledge Document
 
 > **Source of truth: code.** Architecture docs, plans, comments verified against code.
@@ -183,7 +185,7 @@ main()
 action_id: str              # "act_000" (index-based, unique within turn)
 tool: str                   # "holehe" | "h8mail" | "maigret" | "theHarvester" | "_hypothesis_expand"
 params: dict                # {"email": "x@y.com"} — ready to pass to runtime.execute()
-entity_target: str          # "email:hamid091@gmail.com" (node_id in graph)
+entity_target: str          # "email:analyst@example.com" (node_id in graph)
 entity_type: str            # "email" | "username" | "domain" | "hypothesis"
 entity_confidence: float    # 0.0–1.0
 expected_yield: str         # "15–25 services" (human-readable)
@@ -210,11 +212,11 @@ cost_factor: float             # min(1.0, 120 / max(60, timeout_s))
 
 ### Graph Node (graph/memory.py)
 ```
-node_id: str               # "email:hamid091@gmail.com" — deterministic from type+value
+node_id: str               # "email:analyst@example.com" — deterministic from type+value
 type: str                  # person | email | username | domain | ip | phone | service | breach | credential
 value: str                 # Canonical value (lowercase, stripped)
 confidence: float          # 0.0–1.0 (default 0.5)
-sources: list[str]         # ["raw_input"] | ["holehe:hamid091@gmail.com"] | ["hypothesis_generation"]
+sources: list[str]         # ["raw_input"] | ["holehe:analyst@example.com"] | ["hypothesis_generation"]
 first_seen: str            # ISO timestamp
 last_seen: str             # ISO timestamp
 metadata: dict             # {"registered": true, "url": "https://...", "username_hint": "..."}

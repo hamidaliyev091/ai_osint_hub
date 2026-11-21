@@ -1,0 +1,14 @@
+      _     _
+     | |___| |_ ___ _ __ ___
+  _  | |  _  |  _/ _ \ '__/ _ \
+ | |_| | | | | ||  __/ | |  __/
+  \___/|_| |_|\__\___|_|  \___|
+
+holehe v1.61 - check if an email is attached to an account on sites
+Email: alice@example.com
+
+[+] github.com
+[+] twitter.com
+[+] instagram.com
+[-] amazon.com
+[-] spotify.com

@@ -1,0 +1,7 @@
+Running scan for +14155552671
+[+] Phone number: +14155552671
+[+] Valid: true
+[+] Line type: mobile
+[+] Carrier: AT&T Mobility
+[+] Location: California, United States
+[+] VoIP: false

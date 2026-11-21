@@ -1,0 +1,2 @@
+http://example.com [200 OK] Country[US], HTTPServer[nginx/1.18.0], IP[93.184.216.34], JQuery[3.6.0], WordPress[6.2], X-Powered-By[PHP/8.1.2], Title[Example Domain]
+https://www.example.com/login [301 Moved Permanently] Country[US], HTTPServer[nginx/1.18.0], RedirectLocation[https://www.example.com/login/]

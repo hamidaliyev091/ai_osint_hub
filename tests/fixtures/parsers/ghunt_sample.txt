@@ -1,0 +1,12 @@
+{
+  "profile": {
+    "displayName": "Alice Example",
+    "google_id": "1234567890",
+    "profile_photo": "https://lh3.googleusercontent.com/a/photo.jpg"
+  },
+  "google_services": ["youtube", "maps", "photos"],
+  "urls": [
+    "https://www.youtube.com/@aliceexample",
+    "https://maps.google.com/?cid=1234567890"
+  ]
+}

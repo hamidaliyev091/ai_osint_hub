@@ -34,6 +34,30 @@ _SUFFIX_PATTERN = re.compile(r'\b(\d{2,4})\b')
 _EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
 _DOMAIN_RE = re.compile(r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b')
 _URL_RE = re.compile(r'https?://[^\s<>"]+')
+_PHONE_CANDIDATE_RE = re.compile(r'(?<![\w])\+?\d[\d\s().-]{6,}\d(?![\w])')
+
+
+def extract_phones(text: str) -> list[str]:
+    """Extract plausible phone numbers (E.164-ish) from arbitrary text.
+
+    Requires either an explicit ``+`` prefix with 8-15 digits or a bare number
+    with 10-15 digits, which avoids matching years, IDs and timestamps.
+    """
+    results: set[str] = set()
+    for match in _PHONE_CANDIDATE_RE.finditer(text or ""):
+        raw = match.group(0).strip()
+        digits = re.sub(r"\D", "", raw)
+        has_plus = raw.startswith("+")
+        if not ((has_plus and 8 <= len(digits) <= 15)
+                or (not has_plus and 10 <= len(digits) <= 15)):
+            continue
+        # Reject obvious dates (yyyy-mm-dd / dd-mm-yyyy) rather than phone-like
+        # groupings such as "(415) 555-2671".
+        if (re.fullmatch(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", raw)
+                or re.fullmatch(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", raw)):
+            continue
+        results.add(("+" if has_plus else "") + digits)
+    return sorted(results)
 
 
 def parse_raw_input(text: str) -> dict:
@@ -142,6 +166,7 @@ def parse_raw_input(text: str) -> dict:
         "associations": associations,
         "emails": emails,
         "domains": domains,
+        "phones": extract_phones(text),
         "usernames": bare_usernames,
         "raw_text": text,
     }

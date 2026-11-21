@@ -32,3 +32,6 @@ Thumbs.db
 # Local dev
 venv/
 .venv/
+.venv*/
+.toolhome/
+.tmp/

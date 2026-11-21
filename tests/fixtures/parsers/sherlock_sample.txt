@@ -1,0 +1,6 @@
+[*] Checking username alice on:
+[+] GitHub: https://github.com/alice
+[+] Twitter: https://twitter.com/alice
+[+] Reddit: https://www.reddit.com/user/alice
+[+] Instagram: https://www.instagram.com/alice/
+[*] Search completed

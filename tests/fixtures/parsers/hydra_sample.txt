@@ -1,0 +1,7 @@
+Hydra v9.5 (c) 2023 by van Hauser/THC
+Hydra starting at 2024-01-01 00:00:00
+[DATA] max 1 task per 1 server, overall 1 task, 2 login tries (l:2/p:2), ~1 try per task
+[DATA] attacking ssh://192.0.2.10:22/
+[22][ssh] host: 192.0.2.10   login: admin   password: s3cr3t
+[22][ssh] host: 192.0.2.10   login: root   password: toor
+1 of 1 target successfully completed, 2 valid passwords found

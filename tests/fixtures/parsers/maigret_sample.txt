@@ -1,0 +1,18 @@
+{
+  "alice": {
+    "GitHub": {
+      "status": {"status": "Claimed", "is_claimed": true},
+      "url_main": "https://github.com",
+      "url_user": "https://github.com/alice"
+    },
+    "Twitter": {
+      "status": {"status": "Claimed", "is_claimed": true},
+      "url_main": "https://twitter.com",
+      "url_user": "https://twitter.com/alice"
+    },
+    "Reddit": {
+      "status": {"status": "Not found", "is_claimed": false},
+      "url_main": "https://www.reddit.com"
+    }
+  }
+}

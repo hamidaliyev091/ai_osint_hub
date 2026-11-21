@@ -1,2 +1,12 @@
-httpx>=0.28.0
-rich>=13.0.0
+# Runtime dependencies
+pydantic>=2.5
+httpx>=0.28
+mcp>=1.0
+pyyaml>=6.0
+
+# Development / verification
+# pytest>=8.0
+
+# Web workbench
+fastapi>=0.110
+uvicorn>=0.30

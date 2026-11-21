@@ -161,3 +161,22 @@ class TestScoreConfidence:
     def test_CONFIDENCE_constants(self):
         assert CONFIDENCE["parsed_email"] == 0.85
         assert CONFIDENCE["generated_username"] == 0.30
+
+
+class TestExtractPhones:
+    def test_extracts_e164_phone(self):
+        from hub.cooking import extract_phones
+        assert extract_phones("call +14155552671 now") == ["+14155552671"]
+
+    def test_extracts_formatted_us_phone(self):
+        from hub.cooking import extract_phones
+        phones = extract_phones("call (415) 555-2671")
+        assert phones and phones[0].endswith("4155552671")
+
+    def test_rejects_dates_and_short_numbers(self):
+        from hub.cooking import extract_phones
+        assert extract_phones("on 2026-11-14 in room 12345") == []
+
+    def test_parse_raw_input_includes_phones(self):
+        result = parse_raw_input("target +14155552671 lives at example.com")
+        assert "+14155552671" in result["phones"]

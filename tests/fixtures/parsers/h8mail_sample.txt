@@ -1,0 +1,7 @@
+h8mail v2.6.6 - Email OSINT & Password breach hunting tool
+[>] Target: alice@example.com
+[>] Breach: LinkedIn (2012) - passwords
+[>] Breach: Adobe (2013) - email, password hash
+[>] Breach: Collection #1 - email, password
+[>] Related account: bob@example.com
+[>] Found 3 breached accounts for alice@example.com

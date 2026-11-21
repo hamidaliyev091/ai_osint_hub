@@ -1,0 +1,26 @@
+*******************************************************************
+*  theHarvester 4.6.0                                             *
+*******************************************************************
+
+[*] Target: example.com
+
+[*] Emails found: 3
+----------------------
+alice@example.com
+bob@example.com
+info@example.com
+
+[*] Hosts found: 3
+-------------------
+www.example.com:93.184.216.34
+mail.example.com:93.184.216.35
+vpn.example.com
+
+[*] IPs found: 2
+----------------
+93.184.216.34
+93.184.216.35
+
+[*] URLs found: 1
+-----------------
+https://www.example.com/login
