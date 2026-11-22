@@ -3,8 +3,11 @@
 import asyncio
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -175,34 +178,95 @@ class TestMcp:
         """Real MCP protocol: initialize + tools/list over stdio, then EOF."""
         home = tmp_path / "mcp_proto_home"
         home.mkdir()
+        stderr_log = tmp_path / "mcp_stderr.log"
         env = dict(os.environ,
                    AI_OSINT_HUB_HOME=str(home),
-                   PYTHONIOENCODING="utf-8")
-        messages = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                        "clientInfo": {"name": "pytest", "version": "0.0.1"}}},
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        ]
-        payload = "".join(json.dumps(message) + "\n" for message in messages)
-        process = subprocess.run(
-            [sys.executable, "-m", "hub.mcp_server"], cwd=str(REPO_ROOT), env=env,
-            input=payload, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=120,
-        )
-        assert process.returncode == 0, process.stderr
-        responses = {}
-        for line in (process.stdout or "").splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
+                   PYTHONIOENCODING="utf-8",
+                   PYTHONUNBUFFERED="1")
+        responses: dict = {}
+        line_queue: queue.Queue[str | None] = queue.Queue()
+
+        def _send(proc: subprocess.Popen[str], message: dict) -> None:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+
+        def _wait_for_id(expected_id: int, timeout: float = 60.0) -> dict:
+            deadline = time.monotonic() + timeout
+            while expected_id not in responses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"Timed out waiting for id={expected_id}; got={list(responses)}; "
+                        f"stderr={stderr_log.read_text(encoding='utf-8', errors='replace')}"
+                    )
+                line = line_queue.get(timeout=remaining)
+                if line is None:
+                    raise AssertionError(
+                        f"MCP stdout closed before id={expected_id}; got={list(responses)}; "
+                        f"stderr={stderr_log.read_text(encoding='utf-8', errors='replace')}"
+                    )
+                stripped = line.strip()
+                if not stripped.startswith("{"):
+                    continue
+                try:
+                    msg = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if "id" in msg:
+                    responses[msg["id"]] = msg
+            return responses[expected_id]
+
+        with stderr_log.open("w", encoding="utf-8") as stderr_fh:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "hub.mcp_server"],
+                cwd=str(REPO_ROOT), env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_fh,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+            reader = None
             try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "id" in message:
-                responses[message["id"]] = message
+                def _read_stdout() -> None:
+                    try:
+                        assert process.stdout is not None
+                        for raw_line in process.stdout:
+                            line_queue.put(raw_line)
+                    finally:
+                        line_queue.put(None)
+
+                reader = threading.Thread(target=_read_stdout, daemon=True)
+                reader.start()
+
+                _send(process, {
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                               "clientInfo": {"name": "pytest", "version": "0.0.1"}},
+                })
+                _wait_for_id(1)
+                _send(process, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+                _send(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                _wait_for_id(2)
+
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+                process.wait(timeout=30)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+                if process.stdout and not process.stdout.closed:
+                    process.stdout.close()
+                if reader is not None:
+                    reader.join(timeout=5)
+
+        stderr_text = stderr_log.read_text(encoding="utf-8", errors="replace")
+        assert process.returncode == 0, stderr_text
         assert responses[1]["result"]["serverInfo"]["name"] == "AI OSINT Hub"
         names = {tool["name"] for tool in responses[2]["result"]["tools"]}
         assert {"investigate", "step", "status", "graph", "tools", "report"} <= names
