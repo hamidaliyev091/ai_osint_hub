@@ -189,10 +189,11 @@ class TestDiskCache:
 
 class TestChildEnv:
     def test_managed_dirs_prepended_to_path(self, isolated_locator):
-        env = locator.enrich_child_env({"PATH": "C:\\existing"})
+        existing = "C:\\existing" if os.name == "nt" else "/existing"
+        env = locator.enrich_child_env({"PATH": existing})
         parts = env["PATH"].split(os.pathsep)
         assert parts[0] == str(isolated_locator["home_bin"])
-        assert parts[-1] == "C:\\existing"
+        assert parts[-1] == existing
 
     def test_resolved_env_merged(self, isolated_locator):
         resolved = locator.ResolvedTool(

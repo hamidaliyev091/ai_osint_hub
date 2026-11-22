@@ -19,15 +19,17 @@ def isolated_layout(tmp_path, monkeypatch):
     bin_dir = tmp_path / "home" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv(locator.MANAGED_BIN_ENV, str(bin_dir))
-    monkeypatch.setenv(locator.MANAGED_VENV_ENV, str(tmp_path / "repo" / ".venv" / "Scripts"))
+    monkeypatch.setenv(locator.MANAGED_VENV_ENV,
+                       str(tmp_path / "repo" / ".venv" / ("Scripts" if os.name == "nt" else "bin")))
     monkeypatch.setattr(locator, "repo_root", lambda: tmp_path / "repo")
     locator.reset_cache()
     yield {"bin": bin_dir, "repo": tmp_path / "repo", "tmp": tmp_path}
     locator.reset_cache()
 
 
-def _venv_python(repo: Path) -> Path:
-    return repo / ".venv" / "Scripts" / "python.exe"
+def _venv_python(repo: Path, venv_name: str = ".venv") -> Path:
+    return repo / venv_name / ("Scripts" if os.name == "nt" else "bin") / (
+        "python.exe" if os.name == "nt" else "python")
 
 
 class TestVenv:
@@ -48,7 +50,7 @@ class TestVenv:
 
         monkeypatch.setattr(provision, "_run", fake_run)
         monkeypatch.setattr(provision, "UV", "uv")
-        python = isolated_layout["repo"] / ".venv314" / "Scripts" / "python.exe"
+        python = _venv_python(isolated_layout["repo"], ".venv314")
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_text("fake", encoding="utf-8")
         path, detail = provision.ensure_managed_venv("3.14")

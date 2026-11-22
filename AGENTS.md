@@ -253,6 +253,8 @@ repo. Tests use `tmp_path`/`AI_OSINT_HUB_HOME` fixtures.
   restore Medium integrity via `icacls .\.venv /setintegritylevel "(OI)(CI)M" /T /C /Q`.
 * `.github/workflows/ci.yml` runs the offline `pytest -q` matrix on
   `ubuntu-latest` and `windows-latest` for Python `3.11` and `3.13`.
+* `pyproject.toml` pins `mcp>=1.0,<2` because `hub/mcp_server.py` uses the
+  v1 `mcp.server.fastmcp.FastMCP` API (removed in `mcp 2.x`).
 
 ## File layout quick map
 

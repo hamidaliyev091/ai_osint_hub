@@ -495,6 +495,8 @@ def _resolve_wsl(tool_id: str, binary: str) -> Optional[ResolvedTool]:
 # ════════════════════════════════════════════════════════════════════════
 
 def _windows_executable_names(binary: str) -> list[str]:
+    if os.name != "nt":
+        return [binary]
     suffixes = [""] if Path(binary).suffix else [".exe", ".com", ".cmd", ".bat"]
     return [binary + suffix for suffix in suffixes]
 
