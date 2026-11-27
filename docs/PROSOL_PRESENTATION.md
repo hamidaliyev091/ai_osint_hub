@@ -1,256 +1,163 @@
-# AI OSINT Hub: Enterprise-Grade Autonomous OSINT & Threat Attribution Engine
-**Technical Architecture & Candidate Presentation for PROSOL**
-**Presenter:** Hamid Aliyev
-**Target Role:** Cyber Threat Intelligence (CTI) / Security Automation / OSINT Analyst
+# AI OSINT Hub v2.1 — Evidence-Backed OSINT & Attribution Workbench
+
+**Technical Architecture & Live Demo Presentation for PROSOL QSC**
+- **Candidate:** Hamid Aliyev
+- **Target Teams:** Cyber Threat Intelligence (CTI) · 24/7 SOC & DFIR · Red Team Reconnaissance · Security Engineering
+- **Repository & Release:** `github.com/hamidaliyev091/ai_osint_hub` (`v2.1.0` · 745 offline tests · 7/7 CI jobs passing)
+- **Deck Formats in `docs/`:**
+  - Interactive 16:9 Web Deck: `docs/PROSOL_PRESENTATION.html`
+  - Editable PowerPoint (16:9 `.pptx` with Speaker Notes): `docs/PROSOL_Presentation_Hamid_Aliyev.pptx`
+  - Print-Ready 16:9 PDF Slides: `docs/PROSOL_Presentation_Hamid_Aliyev.pdf`
 
 ---
 
-> [!IMPORTANT]
-> **Executive Summary for PROSOL Evaluators**
-> AI OSINT Hub is a hardened, production-grade intelligence gathering and entity-resolution platform (v2.1.0). Unlike brittle OSINT scripts or hallucination-prone "AI wrappers", it operates on a **zero-LLM deterministic core** backed by SQLite Write-Ahead Logging (WAL), mathematical epistemic confidence scoring, code-enforced defensive security boundaries (SSRF protection, non-intrusive policy gating), and automated visual forensics (EXIF, GPS, 64-bit perceptual hashing).
+## Slide 1 — Executive Hook: Real OSINT Without Noise or Hallucinations
+
+**AI OSINT Hub v2.1** is an autonomous, offline-capable OSINT collection, Entity-Resolved Knowledge Graph (ERKG), visual forensics, and reporting workbench built on a **deterministic zero-LLM core**.
+
+- **32 Hardened Capabilities:** 15 Python-native passive collectors, 4 credentialed APIs, 7 managed OSINT CLIs, 5 active/auth-gated tools, and 1 policy-blocked intrusive capability (`hydra`).
+- **Cryptographic Provenance:** Every non-hypothesis claim cites an immutable `EvidenceArtifact` (`SHA-256` raw output digest + tool provenance) persisted in atomic SQLite WAL transactions.
+- **SSRF-Safe Visual Forensics:** Automatically harvests public avatars, Gravatar `d=404` probes, `og:image` tags, and favicons; extracts EXIF/GPS and correlates reused photos via 64-bit `dHash`/`pHash`.
+- **Analyst-First Workbench (`1280×800` to 4K):** 4 themes (`Clean Light`, `Warm Paper`, `Midnight Slate`, `Gruvbox Dark`), `Overview`, `Visuals & Photos`, `Graph`, `Timeline`, and `Dossier` tabs, plus CLI & Stdio MCP parity.
 
 ---
 
-## Slide 1: Title & Executive Overview
+## Slide 2 — The Operational Problem in CTI & SOC Investigations
 
-### The Vision: Recruiter-Grade OSINT Automation
-* **Project:** AI OSINT Hub (v2.1.0)
-* **Candidate:** Hamid Aliyev
-* **Target:** PROSOL — Cyber Threat Intelligence, Incident Response & SOC Operations
-* **Repository:** [github.com/hamidaliyev091/ai_osint_hub](https://github.com/hamidaliyev091/ai_osint_hub)
-* **Core Philosophy:** *Zero bloat, deterministic ground truth, strict defensive boundaries, and intelligence that analysts can trust in court and client briefs.*
-
-```
-+----------------------------------------------------------------------------------+
-|                            AI OSINT HUB v2.1.0                                   |
-|   32 Integrated Tools | Closed 6-State Epistemics | Automated Visual Forensics   |
-|   SSRF & Policy Gated | SQLite WAL Transactional  | 4 Enterprise Themes          |
-+----------------------------------------------------------------------------------+
-```
-
-> **Speaker Notes:**
-> *"Good morning / afternoon members of the PROSOL team. Today I am presenting AI OSINT Hub — an autonomous intelligence collection and threat attribution workbench that I engineered to solve the most painful operational bottlenecks in modern threat intelligence, investigation, and incident response."*
+| Common Failure Mode | What Goes Wrong in Practice | How AI OSINT Hub v2.1 Solves It |
+|---|---|---|
+| **1. Fragmented CLI Sprawl & False Positives** | Running 15 separate tools dumps unlinked JSON, generic `/members` URL false positives, bot committers (`web-flow`), and split duplicate `person` records. | Single-subject ERKG merges verified handles/emails (`_unify_duplicate_persons`), filters generic paths & bots, and treats `HAS_EMAIL` as multi-valued. |
+| **2. Hallucinating "AI Wrappers"** | Piping raw scrapes into an LLM invents accounts, IPs, and ownership claims with zero chain of custody — unusable in forensic or client reports. | Zero-LLM deterministic core (`enabled=False` default). Optional AI insights are quarantined and capped (`AI_INFERRED`, `direct=False`). |
+| **3. Recon OPSEC, SSRF & Scope Drift** | Naive scrapers follow redirects to `127.0.0.1` / `169.254.169.254`, leak API keys in stdout logs, or run intrusive tools out of scope. | Pre-spawn `check_capability`, redirect-aware `assert_safe_host` SSRF guard, vault secret redaction, and `hydra` locked as `INTRUSIVE_BLOCKED`. |
 
 ---
 
-## Slide 2: The Core Problem in Modern Threat Intelligence
+## Slide 3 — 5-Stage Deterministic System Architecture
 
-### Operational Bottlenecks in Today's SOC & CTI Teams:
-1. **Tool Fragmentation & Chaos:**
-   Analysts juggle 10–20 standalone CLI tools (`theHarvester`, `holehe`, `sherlock`, `maigret`, `shodan`, `whois`), manually scraping terminals, copying hashes, and stitching notes into spreadsheets.
-2. **"AI Wrapper" Hallucination Risk:**
-   Tools that blindly pipe raw internet text into generative LLMs introduce catastrophic false positives, hallucinations, and unbacked claims that cannot stand up in forensic reports or customer briefings.
-3. **Noisy False Positives & Synthetic Accounts:**
-   Generic paths (`/members`, `/login`) and bot committers (`web-flow`, `dependabot[bot]`) contaminate identity clusters.
-4. **Defensive Hazards & Operational Security (OPSEC):**
-   Uncontrolled crawling triggers Server-Side Request Forgery (SSRF), internal network scanning, or accidental intrusive probes that violate engagement scope.
-
----
-
-## Slide 3: System Architecture — 5-Layer Deterministic Pipeline
-
-AI OSINT Hub enforces a strict unidirectional pipeline where **claims cannot exist without cryptographic evidence**.
-
-```
-+-----------------------------------------------------------------------------+
-| 1. MULTI-CLUE INTAKE                                                        |
-|    Names, Handles, Emails, Domains, IPs, Visuals (Transliteration Aware)    |
-+-----------------------------------------------------------------------------+
-                                      |
-                                      v
-+-----------------------------------------------------------------------------+
-| 2. POLICY & SCOPE GATE                                                      |
-|    SSRF Guard (assert_safe_host) | Active Recon Policy | Hydra Auto-Block   |
-+-----------------------------------------------------------------------------+
-                                      |
-                                      v
-+-----------------------------------------------------------------------------+
-| 3. HARDENED TOOLCHAIN RUNTIME (32 Tools)                                    |
-|    Native HTTP (crt.sh, RDAP, BGP) | APIs | Managed CLIs | WSL2 Bridge      |
-+-----------------------------------------------------------------------------+
-                                      |
-                                      v
-+-----------------------------------------------------------------------------+
-| 4. EVIDENCE INGESTOR & ERKG STORE                                           |
-|    SHA-256 Artifacts | SQLite WAL | Closed 6-State Epistemics | Unification |
-+-----------------------------------------------------------------------------+
-                                      |
-                                      v
-+-----------------------------------------------------------------------------+
-| 5. PARITY PRESENTATION INTERFACES                                           |
-|    FastAPI Web Workbench (4 Themes) | FastMCP Stdio | Headless CLI | Dossier|
-+-----------------------------------------------------------------------------+
+```mermaid
+flowchart LR
+    Intake["1. Multi-Clue Intake\nUSER_PROVIDED_SEED\nBounded Permutations"] --> Policy["2. Policy & SSRF Gate\nallow_domains · Active=False\nHydra INTRUSIVE_BLOCKED"]
+    Policy --> Runtime["3. 32-Tool Runtime\nshell=False · stdin=DEVNULL\nWSL2 --exec · 24h Cooldown"]
+    Runtime --> Parsers["Deterministic Parsers\n+ Visual Harvester\n(5 MB · Pillow · pHash/EXIF)"]
+    Parsers --> ERKG["4. SQLite WAL ERKG\nSHA-256 Artifacts\n6-State Epistemics"]
+    ERKG --> Interfaces["5. Parity Interfaces\n4-Theme Web · CLI · MCP\nHTML/PDF & .osintcase.zip"]
+    ERKG -.->|"Opt-In & Quarantined"| AI["Optional AI Layer\nOff | ONNX | Ollama | Cloud"]
 ```
 
----
-
-## Slide 4: Epistemic Truth Model & Entity Resolution
-
-### The Closed 6-State Epistemic Enum (`hub.models.EpistemicStatus`)
-Every claim in the Entity-Relationship Knowledge Graph (ERKG) is strictly classified into one of six states:
-
-| Epistemic Status | Operational Definition | Mathematical Criteria |
-| :--- | :--- | :--- |
-| `CONFIRMED` | Indisputable ground truth | Verified primary seed or multi-source cryptographically corroborated evidence. |
-| `CORROBORATED` | High confidence | $\ge 2$ independent tool collectors confirming the exact same predicate and object. |
-| `SINGLE_SOURCE_LEAD` | Uncorroborated lead | 1 external tool output; flagged for analyst verification before citing. |
-| `HYPOTHESIS` | Planner candidate | Generated via structured transliteration / permutations; strictly bounded (confidence $\le 0.35$). |
-| `CONTRADICTED` | Mutually exclusive conflict | A functional predicate received conflicting verified claims; alerts analyst immediately. |
-| `COLLECTION_FAILURE` | Audit record | Tool crashed, timed out, or hit rate limit; recorded in execution ledger to prevent repeat failure. |
-
-### Key Resolution Improvements in v2.1.0:
-* **Multi-Valued `HAS_EMAIL`:** Legitimate targets have multiple personal and corporate emails. `HAS_EMAIL` is non-functional; multiple emails enrich the profile without triggering false contradictions.
-* **Automated Person Unification (`_unify_duplicate_persons`):** When seed clues and discovered accounts share verified unique handles or non-role emails, duplicate `PERSON` entities automatically merge into a single identity card.
-* **Provider Infrastructure Tagging:** Freemail domains (`gmail.com`, `mail.ru`) and synthetic addresses (`*@users.noreply.github.com`) are tagged as infrastructure, preventing fake domain ownership claims.
+- **One Iteration = One Atomic SQLite Transaction:** Artifacts, claims, contradictions, execution ledger entries, hypotheses, and iteration telemetry commit together or roll back cleanly.
+- **Duplicate-Run Ledger Guard:** `try_claim_execution` + `param_hash` guarantees the engine never re-runs identical tool invocations or double-counts a single source as corroboration.
 
 ---
 
-## Slide 5: Defensive Security & Sandboxing (Zero Host Risk)
+## Slide 4 — Epistemic Truth Model & v2.1 Accuracy Engineering
 
-Designed with enterprise security postures appropriate for PROSOL's high-security environments:
+### Closed 6-State `EpistemicStatus` (`hub/erkg/confidence.py`)
 
-1. **Pre-Spawn SSRF & Host Validation (`assert_safe_host`):**
-   * Rejects loopback (`127.0.0.0/8`, `::1`), private RFC 1918 subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and AWS/cloud link-local metadata endpoints (`169.254.169.254`).
-   * Enforces manual redirect loops with re-validation on every hop to eliminate redirect SSRF bypasses.
-2. **Non-Intrusive Policy Guard (`INTRUSIVE_BLOCKED`):**
-   * Brute-force and intrusive attack tools (e.g. `hydra`) are strictly policy-blocked (`policy_blocked=True`). They display honestly as `BLOCKED` in UI and tool diagnostics, never spawning unmonitored attacks.
-3. **Shell-Free Subprocess Execution:**
-   * Every CLI tool is spawned with `shell=False` and `stdin=DEVNULL`. Shell injection is architecturally impossible.
-4. **Quarantine & Anti-Prompt-Injection:**
-   * External OSINT data is sanitized and wrapped in protective boundaries (`<untrusted_osint_data>` and `<untrusted_visual_data>`) before reaching any optional AI reflection layer.
+| Status | Deterministic Rule | Confidence Formula / Cap |
+|---|---|---|
+| `CONFIRMED` | `>= 2` independent direct `source_tool`s and confidence `>= 0.90` (or primary user seed) | `0.90 – 0.99` |
+| `CORROBORATED` | `>= 2` independent `source_tool`s (`0.85 + 0.05*(n-2) + 0.15*(avg_rel-0.5)`) | `0.85 – 0.99` |
+| `SINGLE_SOURCE_LEAD` | Exactly `1` external tool (`min(0.65, 0.10 + 0.60 * reliability)`) | `<= 0.65` |
+| `HYPOTHESIS` | Planner/intake candidate (e.g., transliterated handle, max 6 handles / 4 emails) | `<= 0.35` (cap `0.40`) |
+| `CONTRADICTED` | Conflicting values on a **functional** predicate (`HAS_PHONE`, `HAS_ATTRIBUTE:timezone`) | `0.30` (flagged for review) |
+| `COLLECTION_FAILURE` | Timeout, missing binary, auth gap, or rate-limit recorded in execution ledger | `0.00` |
 
----
-
-## Slide 6: Visual Forensics & Cross-Platform Avatar Correlation
-
-A standout capability in v2.1.0: **Automated Visual Intelligence Gathering**.
-
-```
-+-----------------------------------------------------------------------------------+
-|  Target Input: "Aurora Vance" / "aurora_vance_sec" / "aurora@aurora-defense.az"   |
-+-----------------------------------------------------------------------------------+
-                                   |
-         +-------------------------+-------------------------+
-         |                                                   |
-         v                                                   v
- [GitHub Collector]                                 [Gravatar Collector]
-  avatar_url: avatars.githubusercontent.com/...       avatar_url: gravatar.com/avatar/...
-         |                                                   |
-         +-------------------------+-------------------------+
-                                   |
-                                   v
-             [Visual Harvester (SSRF-Safe, Max 5MB, MIME)]
-                                   |
-                                   v
-               [64-Bit Perceptual Hashing (dHash + pHash)]
-                                   |
-             * GitHub Avatar pHash:   0x8f7e3c1a9b2d4e6f
-             * Gravatar Avatar pHash: 0x8f7e3c1a9b2d4e6f
-             * Hamming Distance: 0 (Exact Visual Match)
-                                   |
-                                   v
-       [Automatic Identity Link: Same Individual Across Disparate Networks]
-```
-
-### Visual Intelligence Features:
-* **Passive Avatar Discovery:** Automatically extracts profile photos from GitHub profiles, Gravatar hashes (`d=404` validation), and social OpenGraph tags (`og:image`, `twitter:image`).
-* **EXIF & Geolocation Extraction:** Strips and parses camera models, software tags, and GPS coordinates if present.
-* **Perceptual Hashing Matching:** Flags matching avatars across accounts even if images were resized, recompressed, or stripped of metadata by social platforms.
-* **Analyst File Upload:** 1-click drag-and-drop forensics for local evidence photos.
+### Real-World Precision Fixes Shipped in v2.1:
+1. **Multi-Valued `HAS_EMAIL` & `LOCATED_IN`:** Work, personal, and GitHub commit emails coexist without fake contradictions; city + country claims stay complementary.
+2. **Automatic Person Unification:** Seed `Elena Vance` and GitHub profile `evance-sec` unify into one subject card when linked by a verified handle or non-role email.
+3. **Provider Infrastructure Separation:** `gmail.com`, `outlook.com`, and `*@users.noreply.github.com` carry `provider_infrastructure=True` so freemail providers are never misreported as target-owned domains.
+4. **Noise Suppression:** Rejects Sherlock/Maigret generic URL paths (`/members`, `/profile`, `/login`) and filters GitHub system bots (`web-flow`, `dependabot[bot]`, `github-actions[bot]`).
 
 ---
 
-## Slide 7: 32-Tool Enterprise Toolchain Matrix
+## Slide 5 — Workbench Tour I: Subject Overview & Visual Forensics
 
-AI OSINT Hub incorporates 32 specialized reconnaissance capabilities across four execution tiers:
+| **Subject Overview (`docs/assets/workbench-overview.png`)** | **Visuals & Photos (`docs/assets/workbench-visuals.png`)** |
+| :---: | :---: |
+| ![Overview](assets/workbench-overview.png) | ![Visuals](assets/workbench-visuals.png) |
 
-* **1. Python-Native Passive Collectors (Zero External Binary Dependencies):**
-  `dns_lookup`, `virustotal_lookup`, `tls_cert`, `rdap_lookup`, `crtsh_lookup`, `asn_bgp_lookup`, `favicon_hash`, `media_forensics`, `photon_crawler`, `wayback_machine`, `gravatar_probe`, `openpgp_search`, `ahmia_search`.
-* **2. Authenticated Intelligence APIs (Safe Key Vault + Auto Redaction):**
-  `shodan_lookup`, `censys_lookup`, `github_osint`.
-* **3. Managed OSINT CLIs (Isolated Sandboxed Virtual Environments):**
-  `theharvester`, `holehe`, `sherlock`, `maigret`, `phoneinfoga`, `ghunt`, `h8mail`.
-* **4. System & Network Reconnaissance (Direct Windows or Seamless WSL2 Bridge):**
-  `whois`, `dig`, `nmap` (passive), `traceroute`, `snscrape`.
+Shown on deterministic synthetic case **`case_demo_aurora`** (*Aurora Meridian Supply-Chain Attribution*):
+- **Unified Subject Card:** `Elena Vance` (`CONFIRMED`, `conf 0.95`, `Toronto, CA`) with `17 entities · 38 claims · 12 artifacts · 1 contradiction · 3 visuals`.
+- **Actionable Alerts:** Automatically surfaces both the **Timezone Contradiction** (`UTC-05:00 Toronto` on GitHub vs `UTC+00:00 Reykjavik` on OpenPGP) and the **Cross-Platform Visual Match**.
+- **64-Bit Perceptual Hashing (`pHash` / `dHash`):** Links `aurora_github.png` and `aurora_gravatar.png` at **`pHash 100%`** (`a8f3c19e4b2d7055`) even though their SHA-256 digests and EXIF `Software` headers differ (`GIMP 2.10` vs `Gravatar Mirror Cache`).
 
 ---
 
-## Slide 8: Enterprise Workbench UI & Cross-Screen Design
+## Slide 6 — Workbench Tour II: ERKG Graph, 4 Themes & Client Dossier
 
-Engineered for SOC analyst ergonomics across **13" field laptops, 1080p desktop stations, and ultrawide command centers**:
+| **Cytoscape `cose` Graph (`docs/assets/workbench-graph.png`)** | **Evidence-Cited Dossier (`docs/assets/workbench-dossier.png`)** |
+| :---: | :---: |
+| ![Graph](assets/workbench-graph.png) | ![Dossier](assets/workbench-dossier.png) |
 
-* **Clean Layout:** Cases rail on the left with 1-click case creation and instant tool diagnostics.
-* **Overview Tab First:** Verified Accounts card, discovered email addresses, domains, and repositories displayed immediately.
-* **Visuals & Photos Gallery:** Responsive photo grid showing source platform, image dimensions, EXIF status, and perceptual similarity matches.
-* **Interactive Correlation Graph:** Cytoscape `cose` force-directed graph with solid matte label pills and auto-selected subject inspector.
-* **4 Instant Themes:**
-  1. **Clean Light (Default):** Crisp linear white/slate for high visibility.
-  2. **Warm Paper:** Soft parchment tones for reduced eye strain.
-  3. **Midnight Slate:** Low-light dark mode for 24/7 SOC environments.
-  4. **Gruvbox Dark:** High-contrast terminal styling.
+- **Readable Knowledge Graph:** Tuned force-directed `cose` layout with matte label pills (zero text collision), entity-type filter chips, `Shortest Path` tracer, and right-hand **Artifact Inspector** showing raw `SHA-256` (`51b1ddd2000bd174...`) and tool output snippets.
+- **4 Enterprise Themes (`1280×800` Laptops to Ultrawides):** `Clean Light` (default executive slate/white), `Warm Paper`, `Midnight Slate` (24/7 SOC dark), and `Gruvbox Dark`.
+- **Portable Deliverables:** One-click Markdown, JSON, print-ready HTML/PDF dossiers, and cryptographically verified `.osintcase.zip` case bundles (`--redact-pii` supported).
 
 ---
 
-## Slide 9: Pragmatic, Local-First AI Integration
+## Slide 7 — 32-Tool Capability Matrix & Cross-Platform Runtime
 
-* **Zero-LLM Core by Default:** Complete intelligence collection, entity resolution, and confidence math run deterministically without cloud or GPU costs.
-* **Optional Built-in `[local-ai]` (ONNX Runtime):**
-  * Powered by `fastembed` — zero daemons, zero external processes, zero GPU required.
-  * Provides offline semantic alias matching and CLIP cross-modal visual search.
-* **BYOK Support for Cloud & Local LLMs:**
-  * Clean support for Ollama, LM Studio, Google Gemini, DeepSeek, and OpenAI-compatible endpoints.
-* **Analyst Safety Guarantee:**
-  * Any AI output is tagged `AI_INFERRED` with confidence capped at $\le 0.35$ (text) or $\le 0.45$ (visuals). AI never overrides verified evidence.
+| Tier | Count | Capabilities (`hub/tools/capabilities.py`) |
+|---|:---:|---|
+| **Python-Native Passive** | **15** | `dns_lookup`, `http_headers`, `tls_cert`, `crtsh_lookup`, `asn_bgp_lookup`, `favicon_hash`, `media_forensics`, `photon_crawler`, `github_osint`, `gravatar_lookup`, `pgp_keyserver`, `rdap_lookup`, `wayback_cdx`, `darkweb_ahmia`, `snscrape` |
+| **Credentialed APIs** | **4** | `virustotal_lookup`, `shodan_lookup`, `censys_lookup` (Platform v3), `hunter_lookup` |
+| **Managed Passive CLIs** | **7** | `theharvester`, `sherlock`, `maigret`, `holehe`, `phoneinfoga`, `ghunt`, `h8mail` |
+| **Active / Auth-Gated** | **5** | `nmap`, `amass`, `gobuster`, `whatweb`, `hashcat` *(disabled unless `allow_active_recon=True`)* |
+| **Intrusive Blocked** | **1** | `hydra` *(`INTRUSIVE_BLOCKED` — `policy_blocked=True`, surfaced honestly as `BLOCKED`)* |
+
+- **Deterministic Locator (`hub/tools/locator.py`):** Resolves managed launchers → `~/.ai_osint_hub/bin` → `.venv*` entry-points (bypassing Windows `0xC0000142` trampolines) → host `PATH` → shell-free `wsl.exe -d Ubuntu --exec`.
+- **Resilience:** 24-hour provider rate-limit cooldown cache (`rate_limit_cache.json`) prevents wasting pivots on throttled APIs.
 
 ---
 
-## Slide 10: Live Demonstration Walkthrough Script (5 Minutes)
+## Slide 8 — Code-Enforced Security & Adversarial Hardening
+
+1. **Zero-Shell Subprocess Isolation (`hub/tools/runtime.py`):** `asyncio.create_subprocess_exec(*argv, stdin=DEVNULL)` (`shell=False`), scrubbed env allowlist, `.toolhome` sandbox redirection, and hard process-tree kill on timeout (`taskkill /F /T` / `os.killpg`).
+2. **Redirect-Aware SSRF Protection (`hub/tools/builtin/_http.py`):** Pre-connect DNS A/AAAA resolution + manual redirect re-validation blocks loopback (`127.0.0.0/8`, `::1`), RFC 1918 private networks, and cloud metadata (`169.254.169.254`).
+3. **Media & UI XSS Hardening (`visual_harvester.py`, `web.py`):** `<= 5 MB` stream cap, Pillow image decode verification, strict rejection of SVG/HTML active content, `X-Content-Type-Options: nosniff`, `http:/https:/mailto:` link allowlist, and **zero `innerHTML` / `eval`**.
+4. **Prompt-Injection Quarantine & Bundle Safety (`quarantine.py`, `bundle.py`):** External text/EXIF sanitized inside `<untrusted_osint_data>` / `<untrusted_visual_data>`; `.osintcase.zip` enforces Zip-Slip, symlink, compression-ratio, SHA-256 manifest, and SQLite `PRAGMA trusted_schema = OFF` + `integrity_check`.
+
+---
+
+## Slide 9 — Simple, Honest AI: 4 Clear Modes, Zero Knob Bloat
+
+| AI Mode | Runtime Dependency | Operational Role | Epistemic Guardrail |
+|---|---|---|---|
+| **1. Off (Default)** | **None** | Full deterministic OSINT engine, ERKG unification, EXIF + 64-bit `pHash`/`dHash` clustering | Deterministic ground truth |
+| **2. Built-in Local AI** | `.[local-ai]` (`fastembed` ONNX) | Offline semantic bio/alias embeddings (`bge-small-en-v1.5`) + CLIP image similarity — **no Ollama or GPU required** | `AI_INFERRED` (`<= 0.45`) |
+| **3. Local Ollama / LM Studio** | Local daemon (`gemma4`, `qwen2.5vl`) | Private on-premise case reflection, contradiction triage & executive summary | `AI_INFERRED` (`<= 0.35`, `direct=False`) |
+| **4. Cloud BYOK** | `Gemini` / `DeepSeek` / OpenAI-compat | Cloud executive synthesis with automatic secret redaction & `<untrusted_*>` tags | Never promotes to `CONFIRMED` |
+
+---
+
+## Slide 10 — Live 4-Minute Demo Playbook
 
 ```powershell
-# 1. Verify system toolchain integrity (Expected: 32/32 AVAILABLE)
-python -m hub.cli doctor
+# 1. Verify 32-capability inventory & policy status (Hydra shown BLOCKED)
+.\.venv\Scripts\python.exe -m hub.cli doctor --no-smoke
 
-# 2. Seed synthetic demonstration case (Aurora Vance - Threat Actor / Executive Profile)
-python -m hub.cli demo
+# 2. Seed deterministic synthetic supply-chain case (Elena Vance / case_demo_aurora)
+.\.venv\Scripts\python.exe -m hub.cli demo
 
-# 3. Launch Web Workbench with automated browser opening
-python -m hub.cli web --open
+# 3. Launch multi-theme Web Workbench
+.\.venv\Scripts\python.exe -m hub.cli web --open
+
+# Optional: Export PII-redacted case bundle for analyst handoff
+.\.venv\Scripts\python.exe -m hub.cli export case_demo_aurora --redact-pii --out aurora_redacted.osintcase.zip
 ```
 
-### Demonstration Flow:
-1. **Tool Integrity:** Show `python -m hub.cli doctor` returning 32/32 available with Hydra clearly flagged as `BLOCKED`.
-2. **Overview Tab:** Highlight the unified identity of *Aurora Vance*, showing cross-platform accounts linked without duplicate fragmentation.
-3. **Visuals Tab:** Show the perceptual hash match between GitHub and Gravatar avatars.
-4. **Theme Switcher:** Switch between Clean Light and Midnight Slate to show cross-screen adaptability.
-5. **Graph & Dossier Export:** Show the Cytoscape correlation graph and 1-click `.osintcase.zip` export.
+---
+
+## Slide 11 — Direct Operational Fit for PROSOL QSC
+
+- **PROSOL Cyber Threat Intelligence (CTI):** Automates multi-hop attribution (`handle → commit email → OpenPGP key → domain → crt.sh SANs → IP → BGP ASN`) in ~90 seconds while preserving raw SHA-256 artifacts for threat actor dossiers.
+- **PROSOL 24/7 SOC & Incident Response (DFIR):** Enriches suspicious external indicators or compromised identities offline/on-prem; exports tamper-evident `.osintcase.zip` bundles (`--redact-pii`) across L1/L2/L3 analysts.
+- **PROSOL Red Team & Critical Infrastructure Assessments:** Enforces `allow_domains` scope boundaries, keeps `allow_active_recon=False` by default, blocks `hydra`, and records a complete execution ledger suitable for regulated banking and government clients.
 
 ---
 
-## Slide 11: Direct Value Proposition for PROSOL
+## Slide 12 — Verification Metrics & Technical Q&A Defense
 
-| PROSOL Business Unit | Operational Challenge | How AI OSINT Hub Solves It |
-| :--- | :--- | :--- |
-| **Cyber Threat Intelligence (CTI)** | Manual actor profiling takes hours of tedious searching. | Automated pivot engine correlates handles, emails, and keys in under 90 seconds. |
-| **Incident Response & DFIR** | Rapid external surface analysis of compromised identities. | Maps exposed repositories, public PGP keys, and social breadcrumbs instantly. |
-| **Red Team & Penetration Testing** | Passive recon must be non-intrusive and auditable. | Enforces strict passive boundaries, SSRF blocks, and immutable execution logs. |
-| **SOC & Client Reporting** | Client deliverables must be verifiable and professional. | Instant presentation-ready HTML/PDF dossiers with cryptographic artifact backing. |
-
----
-
-## Slide 12: Technical Defense & Anticipated Q&A
-
-* **Q: "Why not just use Maltego?"**  
-  *A:* Maltego requires heavy manual graph manipulation and proprietary transforms. AI OSINT Hub provides fully automated async collection, deterministic entity resolution, and zero licensing lock-in.
-* **Q: "How is investigator OPSEC preserved?"**  
-  *A:* Passive collectors query public third-party caches (crt.sh, RDAP, Wayback) rather than touching target servers. Centralized HTTP routing allows routing all traffic through SOCKS5/corporate VPN proxies.
-* **Q: "Can an attacker compromise the system via prompt injection?"**  
-  *A:* All external strings pass through `hub.security.quarantine`. Crucially, core ERKG reasoning is 100% deterministic code—an LLM never makes graph mutation decisions.
-
----
-
-## Slide 13: Summary & Candidate Value
-
-* **Architecture Mastery:** Designed and verified end-to-end async Python, SQLite WAL transactions, and multi-tier tool execution.
-* **Defensive Engineering:** Strict SSRF validation, policy gates, and input sanitization baked into every subsystem.
-* **Production Polish:** 745 automated tests, 32/32 healthy tools, responsive multi-theme interface, and clean documentation.
-* **Mission Alignment:** Ready to elevate PROSOL's CTI, DFIR, and automated reconnaissance capabilities on day one.
+- **745 Passing Offline Tests (`pytest`):** Covers ERKG confidence math, duplicate person merging, SSRF/redirect blocks, Zip-Slip/bomb defenses, visual `pHash` clustering, and UI DOM safety.
+- **7/7 CI Matrix + Non-Root Docker (`UID 10001`):** Verified on `ubuntu-latest`, `windows-latest`, and `macos-latest` across Python `3.11` & `3.13`.
+- **Toolchain Health:** `32/32 AVAILABLE` on Windows 11 + WSL2 Ubuntu reference workstation.
