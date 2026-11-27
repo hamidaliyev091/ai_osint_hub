@@ -23,13 +23,108 @@ class AIProviderKind(str, Enum):
     OPENAI_COMPAT = "openai_compat"
 
 
+class AIHardwarePreset(str, Enum):
+    """Hardware-adaptive AI & Vision presets (default: disabled)."""
+
+    DISABLED = "disabled"
+    CPU_LIGHT = "cpu_light"
+    VRAM_8GB = "vram_8gb"
+    VRAM_16GB_PLUS = "vram_16gb_plus"
+    CLOUD_BYOK = "cloud_byok"
+
+
+AI_PRESETS_CATALOG: dict[str, dict[str, Any]] = {
+    AIHardwarePreset.DISABLED.value: {
+        "preset": AIHardwarePreset.DISABLED.value,
+        "label": "Zero-LLM Deterministic (Disabled)",
+        "description": "Pure deterministic OSINT core with zero LLM/VLM inference.",
+        "enabled": False,
+        "provider": AIProviderKind.DISABLED.value,
+        "vision_enabled": False,
+        "text_model": "",
+        "vision_model": "",
+        "embedding_model": "",
+        "num_ctx": 8192,
+        "keep_alive": "2m",
+        "pull_commands": [],
+    },
+    AIHardwarePreset.CPU_LIGHT.value: {
+        "preset": AIHardwarePreset.CPU_LIGHT.value,
+        "label": "CPU-Light (<= 8 GB RAM, No GPU)",
+        "description": "Compact local Ollama profile for CPU-only machines.",
+        "enabled": True,
+        "provider": AIProviderKind.OLLAMA.value,
+        "vision_enabled": False,
+        "text_model": "qwen2.5:3b",
+        "vision_model": "",
+        "embedding_model": "embeddinggemma",
+        "num_ctx": 4096,
+        "keep_alive": "60s",
+        "pull_commands": ["ollama pull qwen2.5:3b", "ollama pull embeddinggemma"],
+    },
+    AIHardwarePreset.VRAM_8GB.value: {
+        "preset": AIHardwarePreset.VRAM_8GB.value,
+        "label": "8 GB VRAM + 32 GB RAM (Recommended Local)",
+        "description": "Tuned for 8 GB VRAM GPUs with 90s keep_alive to avoid sequential VRAM thrashing.",
+        "enabled": True,
+        "provider": AIProviderKind.OLLAMA.value,
+        "vision_enabled": True,
+        "text_model": "gemma4:e4b",
+        "vision_model": "qwen2.5vl:7b",
+        "embedding_model": "embeddinggemma",
+        "num_ctx": 8192,
+        "keep_alive": "90s",
+        "pull_commands": [
+            "ollama pull gemma4:e4b",
+            "ollama pull qwen2.5vl:7b",
+            "ollama pull embeddinggemma",
+        ],
+    },
+    AIHardwarePreset.VRAM_16GB_PLUS.value: {
+        "preset": AIHardwarePreset.VRAM_16GB_PLUS.value,
+        "label": "16+ GB VRAM Workstation",
+        "description": "Extended context local Ollama profile for 16+ GB VRAM GPUs.",
+        "enabled": True,
+        "provider": AIProviderKind.OLLAMA.value,
+        "vision_enabled": True,
+        "text_model": "gemma4:12b",
+        "vision_model": "qwen2.5vl:7b",
+        "embedding_model": "embeddinggemma",
+        "num_ctx": 16384,
+        "keep_alive": "5m",
+        "pull_commands": [
+            "ollama pull gemma4:12b",
+            "ollama pull qwen2.5vl:7b",
+            "ollama pull embeddinggemma",
+        ],
+    },
+    AIHardwarePreset.CLOUD_BYOK.value: {
+        "preset": AIHardwarePreset.CLOUD_BYOK.value,
+        "label": "Cloud BYOK (Gemini / DeepSeek / OpenAI)",
+        "description": "Bring-your-own-key remote inference with strict redaction and quarantine.",
+        "enabled": True,
+        "provider": AIProviderKind.GEMINI.value,
+        "vision_enabled": True,
+        "text_model": "gemini-2.5-flash",
+        "vision_model": "gemini-2.5-flash",
+        "embedding_model": "",
+        "num_ctx": 8192,
+        "keep_alive": "2m",
+        "pull_commands": [],
+    },
+}
+
+
 class AIConfig(BaseModel):
-    """Persisted configuration for ``hub.ai`` (target hardware: 8GB VRAM / 32GB RAM)."""
+    """Persisted configuration for ``hub.ai`` (strict zero-LLM default)."""
 
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
+    preset: AIHardwarePreset = AIHardwarePreset.DISABLED
     provider: AIProviderKind = AIProviderKind.DISABLED
+    num_ctx: int = Field(default=8192, ge=512, le=131072)
+    keep_alive: str = "2m"
 
     # Local consumer-hardware defaults (8 GB VRAM + 32 GB RAM)
     ollama_host: str = "http://127.0.0.1:11434"
@@ -125,20 +220,29 @@ class AIStatusReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+    preset: AIHardwarePreset = AIHardwarePreset.DISABLED
     provider: AIProviderKind
     active: bool
     config_path: str
     vision_enabled: bool
     reflection_enabled: bool
+    num_ctx: int = 8192
+    keep_alive: str = "2m"
     models: dict[str, str] = Field(default_factory=dict)
     endpoints: dict[str, str] = Field(default_factory=dict)
     credentials: dict[str, dict[str, Any]] = Field(default_factory=dict)
     local_probes: dict[str, Any] = Field(default_factory=dict)
     hardware_profile: dict[str, Any] = Field(default_factory=dict)
+    presets_catalog: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    installed_models: list[str] = Field(default_factory=list)
+    missing_models: list[str] = Field(default_factory=list)
+    pull_commands: list[str] = Field(default_factory=list)
 
 
 __all__ = [
     "AIProviderKind",
+    "AIHardwarePreset",
+    "AI_PRESETS_CATALOG",
     "AIConfig",
     "ReflectionAmbiguousMatch",
     "ReflectionHypothesisProposal",

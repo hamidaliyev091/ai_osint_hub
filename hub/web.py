@@ -25,19 +25,23 @@ inserts them with ``textContent`` — never ``innerHTML``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import inspect
 import json
+import re
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
@@ -132,6 +136,7 @@ class AIConfigRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     enabled: Optional[bool] = None
+    preset: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
     vision_model: Optional[str] = None
@@ -147,6 +152,14 @@ class AIConfigRequest(BaseModel):
     num_ctx: Optional[int] = None
     temperature: Optional[float] = None
     keep_alive: Optional[str] = None
+    vision_enabled: Optional[bool] = None
+    reflection_enabled: Optional[bool] = None
+
+
+class DemoRequest(BaseModel):
+    """Optional parameters for seeding the synthetic demo case."""
+
+    overwrite: bool = True
 
 
 class ReflectRequest(BaseModel):
@@ -1292,7 +1305,199 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
                 status_code=500)
         return JSONResponse(jsonable_encoder(_value(result, 2000)))
 
+    # ── Demo Case / Portable Bundles / MCP Setup ───────────────────
+
+    @app.post("/api/demo")
+    async def post_demo(payload: Optional[DemoRequest] = Body(default=None)) -> Any:
+        overwrite = bool(payload.overwrite) if payload is not None else True
+        try:
+            if hasattr(svc, "seed_demo"):
+                result = await asyncio.to_thread(
+                    _call, svc.seed_demo, overwrite=overwrite)
+            else:
+                from hub.demo import seed_demo_case
+
+                inv_dir = svc.engine().state_root()
+                result = await asyncio.to_thread(
+                    seed_demo_case, None,
+                    overwrite=overwrite, investigations_dir=inv_dir)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"demo seed failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.get("/api/investigations/{target_id}/bundle")
+    async def get_investigation_bundle(target_id: str,
+                                       redact_pii: bool = False) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        try:
+            if hasattr(svc, "export_bundle"):
+                exported = await asyncio.to_thread(
+                    _call, svc.export_bundle, target_id,
+                    redact_pii=redact_pii)
+            else:
+                try:
+                    from hub.bundle import export_case_bundle
+                except ImportError:
+                    return JSONResponse(
+                        {"status": "unavailable",
+                         "errors": ["Portable bundle subsystem not available"]},
+                        status_code=503)
+                inv_dir = svc.engine().state_root()
+                exported = await asyncio.to_thread(
+                    _call, export_case_bundle, inv_dir, target_id,
+                    redact_pii=redact_pii, investigations_dir=inv_dir)
+        except LookupError:
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"bundle export failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if not isinstance(exported, tuple) or len(exported) != 2:
+            return JSONResponse(
+                _error_payload("bundle export returned unexpected payload"),
+                status_code=500)
+        zip_bytes, manifest = exported
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", target_id).strip("._") or "case"
+        filename = f"{safe_id}.osintcase.zip"
+        return Response(
+            content=bytes(zip_bytes),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Bundle-Target-Id": safe_id,
+                "X-Bundle-Redacted": "true" if (manifest or {}).get("redacted", redact_pii) else "false",
+            },
+        )
+
+    @app.post("/api/bundles/import")
+    async def post_import_bundle(
+        request: Request,
+        overwrite: bool = False,
+        target_id: Optional[str] = None,
+    ) -> Any:
+        max_bytes = 50 * 1024 * 1024
+        content_type = (request.headers.get("content-type") or "").lower()
+        new_target_id: Optional[str] = target_id
+        effective_overwrite = bool(overwrite)
+
+        if "application/json" in content_type:
+            try:
+                body_bytes = await request.body()
+                if len(body_bytes) > 75 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="bundle payload exceeds size limit")
+                data = json.loads(body_bytes.decode("utf-8"))
+            except HTTPException:
+                raise
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}")
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="JSON body must be an object")
+            b64 = data.get("data_base64")
+            if not isinstance(b64, str) or not b64.strip():
+                raise HTTPException(status_code=400, detail="data_base64 is required")
+            # Strip optional data URL prefix if present
+            b64_clean = b64.strip()
+            if "," in b64_clean and b64_clean.lower().startswith("data:"):
+                b64_clean = b64_clean.split(",", 1)[1].strip()
+            try:
+                zip_bytes = base64.b64decode(b64_clean, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(status_code=400, detail=f"invalid base64 bundle data: {exc}")
+            if "overwrite" in data and data["overwrite"] is not None:
+                effective_overwrite = bool(data["overwrite"])
+            if data.get("new_target_id"):
+                new_target_id = str(data["new_target_id"])
+            elif data.get("target_id"):
+                new_target_id = str(data["target_id"])
+        else:
+            zip_bytes = await request.body()
+
+        if not zip_bytes:
+            raise HTTPException(status_code=400, detail="empty bundle payload")
+        if len(zip_bytes) > max_bytes:
+            raise HTTPException(status_code=400, detail="bundle exceeds 50 MiB limit")
+
+        try:
+            if hasattr(svc, "import_bundle"):
+                result = await asyncio.to_thread(
+                    _call, svc.import_bundle, zip_bytes,
+                    overwrite=effective_overwrite, new_target_id=new_target_id)
+            else:
+                try:
+                    from hub.bundle import import_case_bundle
+                except ImportError:
+                    return JSONResponse(
+                        {"status": "unavailable",
+                         "errors": ["Portable bundle subsystem not available"]},
+                        status_code=503)
+                inv_dir = svc.engine().state_root()
+                result = await asyncio.to_thread(
+                    _call, import_case_bundle, inv_dir, zip_bytes,
+                    overwrite=effective_overwrite, new_target_id=new_target_id,
+                    investigations_dir=inv_dir)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"bundle import failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.get("/api/mcp-config")
+    def get_mcp_config(client: str = "antigravity") -> Any:
+        try:
+            if hasattr(svc, "mcp_config"):
+                result = _call(svc.mcp_config, client)
+            else:
+                result = _fallback_mcp_config(client)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"mcp-config failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(result))
+
     return app
+
+
+def _fallback_mcp_config(client: str = "antigravity") -> dict[str, Any]:
+    """Generate a ready-to-paste MCP client configuration snippet."""
+    key = (client or "antigravity").strip().lower()
+    paths = {
+        "antigravity": "~/.gemini/antigravity/mcp_config.json",
+        "claude": "~/Library/Application Support/Claude/claude_desktop_config.json (macOS) | %APPDATA%\\Claude\\claude_desktop_config.json (Windows)",
+        "cursor": "~/.cursor/mcp.json",
+        "vscode": ".vscode/mcp.json",
+    }
+    if key not in paths:
+        raise ValueError(
+            f"Unsupported MCP client {client!r}. Expected one of: {', '.join(sorted(paths))}"
+        )
+    root_key = "servers" if key == "vscode" else "mcpServers"
+    server_entry: dict[str, Any] = {"command": "ai-osint-hub", "args": ["mcp"]}
+    if key == "vscode":
+        server_entry = {"type": "stdio", **server_entry}
+    snippet = {root_key: {"ai-osint-hub": server_entry}}
+    return {
+        "status": "ok",
+        "client": key,
+        "config_path_hint": paths[key],
+        "config_json": json.dumps(snippet, indent=2),
+        "snippet_json": json.dumps(snippet, indent=2),
+        "snippet": snippet,
+    }
 
 
 def _stream_deadline_seconds(service: InvestigationService,
@@ -1453,7 +1658,16 @@ main {
   overflow: hidden;
   visibility: hidden;
 }
-@media (max-width: 1200px) {
+@media (max-width: 1360px) {
+  main {
+    grid-template-columns: 300px minmax(0, 1fr) 316px;
+    gap: 12px;
+    padding: 12px;
+  }
+  #workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 316px; }
+  #workbench.rail-right-collapsed main { grid-template-columns: 300px minmax(0, 1fr) 0px; }
+}
+@media (max-width: 1080px) {
   main,
   #workbench.rail-left-collapsed main,
   #workbench.rail-right-collapsed main,
@@ -1841,6 +2055,212 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   font-size: 12px;
   font-weight: 600;
 }
+.first-run-overlay {
+  position: absolute;
+  inset: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 8;
+  pointer-events: none;
+}
+.first-run-overlay[hidden] { display: none !important; }
+.first-run-card {
+  pointer-events: auto;
+  width: min(640px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 24px;
+}
+.first-run-card h3 {
+  margin: 0 0 8px;
+  font-size: 17px;
+  color: var(--text);
+}
+.checklist-card {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.checklist-card[hidden] { display: none !important; }
+.checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--text-body);
+}
+.checklist-item.done { color: var(--green); }
+.preset-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.preset-pill {
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--text-body);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.preset-pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fbf1c7;
+}
+.seg-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.seg-toggle button {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-radius: 0;
+  padding: 4px 10px;
+  font-size: 11.5px;
+}
+.seg-toggle button.active {
+  background: var(--accent);
+  color: #fbf1c7;
+}
+.dossier-rendered {
+  max-width: 75ch;
+  margin: 0 auto;
+  padding: 8px 4px 32px;
+  color: var(--text-body);
+  line-height: 1.65;
+}
+.dossier-rendered[hidden], .dossier-pre[hidden] { display: none !important; }
+.dossier-rendered h1 { font-size: 22px; color: var(--text); margin: 0 0 12px; border-bottom: 2px solid var(--accent); padding-bottom: 8px; }
+.dossier-rendered h2 { font-size: 16.5px; color: var(--text); margin: 24px 0 10px; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.dossier-rendered h3 { font-size: 14px; color: var(--text); margin: 16px 0 8px; }
+.dossier-rendered h4 { font-size: 13px; color: var(--muted); margin: 12px 0 6px; text-transform: uppercase; letter-spacing: 0.04em; }
+.dossier-rendered p { margin: 8px 0; }
+.dossier-rendered blockquote {
+  margin: 12px 0;
+  padding: 8px 12px;
+  background: var(--panel2);
+  border-left: 3px solid var(--accent);
+  color: var(--text-body);
+  border-radius: 0 4px 4px 0;
+}
+.dossier-rendered ul, .dossier-rendered ol { margin: 8px 0; padding-left: 22px; }
+.dossier-rendered li { margin: 4px 0; }
+.dossier-rendered table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+}
+.dossier-rendered th, .dossier-rendered td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+.dossier-rendered th {
+  background: var(--panel2);
+  color: var(--text);
+  font-weight: 700;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.dossier-rendered code {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 11.5px;
+  color: var(--text);
+}
+.dossier-rendered pre {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  overflow: auto;
+  font-size: 12px;
+}
+.dossier-rendered a { color: var(--slate); text-decoration: underline; }
+.dossier-rendered hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
+.cmd-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.cmd-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.cmd-item:last-child { border-bottom: none; }
+.cmd-item.selected, .cmd-item:hover {
+  background: var(--panel2);
+  border-left: 3px solid var(--accent);
+}
+.pull-cmd-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  margin-top: 6px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.kbd-hint {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+}
+@media print {
+  @page { margin: 14mm; size: auto; }
+  body { background: #ffffff !important; color: #282828 !important; }
+  #workbench { height: auto; display: block; }
+  header, .intake-panel, .inspector-panel, .tabs, .dl-row,
+  .modal-backdrop, .first-run-overlay { display: none !important; }
+  main { display: block !important; padding: 0 !important; }
+  .visualization-panel { border: none !important; background: #ffffff !important; }
+  .tab-panel { display: none !important; }
+  #tab-dossier { display: block !important; }
+  .dossier-rendered { max-width: none; padding: 0; color: #282828 !important; }
+  .dossier-rendered h1, .dossier-rendered h2, .dossier-rendered h3 { break-after: avoid; page-break-after: avoid; color: #282828 !important; }
+  .dossier-rendered table, .dossier-rendered blockquote, .dossier-rendered pre { break-inside: avoid; page-break-inside: avoid; }
+  .dossier-rendered th, .dossier-rendered code { background: #f2e5bc !important; color: #282828 !important; }
+  .dossier-pre { background: #ffffff !important; color: #282828 !important; border: none !important; }
+}
 </style>
 </head>
 <body>
@@ -1852,6 +2272,8 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     <span id="target-label" class="muted"></span>
     <span class="spacer"></span>
     <span id="stats-line" class="muted"></span>
+    <button id="open-cmd-palette" class="secondary compact" type="button" title="Command Palette (Ctrl+K / Cmd+K)">Cmd+K</button>
+    <button id="open-mcp-modal" class="secondary compact" type="button" aria-haspopup="dialog" aria-controls="mcp-setup-modal">MCP Setup</button>
     <button id="toggle-theme" class="secondary compact" type="button" title="Toggle Light/Dark theme">Theme</button>
     <button id="open-api-keys" class="secondary compact" type="button"
             aria-haspopup="dialog" aria-controls="api-keys-modal">API Keys</button>
@@ -1875,7 +2297,30 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
             </select>
             <button id="run-diff-btn" class="secondary compact" type="button">Diff</button>
           </div>
+          <div class="row" style="margin-top:8px">
+            <button id="export-bundle-btn" class="secondary compact" type="button" title="Export portable .osintcase.zip">Export .osintcase.zip</button>
+            <label class="graph-toggle" style="font-size:11px">
+              <input id="export-redact-pii" type="checkbox"> Redact PII
+            </label>
+          </div>
+          <div class="row" style="margin-top:6px">
+            <button id="import-bundle-btn" class="secondary compact" type="button" title="Import .osintcase.zip bundle">Import .osintcase.zip</button>
+            <label class="graph-toggle" style="font-size:11px">
+              <input id="import-overwrite-bundle" type="checkbox"> Overwrite
+            </label>
+            <input id="bundle-file-input" type="file" accept=".zip,.osintcase.zip" hidden>
+          </div>
         </div>
+
+        <div id="intake-presets" class="preset-bar" role="group" aria-label="Guided intake presets">
+          <button type="button" class="preset-pill active" data-preset="person">Person / Handle</button>
+          <button type="button" class="preset-pill" data-preset="domain">Domain / Org</button>
+          <button type="button" class="preset-pill" data-preset="media">Image / Media Forensics</button>
+          <button type="button" class="preset-pill" data-preset="custom">Custom Clue</button>
+        </div>
+        <p id="intake-preset-hint" class="muted" style="font-size:11.5px;margin:0 0 8px">
+          Preset: Person / Handle — provide a name, handle, or email to trace cross-platform identity.
+        </p>
 
         <form id="intake" autocomplete="off">
           <label for="in-raw">Free-form intelligence</label>
@@ -1942,6 +2387,14 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
               <span class="spacer"></span>
               <span id="ai-status-badge" class="badge AI_INFERRED">disabled</span>
             </div>
+            <label for="ai-preset">Hardware Profile</label>
+            <select id="ai-preset">
+              <option value="disabled">disabled (zero-LLM core)</option>
+              <option value="cpu_light">cpu_light (CPU-only compact)</option>
+              <option value="vram_8gb">vram_8gb (8 GB VRAM + 32 GB RAM)</option>
+              <option value="vram_16gb_plus">vram_16gb_plus (16 GB+ VRAM)</option>
+              <option value="cloud_byok">cloud_byok (Cloud API BYOK)</option>
+            </select>
             <label for="ai-provider">Provider</label>
             <select id="ai-provider">
               <option value="disabled">disabled</option>
@@ -1954,6 +2407,8 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
             <div class="grid2">
               <div><label for="ai-model">Text Model</label><input id="ai-model" type="text" placeholder="gemma4"></div>
               <div><label for="ai-vision-model">Vision Model</label><input id="ai-vision-model" type="text" placeholder="qwen2.5vl:7b"></div>
+              <div><label for="ai-num-ctx">Context (num_ctx)</label><input id="ai-num-ctx" type="number" value="8192" min="512" max="131072"></div>
+              <div><label for="ai-keep-alive">Keep Alive</label><input id="ai-keep-alive" type="text" value="2m" placeholder="90s"></div>
             </div>
             <label for="ai-base-url">Base URL (optional)</label>
             <input id="ai-base-url" type="text" placeholder="http://127.0.0.1:11434">
@@ -2000,6 +2455,34 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         </div>
         <div id="type-filters" aria-label="Entity type filters"></div>
         <div id="graph-wrap">
+          <div id="first-run-panel" class="first-run-overlay">
+            <div class="first-run-card">
+              <div class="row">
+                <span class="badge AI_INFERRED">V2 WORKBENCH</span>
+                <span class="muted mono" style="font-size:11px">Deterministic ERKG · Zero-LLM Default</span>
+              </div>
+              <h3 style="margin-top:8px">Start Your Investigation or Load the Synthetic Demo</h3>
+              <p class="muted" style="margin:0 0 12px;font-size:12.5px">
+                Every finding cites its immutable SHA-256 evidence artifact, detects contradictions automatically, and isolates untrusted external strings.
+              </p>
+              <div class="row">
+                <button id="btn-load-demo" type="button">Load Interactive Demo Case</button>
+                <button id="btn-import-bundle-empty" class="secondary" type="button">Import .osintcase.zip</button>
+                <button id="btn-open-mcp-empty" class="secondary" type="button">10-Second MCP Setup</button>
+              </div>
+              <div id="quickstart-checklist" class="checklist-card">
+                <div class="row" style="margin-bottom:6px">
+                  <strong style="font-size:12px;color:var(--text)">Quick-Start Checklist</strong>
+                  <span class="spacer"></span>
+                  <button id="dismiss-quickstart" class="secondary compact" type="button">Dismiss</button>
+                </div>
+                <div class="checklist-item" data-step="1"><span class="mono">[ ]</span> 1. Load Interactive Demo Case or launch a new investigation</div>
+                <div class="checklist-item" data-step="2"><span class="mono">[ ]</span> 2. Select any node in the graph to inspect its SHA-256 evidence artifact</div>
+                <div class="checklist-item" data-step="3"><span class="mono">[ ]</span> 3. Press Ctrl/Cmd+K to jump between entities, pivots, and contradictions</div>
+                <div class="checklist-item" data-step="4"><span class="mono">[ ]</span> 4. Export an evidence-cited Dossier (Markdown/HTML/PDF) or .osintcase.zip</div>
+              </div>
+            </div>
+          </div>
           <div id="cy-graph" class="graph-hidden" aria-label="Interactive Cytoscape knowledge graph"></div>
           <svg id="graph" viewBox="0 0 960 620" preserveAspectRatio="xMidYMid meet"
                role="img" aria-label="Entity-resolved knowledge graph"></svg>
@@ -2033,6 +2516,29 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 
       <div id="tab-ai" class="tab-panel">
         <div class="panel-body">
+          <div id="ai-lab-profile-card" class="ai-box">
+            <div class="row">
+              <strong style="color:var(--text)">Hardware Profile &amp; Local Models</strong>
+              <span id="ai-lab-badge" class="badge AI_INFERRED">disabled</span>
+              <span class="spacer"></span>
+              <button id="ai-lab-probe-btn" class="secondary compact" type="button">Detect Local Models</button>
+            </div>
+            <p class="muted" style="font-size:12px;margin:8px 0">
+              AI is strictly opt-in (<code>disabled</code> by default). Pick a hardware profile tuned for your GPU/CPU or Cloud BYOK, and copy any missing <code>ollama pull</code> commands below.
+            </p>
+            <div class="row" style="margin-top:8px">
+              <select id="ai-lab-preset" aria-label="AI Hardware Profile" style="max-width:320px">
+                <option value="disabled">disabled — Zero-LLM Deterministic Core</option>
+                <option value="cpu_light">cpu_light — CPU Light (no GPU)</option>
+                <option value="vram_8gb">vram_8gb — 8 GB VRAM + 32 GB RAM</option>
+                <option value="vram_16gb_plus">vram_16gb_plus — 16 GB+ VRAM Workstation</option>
+                <option value="cloud_byok">cloud_byok — Cloud API BYOK</option>
+              </select>
+              <button id="ai-lab-apply-btn" class="compact" type="button">Apply Profile</button>
+            </div>
+            <div id="ai-models-status" class="muted mono" style="font-size:11.5px;margin-top:10px"></div>
+            <div id="ai-pull-commands" style="margin-top:8px"></div>
+          </div>
           <div class="ai-box">
             <div class="row">
               <strong style="color:var(--text)">AI Case Reflection (Quarantined)</strong>
@@ -2067,9 +2573,18 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
           <a id="download-md" class="dl-link" href="#" download>Download Markdown</a>
           <a id="download-json" class="dl-link" href="#" download>Download JSON</a>
           <a id="download-html" class="dl-link" href="#" download>Download HTML</a>
+          <span class="spacer"></span>
+          <div class="seg-toggle" role="group" aria-label="Dossier view mode">
+            <button id="dossier-mode-rendered" class="active" type="button">Rendered</button>
+            <button id="dossier-mode-raw" type="button">Raw</button>
+          </div>
+          <button id="dossier-print-btn" class="secondary compact" type="button">Print / Save PDF</button>
         </div>
         <div class="panel-body">
-          <pre id="dossier-text" class="dossier-pre">No dossier yet.</pre>
+          <article id="dossier-rendered" class="dossier-rendered" aria-label="Rendered intelligence dossier">
+            <p class="muted">No dossier yet. Load the Demo Case or start an investigation.</p>
+          </article>
+          <pre id="dossier-text" class="dossier-pre" hidden>No dossier yet.</pre>
         </div>
       </div>
     </section>
@@ -2146,6 +2661,65 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         <button id="close-api-keys" class="secondary" type="button">Close</button>
       </div>
       <p id="api-keys-message" role="alert" style="font-size:12px"></p>
+    </div>
+  </div>
+  <div id="scope-auth-modal" class="modal-backdrop" hidden role="dialog"
+       aria-modal="true" aria-labelledby="scope-auth-title">
+    <div class="modal-card">
+      <h2 id="scope-auth-title">Scope &amp; Authorization Acknowledgment</h2>
+      <p style="margin:8px 0;font-size:13px">
+        Enabling <strong>Allow Active Recon</strong> permits direct network probes (e.g., port scanning, HTTP fingerprinting, directory enumeration) against target hosts.
+      </p>
+      <ul style="margin:8px 0;padding-left:20px;font-size:12.5px">
+        <li>Verify that all target domains/IPs are listed in <code>Scope allow-domains</code> or explicitly authorized.</li>
+        <li>Confirm you hold written authorization to perform active reconnaissance against these targets.</li>
+        <li>Intrusive credential attacks remain strictly blocked by default.</li>
+      </ul>
+      <div class="row" style="margin-top:16px">
+        <button id="confirm-scope-auth" type="button">I Confirm Authorization</button>
+        <button id="cancel-scope-auth" class="secondary" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+  <div id="cmd-palette-modal" class="modal-backdrop" hidden role="dialog"
+       aria-modal="true" aria-labelledby="cmd-palette-title">
+    <div class="modal-card">
+      <div class="row" style="margin-bottom:8px">
+        <h2 id="cmd-palette-title" style="margin:0">Command Palette</h2>
+        <span class="spacer"></span>
+        <span class="kbd-hint mono">↑↓ · Enter · Esc</span>
+      </div>
+      <input id="cmd-palette-input" type="search" autocomplete="off"
+             placeholder="Jump to entity, switch tab, load demo, export bundle, toggle theme…">
+      <ul id="cmd-palette-results" class="cmd-list" role="listbox"></ul>
+      <div class="row" style="margin-top:12px">
+        <span class="spacer"></span>
+        <button id="close-cmd-palette" class="secondary compact" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+  <div id="mcp-setup-modal" class="modal-backdrop" hidden role="dialog"
+       aria-modal="true" aria-labelledby="mcp-setup-title">
+    <div class="modal-card">
+      <h2 id="mcp-setup-title">10-Second MCP Setup</h2>
+      <p class="muted" style="margin:0 0 12px;font-size:12px">
+        Connect AI OSINT Hub to your AI IDE or desktop agent via stdio MCP.
+      </p>
+      <div id="mcp-client-tabs" class="preset-bar" role="group" aria-label="MCP Client">
+        <button type="button" class="preset-pill active" data-mcp-client="antigravity">Antigravity</button>
+        <button type="button" class="preset-pill" data-mcp-client="claude">Claude Desktop</button>
+        <button type="button" class="preset-pill" data-mcp-client="cursor">Cursor</button>
+        <button type="button" class="preset-pill" data-mcp-client="vscode">VS Code</button>
+      </div>
+      <div class="muted mono" style="font-size:11.5px;margin-bottom:6px">
+        Config path: <span id="mcp-config-path">—</span>
+      </div>
+      <pre id="mcp-config-pre" class="dossier-pre" style="min-height:140px"></pre>
+      <div class="row" style="margin-top:12px">
+        <button id="copy-mcp-config-btn" type="button">Copy JSON Config</button>
+        <button id="close-mcp-setup" class="secondary" type="button">Close</button>
+        <span id="mcp-copy-status" class="muted" style="font-size:12px"></span>
+      </div>
     </div>
   </div>
 </div>
@@ -2600,6 +3174,8 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     var graph = payload.graph || { nodes: [], edges: [] };
     var nodes = graph.nodes || [];
     var edges = graph.edges || [];
+    var firstRun = byId("first-run-panel");
+    if (firstRun) { firstRun.hidden = nodes.length > 0; }
     renderTypeFilters(nodes);
     if (!nodes.length) {
       var empty = svgNode("text", "empty");
@@ -2984,6 +3560,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     var claims = node.claims || [];
     renderInspector(node.type + ": " + node.value, node.status,
       firstArtifact(claims, payload), claims, node.id, payload);
+    markChecklistStep(2);
   }
 
   function inspectClaim(edge, payload) {
@@ -3213,6 +3790,73 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     });
   }
 
+  function copyTextToClipboard(text, statusEl) {
+    var val = String(text || "");
+    if (!val) { return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(val).then(function () {
+        if (statusEl) { statusEl.textContent = "Copied!"; }
+      }).catch(function () {
+        if (statusEl) { statusEl.textContent = "Select and copy manually."; }
+      });
+      return;
+    }
+    var ta = document.createElement("textarea");
+    ta.value = val;
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+      if (statusEl) { statusEl.textContent = "Copied!"; }
+    } catch (err) {
+      if (statusEl) { statusEl.textContent = "Copy unavailable."; }
+    }
+    document.body.removeChild(ta);
+  }
+
+  function renderAiLabStatus(data) {
+    var preset = String(data.preset || (data.enabled ? (data.provider === "ollama" ? "vram_8gb" : "cloud_byok") : "disabled"));
+    var labPreset = byId("ai-lab-preset");
+    if (labPreset && preset) { labPreset.value = preset; }
+    var railPreset = byId("ai-preset");
+    if (railPreset && preset) { railPreset.value = preset; }
+    var labBadge = byId("ai-lab-badge");
+    if (labBadge) { labBadge.textContent = data.enabled ? (preset + " · " + String(data.provider || "")) : "disabled"; }
+
+    var statusEl = byId("ai-models-status");
+    if (statusEl) {
+      var installed = data.installed_models || [];
+      var missing = data.missing_models || [];
+      var parts = [];
+      parts.push("Installed: " + (installed.length ? installed.join(", ") : "none detected"));
+      if (missing.length) { parts.push("Missing: " + missing.join(", ")); }
+      statusEl.textContent = parts.join(" | ");
+    }
+    var pullBox = byId("ai-pull-commands");
+    if (pullBox) {
+      pullBox.textContent = "";
+      var cmds = data.pull_commands || [];
+      if (!cmds.length && data.models && data.provider === "ollama") {
+        if (data.models.ollama) { cmds.push("ollama pull " + data.models.ollama); }
+        if (data.models.ollama_vision) { cmds.push("ollama pull " + data.models.ollama_vision); }
+      }
+      cmds.forEach(function (cmd) {
+        var row = make("div", "pull-cmd-row");
+        row.appendChild(make("code", "mono", String(cmd)));
+        var btn = make("button", "secondary compact", "Copy");
+        btn.type = "button";
+        btn.addEventListener("click", function () {
+          copyTextToClipboard(cmd, btn);
+          window.setTimeout(function () { btn.textContent = "Copy"; }, 1400);
+        });
+        row.appendChild(btn);
+        pullBox.appendChild(row);
+      });
+    }
+  }
+
   function refreshAiStatus(probe) {
     return api("/api/ai/status" + (probe ? "?probe_local=true" : "")).then(function (data) {
       var enabled = !!data.enabled;
@@ -3225,27 +3869,36 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       if (provEl && provider) { provEl.value = provider; }
       var models = data.models || {};
       var endpoints = data.endpoints || {};
+      var hw = data.hardware_profile || {};
       var modelVal = data.model || models[provider] || models.ollama || "";
       var visionVal = data.vision_model || models.ollama_vision || "";
       var baseVal = data.base_url || endpoints[provider] || "";
+      var numCtxVal = data.num_ctx || hw.ollama_num_ctx || 8192;
+      var keepAliveVal = data.keep_alive || hw.ollama_keep_alive || "2m";
       if (modelVal && byId("ai-model")) { byId("ai-model").value = modelVal; }
       if (visionVal && byId("ai-vision-model")) { byId("ai-vision-model").value = visionVal; }
       if (baseVal && byId("ai-base-url")) { byId("ai-base-url").value = baseVal; }
+      if (byId("ai-num-ctx")) { byId("ai-num-ctx").value = String(numCtxVal); }
+      if (byId("ai-keep-alive")) { byId("ai-keep-alive").value = String(keepAliveVal); }
       var reachable = !!(data.active || data.available);
       setText("ai-config-message", "AI status: " + (enabled ? provider : "disabled") +
         (reachable ? " (active)" : " (idle)"));
+      renderAiLabStatus(data);
     }).catch(function () { /* ignore if ai subsystem absent */ });
   }
 
-  function saveAiConfig() {
-    var body = {
+  function saveAiConfig(overrideBody) {
+    var body = overrideBody || {
       enabled: byId("ai-enabled") ? !!byId("ai-enabled").checked : false,
+      preset: byId("ai-preset") ? byId("ai-preset").value : undefined,
       provider: byId("ai-provider") ? byId("ai-provider").value : "disabled",
       model: byId("ai-model") ? byId("ai-model").value.trim() : "",
       vision_model: byId("ai-vision-model") ? byId("ai-vision-model").value.trim() : "",
-      base_url: byId("ai-base-url") ? byId("ai-base-url").value.trim() : ""
+      base_url: byId("ai-base-url") ? byId("ai-base-url").value.trim() : "",
+      num_ctx: byId("ai-num-ctx") ? Number(byId("ai-num-ctx").value || 8192) : 8192,
+      keep_alive: byId("ai-keep-alive") ? byId("ai-keep-alive").value.trim() : "2m"
     };
-    var apiKey = byId("ai-api-key") ? byId("ai-api-key").value.trim() : "";
+    var apiKey = (!overrideBody && byId("ai-api-key")) ? byId("ai-api-key").value.trim() : "";
     if (apiKey) { body.api_key = apiKey; }
     setText("ai-config-message", "Saving AI config…");
     api("/api/ai/config", {
@@ -3254,7 +3907,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       body: JSON.stringify(body)
     }).then(function (data) {
       if (byId("ai-api-key")) { byId("ai-api-key").value = ""; }
-      setText("ai-config-message", "Saved AI config (" + String(data.provider || body.provider) + ").");
+      setText("ai-config-message", "Saved AI config (" + String(data.provider || body.provider || "updated") + ").");
       refreshAiStatus(false);
     }).catch(function (err) {
       setText("ai-config-message", String(err.message || err));
@@ -3347,6 +4000,220 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     }).catch(function () { /* ignore */ });
   }
 
+  function isSafeHref(rawUrl) {
+    var cleaned = String(rawUrl || "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!cleaned || !/^(https?:|mailto:)/i.test(cleaned)) {
+      return null;
+    }
+    try {
+      var parsed = new URL(cleaned);
+      var proto = String(parsed.protocol || "").toLowerCase();
+      if (proto === "http:" || proto === "https:" || proto === "mailto:") {
+        return parsed.href;
+      }
+    } catch (err) {
+      return null;
+    }
+    return null;
+  }
+
+  var EPISTEMIC_BADGES = {
+    CONFIRMED: true, CORROBORATED: true, SINGLE_SOURCE_LEAD: true,
+    HYPOTHESIS: true, CONTRADICTED: true, COLLECTION_FAILURE: true, AI_INFERRED: true
+  };
+
+  function appendInlineMarkdown(parent, text) {
+    var src = String(text || "");
+    var pos = 0;
+    var tokenRe = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)|(?<![A-Za-z0-9_])_[^_\s][^_]*?_(?![A-Za-z0-9_]))/g;
+    var match;
+    while ((match = tokenRe.exec(src)) !== null) {
+      if (match.index > pos) {
+        parent.appendChild(document.createTextNode(src.slice(pos, match.index)));
+      }
+      var tok = match[0];
+      if (tok.charAt(0) === "`" && tok.charAt(tok.length - 1) === "`") {
+        parent.appendChild(make("code", "", tok.slice(1, -1)));
+      } else if (tok.slice(0, 2) === "**" && tok.slice(-2) === "**") {
+        var innerBold = tok.slice(2, -2);
+        if (EPISTEMIC_BADGES[innerBold]) {
+          parent.appendChild(make("span", "badge " + innerBold, innerBold));
+        } else {
+          parent.appendChild(make("strong", "", innerBold));
+        }
+      } else if (tok.charAt(0) === "[" && tok.indexOf("](") !== -1) {
+        var splitAt = tok.indexOf("](");
+        var label = tok.slice(1, splitAt);
+        var hrefRaw = tok.slice(splitAt + 2, -1);
+        var safeHref = isSafeHref(hrefRaw);
+        if (safeHref) {
+          var anchor = document.createElement("a");
+          anchor.setAttribute("href", safeHref);
+          anchor.setAttribute("target", "_blank");
+          anchor.setAttribute("rel", "noopener noreferrer");
+          anchor.textContent = label;
+          parent.appendChild(anchor);
+        } else {
+          parent.appendChild(document.createTextNode(label));
+        }
+      } else if (tok.charAt(0) === "_" && tok.charAt(tok.length - 1) === "_") {
+        parent.appendChild(make("em", "", tok.slice(1, -1)));
+      } else {
+        parent.appendChild(document.createTextNode(tok));
+      }
+      pos = tokenRe.lastIndex;
+    }
+    if (pos < src.length) {
+      parent.appendChild(document.createTextNode(src.slice(pos)));
+    }
+  }
+
+  function splitTableCells(line) {
+    var trimmed = line.trim();
+    if (trimmed.charAt(0) === "|") { trimmed = trimmed.slice(1); }
+    if (trimmed.charAt(trimmed.length - 1) === "|") { trimmed = trimmed.slice(0, -1); }
+    return trimmed.split("|").map(function (c) { return c.trim(); });
+  }
+
+  function renderMarkdownSafe(mdText, container) {
+    if (!container) { return; }
+    while (container.firstChild) { container.removeChild(container.firstChild); }
+    var lines = String(mdText || "").replace(/\r\n/g, "\n").split("\n");
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      var trimmed = line.trim();
+      if (!trimmed) { i += 1; continue; }
+
+      if (trimmed.slice(0, 3) === "```") {
+        var codeLines = [];
+        i += 1;
+        while (i < lines.length && lines[i].trim().slice(0, 3) !== "```") {
+          codeLines.push(lines[i]);
+          i += 1;
+        }
+        i += 1;
+        var pre = document.createElement("pre");
+        pre.appendChild(make("code", "", codeLines.join("\n")));
+        container.appendChild(pre);
+        continue;
+      }
+
+      if (/^---+$/.test(trimmed)) {
+        container.appendChild(document.createElement("hr"));
+        i += 1;
+        continue;
+      }
+
+      var hMatch = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+      if (hMatch) {
+        var hEl = document.createElement("h" + hMatch[1].length);
+        appendInlineMarkdown(hEl, hMatch[2]);
+        container.appendChild(hEl);
+        i += 1;
+        continue;
+      }
+
+      if (trimmed.charAt(0) === ">") {
+        var bq = document.createElement("blockquote");
+        var bqLines = [];
+        while (i < lines.length && lines[i].trim().charAt(0) === ">") {
+          bqLines.push(lines[i].trim().replace(/^>\s?/, ""));
+          i += 1;
+        }
+        appendInlineMarkdown(bq, bqLines.join(" "));
+        container.appendChild(bq);
+        continue;
+      }
+
+      if (trimmed.charAt(0) === "|" && i + 1 < lines.length && /^\s*\|?\s*[:\-| ]+\s*$/.test(lines[i + 1])) {
+        var headers = splitTableCells(trimmed);
+        i += 2;
+        var table = document.createElement("table");
+        var thead = document.createElement("thead");
+        var htr = document.createElement("tr");
+        headers.forEach(function (cell) {
+          var th = document.createElement("th");
+          appendInlineMarkdown(th, cell);
+          htr.appendChild(th);
+        });
+        thead.appendChild(htr);
+        table.appendChild(thead);
+        var tbody = document.createElement("tbody");
+        while (i < lines.length && lines[i].trim().charAt(0) === "|") {
+          var rowCells = splitTableCells(lines[i]);
+          var tr = document.createElement("tr");
+          for (var c = 0; c < headers.length; c += 1) {
+            var td = document.createElement("td");
+            appendInlineMarkdown(td, rowCells[c] || "");
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+          i += 1;
+        }
+        table.appendChild(tbody);
+        container.appendChild(table);
+        continue;
+      }
+
+      if (/^\s*[-*]\s+/.test(line)) {
+        var ul = document.createElement("ul");
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          var li = document.createElement("li");
+          if (/^\s{2,}[-*]\s+/.test(lines[i])) {
+            li.style.marginLeft = "16px";
+          }
+          appendInlineMarkdown(li, lines[i].replace(/^\s*[-*]\s+/, ""));
+          ul.appendChild(li);
+          i += 1;
+        }
+        container.appendChild(ul);
+        continue;
+      }
+
+      if (/^\s*\d+\.\s+/.test(line)) {
+        var ol = document.createElement("ol");
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+          var oli = document.createElement("li");
+          appendInlineMarkdown(oli, lines[i].replace(/^\s*\d+\.\s+/, ""));
+          ol.appendChild(oli);
+          i += 1;
+        }
+        container.appendChild(ol);
+        continue;
+      }
+
+      var para = document.createElement("p");
+      var paraLines = [];
+      while (
+        i < lines.length && lines[i].trim() &&
+        !/^(#{1,4})\s+/.test(lines[i].trim()) &&
+        lines[i].trim().charAt(0) !== ">" &&
+        lines[i].trim().charAt(0) !== "|" &&
+        !/^\s*[-*]\s+/.test(lines[i]) &&
+        !/^\s*\d+\.\s+/.test(lines[i]) &&
+        lines[i].trim().slice(0, 3) !== "```"
+      ) {
+        paraLines.push(lines[i].trim());
+        i += 1;
+      }
+      appendInlineMarkdown(para, paraLines.join(" "));
+      container.appendChild(para);
+    }
+  }
+
+  function setDossierMode(mode) {
+    var rendered = byId("dossier-rendered");
+    var raw = byId("dossier-text");
+    var btnR = byId("dossier-mode-rendered");
+    var btnRaw = byId("dossier-mode-raw");
+    var isRaw = mode === "raw";
+    if (rendered) { rendered.hidden = isRaw; }
+    if (raw) { raw.hidden = !isRaw; }
+    if (btnR) { btnR.classList.toggle("active", !isRaw); }
+    if (btnRaw) { btnRaw.classList.toggle("active", isRaw); }
+  }
+
   function fetchDossier() {
     if (!state.targetId) { return Promise.resolve(); }
     return fetch("/api/investigations/" + encodeURIComponent(state.targetId) + "/report?format=md")
@@ -3364,6 +4231,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       })
       .then(function (text) {
         setText("dossier-text", text);
+        renderMarkdownSafe(text, byId("dossier-rendered"));
         clearError();
       })
       .catch(function (err) {
@@ -3496,6 +4364,349 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     });
   }
 
+  var CHECKLIST_KEY = "ai_osint_quickstart_v2";
+  var THEME_KEY = "ai_osint_theme";
+  var resizeTimer = null;
+  var cmdSelectedIdx = 0;
+  var cmdFiltered = [];
+  var activeMcpClient = "antigravity";
+
+  function loadChecklistState() {
+    try {
+      var raw = window.localStorage ? window.localStorage.getItem(CHECKLIST_KEY) : null;
+      return raw ? JSON.parse(raw) : { dismissed: false, steps: {} };
+    } catch (err) {
+      return { dismissed: false, steps: {} };
+    }
+  }
+
+  function saveChecklistState(data) {
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(CHECKLIST_KEY, JSON.stringify(data));
+      }
+    } catch (err) { /* ignore storage restrictions */ }
+  }
+
+  function applyChecklistUI() {
+    var box = byId("quickstart-checklist");
+    if (!box) { return; }
+    var st = loadChecklistState();
+    box.hidden = !!st.dismissed;
+    var items = box.querySelectorAll(".checklist-item");
+    for (var i = 0; i < items.length; i += 1) {
+      var stepId = items[i].getAttribute("data-step");
+      var done = !!(st.steps && st.steps[stepId]);
+      items[i].classList.toggle("done", done);
+      var mark = items[i].firstElementChild;
+      if (mark) { mark.textContent = done ? "[x]" : "[ ]"; }
+    }
+  }
+
+  function markChecklistStep(stepNum) {
+    var st = loadChecklistState();
+    if (!st.steps) { st.steps = {}; }
+    st.steps[String(stepNum)] = true;
+    saveChecklistState(st);
+    applyChecklistUI();
+  }
+
+  function dismissChecklist() {
+    var st = loadChecklistState();
+    st.dismissed = true;
+    saveChecklistState(st);
+    applyChecklistUI();
+  }
+
+  function scheduleCyResize() {
+    if (resizeTimer) { window.clearTimeout(resizeTimer); }
+    resizeTimer = window.setTimeout(function () {
+      if (state.cy) {
+        state.cy.resize();
+        state.cy.fit(undefined, 36);
+      }
+    }, 150);
+  }
+
+  function toggleThemeMode() {
+    var root = document.documentElement;
+    var nextDark = root.getAttribute("data-theme") !== "dark";
+    if (nextDark) { root.setAttribute("data-theme", "dark"); }
+    else { root.removeAttribute("data-theme"); }
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(THEME_KEY, nextDark ? "dark" : "light");
+      }
+    } catch (err) { /* ignore */ }
+  }
+
+  function restoreThemeMode() {
+    try {
+      if (window.localStorage && window.localStorage.getItem(THEME_KEY) === "dark") {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    } catch (err) { /* ignore */ }
+  }
+
+  function loadDemoCase() {
+    clearError();
+    setStatus("seeding demo");
+    return api("/api/demo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overwrite: true })
+    }).then(function (data) {
+      if (!data || !data.target_id) { throw new Error("demo returned no target_id"); }
+      state.targetId = data.target_id;
+      state.pathSourceId = null;
+      state.graphView.shortestPathNodes = {};
+      state.graphView.shortestPathEdges = {};
+      setText("target-label", data.target_id);
+      setStatus("COMPLETED", true);
+      markChecklistStep(1);
+      updateDownloads();
+      return refreshCases().then(function () {
+        return refreshState();
+      }).then(function () {
+        fetchTimeline();
+        fetchDossier();
+      });
+    }).catch(function (err) {
+      setStatus("error");
+      showError(err);
+    });
+  }
+
+  function exportCaseBundle() {
+    if (!state.targetId) {
+      showError(new Error("select or load an investigation first"));
+      return;
+    }
+    var redactEl = byId("export-redact-pii");
+    var redact = !!(redactEl && redactEl.checked);
+    var url = "/api/investigations/" + encodeURIComponent(state.targetId) +
+      "/bundle?redact_pii=" + (redact ? "true" : "false");
+    var link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", state.targetId + ".osintcase.zip");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    markChecklistStep(4);
+  }
+
+  function arrayBufferToBase64(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var chunks = [];
+    var step = 0x8000;
+    for (var i = 0; i < bytes.length; i += step) {
+      chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + step)));
+    }
+    return window.btoa(chunks.join(""));
+  }
+
+  function importCaseBundleFile(file) {
+    if (!file) { return; }
+    clearError();
+    setStatus("importing bundle");
+    var reader = new FileReader();
+    reader.onload = function () {
+      var b64 = arrayBufferToBase64(reader.result);
+      var overwriteEl = byId("import-overwrite-bundle");
+      var overwrite = !!(overwriteEl && overwriteEl.checked);
+      api("/api/bundles/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name || "case.osintcase.zip",
+          data_base64: b64,
+          overwrite: overwrite
+        })
+      }).then(function (data) {
+        var tid = (data && (data.target_id || (data.manifest && data.manifest.target_id))) || null;
+        if (!tid) { throw new Error("imported bundle did not return target_id"); }
+        state.targetId = tid;
+        setText("target-label", tid);
+        setStatus("COMPLETED", true);
+        markChecklistStep(1);
+        updateDownloads();
+        return refreshCases().then(function () { return refreshState(); }).then(function () {
+          fetchTimeline();
+          fetchDossier();
+        });
+      }).catch(function (err) {
+        setStatus("error");
+        showError(err);
+      });
+    };
+    reader.onerror = function () {
+      setStatus("error");
+      showError(new Error("failed to read selected bundle file"));
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  var PRESET_HINTS = {
+    person: {
+      hint: "Preset: Person / Handle — provide a name, handle, or email to trace cross-platform identity.",
+      focus: "in-name"
+    },
+    domain: {
+      hint: "Preset: Domain / Org — enter a target domain, organization, or IP for passive DNS, RDAP, CT & ASN mapping.",
+      focus: "in-domains"
+    },
+    media: {
+      hint: "Preset: Image / Media Forensics — paste an image URL below or launch the Vision & Media Forensics Lab.",
+      focus: "in-urls"
+    },
+    custom: {
+      hint: "Preset: Custom Clue — paste free-form OSINT notes, handles, phones, or mixed selectors.",
+      focus: "in-raw"
+    }
+  };
+
+  function setIntakePreset(presetKey) {
+    var key = PRESET_HINTS[presetKey] ? presetKey : "person";
+    var bar = byId("intake-presets");
+    if (bar) {
+      var btns = bar.querySelectorAll(".preset-pill");
+      for (var i = 0; i < btns.length; i += 1) {
+        btns[i].classList.toggle("active", btns[i].getAttribute("data-preset") === key);
+      }
+    }
+    setText("intake-preset-hint", PRESET_HINTS[key].hint);
+    var focusEl = byId(PRESET_HINTS[key].focus);
+    if (focusEl) { try { focusEl.focus(); } catch (err) { /* ignore */ } }
+  }
+
+  function openScopeAuthModal() {
+    var modal = byId("scope-auth-modal");
+    if (modal) { modal.hidden = false; }
+    var confirmBtn = byId("confirm-scope-auth");
+    if (confirmBtn) { try { confirmBtn.focus(); } catch (err) { /* ignore */ } }
+  }
+
+  function closeScopeAuthModal(confirmed) {
+    var modal = byId("scope-auth-modal");
+    if (modal) { modal.hidden = true; }
+    var activeBox = byId("in-active");
+    if (activeBox) { activeBox.checked = !!confirmed; }
+  }
+
+  function fetchMcpConfig(client) {
+    activeMcpClient = client || activeMcpClient || "antigravity";
+    var tabs = byId("mcp-client-tabs");
+    if (tabs) {
+      var pills = tabs.querySelectorAll(".preset-pill");
+      for (var i = 0; i < pills.length; i += 1) {
+        pills[i].classList.toggle("active", pills[i].getAttribute("data-mcp-client") === activeMcpClient);
+      }
+    }
+    setText("mcp-copy-status", "");
+    setText("mcp-config-pre", "Loading MCP snippet…");
+    return api("/api/mcp-config?client=" + encodeURIComponent(activeMcpClient)).then(function (data) {
+      setText("mcp-config-path", data.config_path_hint || data.path || "—");
+      var jsonText = data.snippet_json || data.config_json || JSON.stringify(data.snippet || data.config || data, null, 2);
+      setText("mcp-config-pre", jsonText);
+    }).catch(function (err) {
+      setText("mcp-config-pre", "Error: " + String(err.message || err));
+    });
+  }
+
+  function openMcpSetup() {
+    var modal = byId("mcp-setup-modal");
+    if (!modal) { return; }
+    modal.hidden = false;
+    fetchMcpConfig(activeMcpClient);
+  }
+
+  function closeMcpSetup() {
+    var modal = byId("mcp-setup-modal");
+    if (modal) { modal.hidden = true; }
+  }
+
+  function buildCommandItems() {
+    var items = [
+      { label: "Load Interactive Demo Case (Aurora Meridian)", category: "Action", run: function () { loadDemoCase(); } },
+      { label: "Run Next Pivot", category: "Pivot", run: function () { runNextPivot(); } },
+      { label: "Step Batch (3x Pivots)", category: "Pivot", run: function () { runBatchPivots(); } },
+      { label: "Export Case Bundle (.osintcase.zip)", category: "Bundle", run: function () { exportCaseBundle(); } },
+      { label: "Import Case Bundle (.osintcase.zip)", category: "Bundle", run: function () { var f = byId("bundle-file-input"); if (f) { f.click(); } } },
+      { label: "Open 10-Second MCP Setup", category: "MCP", run: function () { openMcpSetup(); } },
+      { label: "Open API Keys Vault", category: "Settings", run: function () { openApiKeys(); } },
+      { label: "Toggle Light / Dark Theme", category: "View", run: function () { toggleThemeMode(); } },
+      { label: "Print / Save Dossier PDF", category: "Dossier", run: function () { activateTab("dossier"); window.print(); } },
+      { label: "Switch Tab: Graph", category: "Tab", run: function () { activateTab("graph"); } },
+      { label: "Switch Tab: Timeline", category: "Tab", run: function () { activateTab("timeline"); } },
+      { label: "Switch Tab: Telemetry & Pivots", category: "Tab", run: function () { activateTab("telemetry"); } },
+      { label: "Switch Tab: AI & Vision Lab", category: "Tab", run: function () { activateTab("ai"); } },
+      { label: "Switch Tab: Dossier", category: "Tab", run: function () { activateTab("dossier"); } }
+    ];
+    var nodes = (state.payload && state.payload.graph && state.payload.graph.nodes) || [];
+    nodes.slice(0, 60).forEach(function (node) {
+      items.push({
+        label: "Jump to " + String(node.type) + ": " + String(node.value),
+        category: String(node.status || "Entity"),
+        run: function () {
+          activateTab("graph");
+          inspectEntity(node, state.payload);
+          if (state.cy) {
+            var el = state.cy.getElementById(node.id);
+            if (el && el.length) {
+              state.cy.animate({ center: { eles: el } }, { duration: 150 });
+            }
+          }
+        }
+      });
+    });
+    return items;
+  }
+
+  function renderCommandPaletteResults() {
+    var list = byId("cmd-palette-results");
+    var input = byId("cmd-palette-input");
+    if (!list) { return; }
+    var q = input ? String(input.value || "").trim().toLowerCase() : "";
+    var all = buildCommandItems();
+    cmdFiltered = all.filter(function (item) {
+      return !q || item.label.toLowerCase().indexOf(q) !== -1 || item.category.toLowerCase().indexOf(q) !== -1;
+    }).slice(0, 18);
+    if (cmdSelectedIdx >= cmdFiltered.length) { cmdSelectedIdx = Math.max(0, cmdFiltered.length - 1); }
+    list.textContent = "";
+    if (!cmdFiltered.length) {
+      list.appendChild(make("li", "cmd-item muted", "No matching commands or entities."));
+      return;
+    }
+    cmdFiltered.forEach(function (item, idx) {
+      var li = make("li", "cmd-item" + (idx === cmdSelectedIdx ? " selected" : ""));
+      li.setAttribute("role", "option");
+      li.appendChild(make("span", "", item.label));
+      li.appendChild(make("span", "badge", item.category));
+      li.addEventListener("click", function () {
+        closeCommandPalette();
+        markChecklistStep(3);
+        item.run();
+      });
+      list.appendChild(li);
+    });
+  }
+
+  function openCommandPalette() {
+    var modal = byId("cmd-palette-modal");
+    if (!modal) { return; }
+    modal.hidden = false;
+    cmdSelectedIdx = 0;
+    var input = byId("cmd-palette-input");
+    if (input) { input.value = ""; }
+    renderCommandPaletteResults();
+    if (input) { try { input.focus(); } catch (err) { /* ignore */ } }
+  }
+
+  function closeCommandPalette() {
+    var modal = byId("cmd-palette-modal");
+    if (modal) { modal.hidden = true; }
+  }
+
   function activateTab(name) {
     var tabs = document.querySelectorAll(".tab");
     for (var index = 0; index < tabs.length; index += 1) {
@@ -3506,18 +4717,50 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       panels[panelIndex].classList.toggle("active",
         panels[panelIndex].id === "tab-" + name);
     }
-    if (name === "dossier") { fetchDossier(); }
+    if (name === "dossier") { fetchDossier(); markChecklistStep(4); }
     if (name === "timeline") { fetchTimeline(); }
-    if (name === "graph" && state.cy) { state.cy.resize(); state.cy.fit(undefined, 28); }
+    if (name === "graph" && state.cy) { state.cy.resize(); state.cy.fit(undefined, 36); }
   }
 
   function wire() {
+    restoreThemeMode();
+    applyChecklistUI();
     byId("intake").addEventListener("submit", startInvestigation);
     byId("run-pivot").addEventListener("click", runNextPivot);
     var batchBtn = byId("run-batch-pivots");
     if (batchBtn) { batchBtn.addEventListener("click", runBatchPivots); }
     var clearButton = byId("clear-form");
     if (clearButton) { clearButton.addEventListener("click", clearForm); }
+    var activeReconBox = byId("in-active");
+    if (activeReconBox) {
+      activeReconBox.addEventListener("change", function () {
+        if (activeReconBox.checked) {
+          activeReconBox.checked = false;
+          openScopeAuthModal();
+        }
+      });
+    }
+    var confirmScopeBtn = byId("confirm-scope-auth");
+    if (confirmScopeBtn) {
+      confirmScopeBtn.addEventListener("click", function () { closeScopeAuthModal(true); });
+    }
+    var cancelScopeBtn = byId("cancel-scope-auth");
+    if (cancelScopeBtn) {
+      cancelScopeBtn.addEventListener("click", function () { closeScopeAuthModal(false); });
+    }
+    var scopeModal = byId("scope-auth-modal");
+    if (scopeModal) {
+      scopeModal.addEventListener("click", function (event) {
+        if (event.target === scopeModal) { closeScopeAuthModal(false); }
+      });
+    }
+    var presetBar = byId("intake-presets");
+    if (presetBar) {
+      presetBar.addEventListener("click", function (event) {
+        var btn = event.target && event.target.closest ? event.target.closest("[data-preset]") : null;
+        if (btn) { setIntakePreset(btn.getAttribute("data-preset")); }
+      });
+    }
     var zoomIn = byId("zoom-in");
     if (zoomIn) { zoomIn.addEventListener("click", function () { zoomGraph(1.18); }); }
     var zoomOut = byId("zoom-out");
@@ -3572,24 +4815,134 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     if (toggleLeft) {
       toggleLeft.addEventListener("click", function () {
         byId("workbench").classList.toggle("rail-left-collapsed");
-        if (state.cy) { window.setTimeout(function () { state.cy.resize(); }, 50); }
+        scheduleCyResize();
       });
     }
     var toggleRight = byId("toggle-right-rail");
     if (toggleRight) {
       toggleRight.addEventListener("click", function () {
         byId("workbench").classList.toggle("rail-right-collapsed");
-        if (state.cy) { window.setTimeout(function () { state.cy.resize(); }, 50); }
+        scheduleCyResize();
       });
     }
+    window.addEventListener("resize", scheduleCyResize);
     var toggleTheme = byId("toggle-theme");
-    if (toggleTheme) {
-      toggleTheme.addEventListener("click", function () {
-        var root = document.documentElement;
-        if (root.getAttribute("data-theme") === "dark") { root.removeAttribute("data-theme"); }
-        else { root.setAttribute("data-theme", "dark"); }
+    if (toggleTheme) { toggleTheme.addEventListener("click", toggleThemeMode); }
+
+    var loadDemoBtn = byId("btn-load-demo");
+    if (loadDemoBtn) { loadDemoBtn.addEventListener("click", loadDemoCase); }
+    var dismissChecklistBtn = byId("dismiss-quickstart");
+    if (dismissChecklistBtn) { dismissChecklistBtn.addEventListener("click", dismissChecklist); }
+    var exportBundleBtn = byId("export-bundle-btn");
+    if (exportBundleBtn) { exportBundleBtn.addEventListener("click", exportCaseBundle); }
+    var bundleFileInput = byId("bundle-file-input");
+    if (bundleFileInput) {
+      bundleFileInput.addEventListener("change", function () {
+        if (bundleFileInput.files && bundleFileInput.files[0]) {
+          importCaseBundleFile(bundleFileInput.files[0]);
+          bundleFileInput.value = "";
+        }
       });
     }
+    var importBundleBtn = byId("import-bundle-btn");
+    if (importBundleBtn && bundleFileInput) {
+      importBundleBtn.addEventListener("click", function () { bundleFileInput.click(); });
+    }
+    var importEmptyBtn = byId("btn-import-bundle-empty");
+    if (importEmptyBtn && bundleFileInput) {
+      importEmptyBtn.addEventListener("click", function () { bundleFileInput.click(); });
+    }
+
+    var openCmdBtn = byId("open-cmd-palette");
+    if (openCmdBtn) { openCmdBtn.addEventListener("click", openCommandPalette); }
+    var closeCmdBtn = byId("close-cmd-palette");
+    if (closeCmdBtn) { closeCmdBtn.addEventListener("click", closeCommandPalette); }
+    var cmdModal = byId("cmd-palette-modal");
+    if (cmdModal) {
+      cmdModal.addEventListener("click", function (event) {
+        if (event.target === cmdModal) { closeCommandPalette(); }
+      });
+    }
+    var cmdInput = byId("cmd-palette-input");
+    if (cmdInput) {
+      cmdInput.addEventListener("input", function () {
+        cmdSelectedIdx = 0;
+        renderCommandPaletteResults();
+      });
+      cmdInput.addEventListener("keydown", function (event) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          if (cmdFiltered.length) {
+            cmdSelectedIdx = (cmdSelectedIdx + 1) % cmdFiltered.length;
+            renderCommandPaletteResults();
+          }
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          if (cmdFiltered.length) {
+            cmdSelectedIdx = (cmdSelectedIdx - 1 + cmdFiltered.length) % cmdFiltered.length;
+            renderCommandPaletteResults();
+          }
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          var chosen = cmdFiltered[cmdSelectedIdx];
+          if (chosen) {
+            closeCommandPalette();
+            markChecklistStep(3);
+            chosen.run();
+          }
+        }
+      });
+    }
+
+    var openMcpBtn = byId("open-mcp-modal");
+    if (openMcpBtn) { openMcpBtn.addEventListener("click", openMcpSetup); }
+    var openMcpEmptyBtn = byId("btn-open-mcp-empty");
+    if (openMcpEmptyBtn) { openMcpEmptyBtn.addEventListener("click", openMcpSetup); }
+    var closeMcpBtn = byId("close-mcp-setup");
+    if (closeMcpBtn) { closeMcpBtn.addEventListener("click", closeMcpSetup); }
+    var mcpModal = byId("mcp-setup-modal");
+    if (mcpModal) {
+      mcpModal.addEventListener("click", function (event) {
+        if (event.target === mcpModal) { closeMcpSetup(); }
+      });
+    }
+    var mcpTabs = byId("mcp-client-tabs");
+    if (mcpTabs) {
+      mcpTabs.addEventListener("click", function (event) {
+        var btn = event.target && event.target.closest ? event.target.closest("[data-mcp-client]") : null;
+        if (btn) { fetchMcpConfig(btn.getAttribute("data-mcp-client")); }
+      });
+    }
+    var copyMcpBtn = byId("copy-mcp-config-btn");
+    if (copyMcpBtn) {
+      copyMcpBtn.addEventListener("click", function () {
+        var pre = byId("mcp-config-pre");
+        copyTextToClipboard(pre ? pre.textContent : "", byId("mcp-copy-status"));
+      });
+    }
+
+    document.addEventListener("keydown", function (event) {
+      if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "k") {
+        event.preventDefault();
+        var cm = byId("cmd-palette-modal");
+        if (cm && !cm.hidden) { closeCommandPalette(); }
+        else { openCommandPalette(); }
+      } else if (event.key === "Escape") {
+        closeCommandPalette();
+        closeMcpSetup();
+        closeApiKeys();
+        var sm = byId("scope-auth-modal");
+        if (sm && !sm.hidden) { closeScopeAuthModal(false); }
+      }
+    });
+
+    var dosModeR = byId("dossier-mode-rendered");
+    if (dosModeR) { dosModeR.addEventListener("click", function () { setDossierMode("rendered"); }); }
+    var dosModeRaw = byId("dossier-mode-raw");
+    if (dosModeRaw) { dosModeRaw.addEventListener("click", function () { setDossierMode("raw"); }); }
+    var dosPrint = byId("dossier-print-btn");
+    if (dosPrint) { dosPrint.addEventListener("click", function () { window.print(); }); }
+
     var caseSelect = byId("case-select");
     if (caseSelect) {
       caseSelect.addEventListener("change", function () {
@@ -3612,9 +4965,26 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     var runDoctorBtn = byId("run-doctor-btn");
     if (runDoctorBtn) { runDoctorBtn.addEventListener("click", runDoctorCheck); }
     var saveAiBtn = byId("save-ai-config");
-    if (saveAiBtn) { saveAiBtn.addEventListener("click", saveAiConfig); }
+    if (saveAiBtn) { saveAiBtn.addEventListener("click", function () { saveAiConfig(null); }); }
     var probeAiBtn = byId("refresh-ai-status");
     if (probeAiBtn) { probeAiBtn.addEventListener("click", function () { refreshAiStatus(true); }); }
+    var aiLabApplyBtn = byId("ai-lab-apply-btn");
+    if (aiLabApplyBtn) {
+      aiLabApplyBtn.addEventListener("click", function () {
+        var sel = byId("ai-lab-preset");
+        var preset = sel ? sel.value : "disabled";
+        saveAiConfig({ preset: preset, enabled: preset !== "disabled" });
+      });
+    }
+    var aiLabProbeBtn = byId("ai-lab-probe-btn");
+    if (aiLabProbeBtn) { aiLabProbeBtn.addEventListener("click", function () { refreshAiStatus(true); }); }
+    var aiRailPreset = byId("ai-preset");
+    if (aiRailPreset) {
+      aiRailPreset.addEventListener("change", function () {
+        var preset = aiRailPreset.value;
+        if (byId("ai-enabled")) { byId("ai-enabled").checked = preset !== "disabled"; }
+      });
+    }
     var reflectBtn = byId("run-reflect-btn");
     if (reflectBtn) { reflectBtn.addEventListener("click", runCaseReflection); }
     var mediaBtn = byId("analyze-media-btn");
@@ -3663,6 +5033,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     refreshToolsHealth();
     refreshAiStatus(false);
     syncGraphRendererVisibility();
+    setDossierMode("rendered");
   }
 
   if (document.readyState === "loading") {

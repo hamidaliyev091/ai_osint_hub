@@ -10,13 +10,16 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.13"]
 
     steps:
@@ -27,7 +30,33 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip build
           python -m pip install -e ".[dev]"
       - name: Run offline pytest suite
         run: python -m pytest -q
+      - name: Build and verify wheel package data
+        run: |
+          python -m build --wheel
+          python -c "import glob, zipfile; whl = glob.glob('dist/*.whl')[0]; names = zipfile.ZipFile(whl).namelist(); assert any(n.endswith('hub/static/vendor/cytoscape.min.js') for n in names), f'Missing cytoscape.min.js in {whl}: {names}'; print('Verified wheel:', whl)"
+      - name: Verify installed CLI and doctor inventory
+        run: |
+          ai-osint-hub --help
+          ai-osint-hub doctor --no-smoke
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build core image and verify non-root CLI
+        run: |
+          docker build --target core -t ai-osint-hub:core .
+          docker run --rm ai-osint-hub:core ai-osint-hub --help
+          uid="$(docker run --rm ai-osint-hub:core id -u)"
+          test "$uid" = "10001"
+      - name: Build full image and verify non-root CLI
+        run: |
+          docker build --target full -t ai-osint-hub:full .
+          docker run --rm ai-osint-hub:full ai-osint-hub --help
+          uid="$(docker run --rm ai-osint-hub:full id -u)"
+          test "$uid" = "10001"

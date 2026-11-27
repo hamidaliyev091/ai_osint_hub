@@ -14,6 +14,9 @@ adapters over these methods.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -230,10 +233,13 @@ class InvestigationService:
 
     # ── 4. tools ───────────────────────────────────────────────────
 
-    def doctor(self, *, provision: bool = False) -> dict[str, Any]:
+    def doctor(self, *, provision: bool = False, smoke: bool = True) -> dict[str, Any]:
         """Verify (and optionally provision) the whole toolchain."""
         from hub.toolchain.doctor import run_doctor
 
+        params = inspect.signature(run_doctor).parameters
+        if "smoke" in params:
+            return run_doctor(provision=provision, smoke=smoke)
         return run_doctor(provision=provision)
 
     # ── credentials (CLI/Web parity) ──────────────────────────────
@@ -460,6 +466,114 @@ class InvestigationService:
             return result if isinstance(result, dict) else {"status": "ok", "result": result}
         finally:
             store.close()
+
+    # ── 7. demo / portable case bundles / MCP client snippets ─────
+
+    def seed_demo(self, *, overwrite: bool = True) -> dict[str, Any]:
+        """Seed the offline synthetic Aurora Meridian demo investigation."""
+        try:
+            from hub.demo import seed_demo_case
+        except ImportError as exc:
+            return {"status": "error", "errors": [f"demo module unavailable: {exc}"]}
+
+        inv_dir = self.engine().state_root()
+        try:
+            params = inspect.signature(seed_demo_case).parameters
+            if "investigations_dir" in params:
+                return seed_demo_case(overwrite=overwrite, investigations_dir=inv_dir)
+            base = inv_dir.parent if inv_dir.name == "investigations" else inv_dir
+            return seed_demo_case(base, overwrite=overwrite)
+        except (FileExistsError, EngineError, ValueError, OSError) as exc:
+            return {"status": "error", "errors": [str(exc)]}
+
+    def export_bundle(
+        self,
+        target_id: str,
+        *,
+        out_path: Optional[str | Path] = None,
+        redact_pii: bool = False,
+    ) -> tuple[bytes, dict[str, Any]]:
+        """Export an investigation as a verified ``.osintcase.zip`` bundle."""
+        from hub.bundle import export_case_bundle
+
+        inv_dir = self.engine().state_root()
+        return export_case_bundle(
+            None,
+            target_id,
+            out_path=out_path,
+            redact_pii=redact_pii,
+            investigations_dir=inv_dir,
+        )
+
+    def import_bundle(
+        self,
+        source: bytes | str | Path,
+        *,
+        overwrite: bool = False,
+        new_target_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Validate and atomically import a ``.osintcase.zip`` bundle."""
+        from hub.bundle import import_case_bundle
+
+        inv_dir = self.engine().state_root()
+        return import_case_bundle(
+            None,
+            source,
+            overwrite=overwrite,
+            new_target_id=new_target_id,
+            investigations_dir=inv_dir,
+        )
+
+    def mcp_config(self, client: str = "antigravity") -> dict[str, Any]:
+        """Generate a ready-to-paste MCP client configuration snippet."""
+        client_norm = (client or "antigravity").strip().lower()
+        repo_root = str(Path(__file__).resolve().parents[1])
+        python_cmd = sys.executable or "python"
+
+        hints = {
+            "antigravity": "~/.gemini/antigravity/mcp_config.json",
+            "claude": "%APPDATA%\\Claude\\claude_desktop_config.json (Windows) | ~/Library/Application Support/Claude/claude_desktop_config.json (macOS)",
+            "cursor": "~/.cursor/mcp.json (or .cursor/mcp.json)",
+            "vscode": ".vscode/mcp.json",
+        }
+        if client_norm not in hints:
+            return {
+                "status": "error",
+                "errors": [
+                    f"Unsupported MCP client {client!r}. Expected one of: "
+                    + ", ".join(sorted(hints))
+                ],
+            }
+
+        server_entry: dict[str, Any] = {
+            "command": python_cmd,
+            "args": ["-m", "hub.mcp_server"],
+            "cwd": repo_root,
+        }
+        if client_norm == "vscode":
+            snippet: dict[str, Any] = {
+                "servers": {
+                    "ai-osint-hub": {
+                        "type": "stdio",
+                        **server_entry,
+                    }
+                }
+            }
+        else:
+            snippet = {
+                "mcpServers": {
+                    "ai-osint-hub": server_entry,
+                }
+            }
+
+        return {
+            "status": "ok",
+            "client": client_norm,
+            "config_path_hint": hints[client_norm],
+            "snippet": snippet,
+            "snippet_json": json.dumps(snippet, indent=2),
+            "supported_clients": ["antigravity", "claude", "cursor", "vscode"],
+        }
 
 
 # ════════════════════════════════════════════════════════════════════════

@@ -202,6 +202,22 @@ async def chat_completion(
     )
 
 
+def _effective_ollama_num_ctx(config: AIConfig) -> int:
+    if "num_ctx" in config.model_fields_set:
+        return int(config.num_ctx)
+    if "ollama_num_ctx" in config.model_fields_set:
+        return int(config.ollama_num_ctx)
+    return int(config.num_ctx or config.ollama_num_ctx)
+
+
+def _effective_ollama_keep_alive(config: AIConfig) -> str:
+    if "keep_alive" in config.model_fields_set and config.keep_alive:
+        return str(config.keep_alive)
+    if "ollama_keep_alive" in config.model_fields_set and config.ollama_keep_alive:
+        return str(config.ollama_keep_alive)
+    return str(config.keep_alive or config.ollama_keep_alive or "2m")
+
+
 async def _ollama_chat(
     client: httpx.AsyncClient,
     config: AIConfig,
@@ -218,6 +234,14 @@ async def _ollama_chat(
     user_msg: dict[str, Any] = {"role": "user", "content": user_prompt}
     if images_b64:
         user_msg["images"] = images_b64
+    num_ctx = _effective_ollama_num_ctx(config)
+    keep_alive = _effective_ollama_keep_alive(config)
+    options: dict[str, Any] = {
+        "temperature": config.temperature,
+        "num_predict": max_tokens,
+    }
+    if num_ctx > 0:
+        options["num_ctx"] = num_ctx
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -225,13 +249,10 @@ async def _ollama_chat(
             user_msg,
         ],
         "stream": False,
-        "keep_alive": config.ollama_keep_alive,
-        "options": {
-            "num_ctx": config.ollama_num_ctx,
-            "temperature": config.temperature,
-            "num_predict": max_tokens,
-        },
+        "options": options,
     }
+    if keep_alive:
+        payload["keep_alive"] = keep_alive
     if json_mode:
         payload["format"] = "json"
     url = f"{config.ollama_host.rstrip('/')}/api/chat"
@@ -522,16 +543,16 @@ async def fetch_embeddings(
             if provider == AIProviderKind.OLLAMA:
                 model = (model_override or config.ollama_embedding_model).strip()
                 url = f"{config.ollama_host.rstrip('/')}/api/embeddings"
+                keep_alive = _effective_ollama_keep_alive(config)
                 vectors: list[list[float]] = []
                 for item in clean_texts:
-                    resp = await client.post(
-                        url,
-                        json={
-                            "model": model,
-                            "prompt": item,
-                            "keep_alive": config.ollama_keep_alive,
-                        },
-                    )
+                    emb_payload: dict[str, Any] = {
+                        "model": model,
+                        "prompt": item,
+                    }
+                    if keep_alive:
+                        emb_payload["keep_alive"] = keep_alive
+                    resp = await client.post(url, json=emb_payload)
                     if resp.status_code >= 400:
                         return EmbeddingResponse(
                             ok=False,

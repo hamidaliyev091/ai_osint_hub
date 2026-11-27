@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hub.tools import capabilities, locator
+from hub.tools.locator import install_hint
 from hub.tools.runtime import scrub_environment
 
 SMOKE_TIMEOUT_SEC = 60
@@ -73,6 +74,7 @@ class ToolCheck:
     detail: str = ""
     auth_status: str = "NOT_REQUIRED"
     auth_detail: str = ""
+    install_hint: str = ""
 
     @property
     def auth_ready(self) -> bool:
@@ -92,6 +94,7 @@ class ToolCheck:
             "auth_status": self.auth_status,
             "auth_detail": self.auth_detail,
             "auth_ready": self.auth_ready,
+            "install_hint": self.install_hint,
             "ok": bool(self.available and self.smoke_ok),
         }
 
@@ -142,28 +145,36 @@ def smoke_tool(resolved: locator.ResolvedTool, tool_id: str, *,
     return bool(ok), process.returncode, output
 
 
-def check_tool(tool_id: str, *, force: bool = True) -> ToolCheck:
+def check_tool(tool_id: str, *, force: bool = True, smoke: bool = True) -> ToolCheck:
     capability = capabilities.get_tool(tool_id)
     if capability is None:
-        return ToolCheck(tool_id=tool_id, available=False, detail="unknown tool")
+        return ToolCheck(tool_id=tool_id, available=False, detail="unknown tool",
+                         install_hint=install_hint(tool_id))
     auth_status, auth_detail = capabilities.capability_auth(capability)
     if tool_id.lower() in _BUILTIN_TOOLS or capability.invocation.kind == "builtin":
         status = capabilities.health_check(tool_id, force=force)
+        avail = bool(status and status.available)
         return ToolCheck(
             tool_id=tool_id,
-            available=bool(status and status.available),
+            available=avail,
             resolver="builtin",
             location=capability.invocation.builtin_ref or "",
-            smoke_ok=bool(status and status.available),
-            smoke_exit_code=0 if status and status.available else None,
+            smoke_ok=avail,
+            smoke_exit_code=0 if avail else None,
             smoke_output=(status.detail if status else "")[:SMOKE_OUTPUT_LIMIT],
             detail=status.detail if status else "",
             auth_status=auth_status,
             auth_detail=auth_detail,
+            install_hint="" if avail else install_hint(tool_id),
         )
     binary = capability.invocation.binary or tool_id
     resolved = locator.resolve_tool(tool_id, binary, force=force)
-    smoke_ok, exit_code, output = smoke_tool(resolved, tool_id)
+    if smoke:
+        smoke_ok, exit_code, output = smoke_tool(resolved, tool_id)
+    else:
+        smoke_ok = resolved.available
+        exit_code = None
+        output = "smoke skipped (--no-smoke)" if resolved.available else ""
     return ToolCheck(
         tool_id=tool_id,
         available=resolved.available,
@@ -175,10 +186,12 @@ def check_tool(tool_id: str, *, force: bool = True) -> ToolCheck:
         detail=resolved.detail,
         auth_status=auth_status,
         auth_detail=auth_detail,
+        install_hint="" if resolved.available else install_hint(tool_id),
     )
 
 
-def run_doctor(*, provision: bool = False, force: bool = True) -> dict[str, Any]:
+def run_doctor(*, provision: bool = False, force: bool = True,
+               smoke: bool = True) -> dict[str, Any]:
     """Check every registered tool; optionally provision first."""
     started = time.time()
     provisioning: dict[str, Any] = {}
@@ -186,7 +199,7 @@ def run_doctor(*, provision: bool = False, force: bool = True) -> dict[str, Any]
         from hub.toolchain.provision import provision_toolchain
         provisioning = provision_toolchain()
         locator.reset_cache()
-    checks = [check_tool(cap.tool_id, force=force)
+    checks = [check_tool(cap.tool_id, force=force, smoke=smoke)
               for cap in capabilities.all_capabilities()]
     rows = [check.as_dict() for check in checks]
     healthy = [row for row in rows if row["ok"]]
@@ -203,6 +216,7 @@ def run_doctor(*, provision: bool = False, force: bool = True) -> dict[str, Any]
         "total": len(rows),
         "available": len(available),
         "healthy": len(healthy),
+        "smoke_skipped": not smoke,
         "missing": missing,
         "smoke_failed": smoke_failed,
         "auth_ready": len(auth_ready),
@@ -242,9 +256,10 @@ def render_doctor_table(rows: list[dict[str, Any]]) -> str:
 
 
 def doctor_summary_line(result: dict[str, Any]) -> str:
+    mode_note = "smoke skipped" if result.get("smoke_skipped") else f"smoke-checked in {result['duration_sec']}s"
     line = (f"{result['available']}/{result['total']} tools AVAILABLE, "
             f"{result['healthy']}/{result['total']} healthy "
-            f"(smoke-checked in {result['duration_sec']}s)")
+            f"({mode_note})")
     if "auth_ready" in result:
         line += (f"; credentials ready for {result['auth_ready']}/{result['total']} "
                  f"tools")
@@ -264,6 +279,9 @@ def format_doctor_report(result: dict[str, Any]) -> str:
     ]
     if result["missing"]:
         lines.append("Missing: " + ", ".join(result["missing"]))
+        lines.append("Install hints:")
+        for tool_id in result["missing"]:
+            lines.append(f"  - {tool_id}: {install_hint(tool_id)}")
     if result["smoke_failed"]:
         lines.append("Available but smoke-failed: " + ", ".join(result["smoke_failed"]))
     if result.get("auth_blocked"):
@@ -292,4 +310,5 @@ __all__ = [
     "render_doctor_table",
     "format_doctor_report",
     "doctor_summary_line",
+    "install_hint",
 ]

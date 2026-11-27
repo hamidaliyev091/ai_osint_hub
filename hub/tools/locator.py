@@ -26,6 +26,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,9 @@ WSL_ENV = "AI_OSINT_HUB_WSL"                 # "0" disables the WSL bridge
 WSL_DISTRO_ENV = "AI_OSINT_HUB_WSL_DISTRO"   # default: Ubuntu / first distro
 CACHE_TTL_SEC = 45.0
 WSL_PROBE_TIMEOUT_SEC = 12
+NMAP_PROBE_TIMEOUT_SEC = 2.0
+TRAMPOLINE_PROBE_TIMEOUT_SEC = 3.0
+_DLL_INIT_FAILED_CODES = frozenset({-1073741502, 3221225794})  # 0xC0000142
 # Persisted resolution cache: keeps repeated CLI/MCP processes from paying the
 # WSL cold-start probe cost on every invocation.
 DISK_CACHE_TTL_SEC = 900.0
@@ -51,6 +55,7 @@ __all__ = [
     "home_bin",
     "managed_venv_bin",
     "managed_bin_dirs",
+    "extra_host_bin_dirs",
     "python_executable",
     "resolve_tool",
     "reset_cache",
@@ -59,6 +64,7 @@ __all__ = [
     "write_wrapper_launcher",
     "remove_wrapper_launcher",
     "enrich_child_env",
+    "install_hint",
     "wsl_available",
     "wsl_distro",
     "wsl_which",
@@ -491,14 +497,117 @@ def _resolve_wsl(tool_id: str, binary: str) -> Optional[ResolvedTool]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Native resolution
+# Native resolution & cross-platform hints
 # ════════════════════════════════════════════════════════════════════════
+
+def _creation_flags() -> dict[str, Any]:
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
 
 def _windows_executable_names(binary: str) -> list[str]:
     if os.name != "nt":
         return [binary]
     suffixes = [""] if Path(binary).suffix else [".exe", ".com", ".cmd", ".bat"]
     return [binary + suffix for suffix in suffixes]
+
+
+def _probe_dll_init_failed(exe_path: Path) -> bool:
+    """Return True if a Windows trampoline fails with STATUS_DLL_INIT_FAILED (0xC0000142)."""
+    for flag in ("--help", "--version"):
+        try:
+            process = subprocess.run(
+                [str(exe_path), flag],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=TRAMPOLINE_PROBE_TIMEOUT_SEC,
+                **_creation_flags(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return process.returncode in _DLL_INIT_FAILED_CODES
+    return False
+
+
+def _find_console_script_entrypoint(site_packages: Path, script_name: str) -> Optional[str]:
+    """Look up ``module:func`` for ``script_name`` in dist-info entry_points.txt."""
+    if not site_packages.is_dir():
+        return None
+    target_key = script_name.strip().lower()
+    for ep_file in sorted(site_packages.glob("*.dist-info/entry_points.txt")):
+        try:
+            lines = ep_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        in_console_scripts = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                in_console_scripts = line[1:-1].strip().lower() == "console_scripts"
+                continue
+            if not in_console_scripts or "=" not in line:
+                continue
+            name_part, _, spec_part = line.partition("=")
+            if name_part.strip().lower() == target_key:
+                spec = spec_part.split("[", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z0-9_.]+:[A-Za-z0-9_.]+", spec):
+                    return spec
+    return None
+
+
+def _resolve_venv_python_entrypoint(
+    directory: Path,
+    candidate: Path,
+    source: str,
+) -> Optional[ResolvedTool]:
+    """Bypass a broken Windows uv-trampoline .exe using the venv's python.exe."""
+    venv_python = directory / "python.exe"
+    if not venv_python.is_file():
+        return None
+    stem = candidate.stem
+    site_packages = directory.parent / "Lib" / "site-packages"
+    entry_spec = _find_console_script_entrypoint(site_packages, stem)
+    if entry_spec is not None:
+        mod_name, _, func_path = entry_spec.partition(":")
+        code = (
+            "import functools, importlib, sys; "
+            f"sys.argv[0] = {stem!r}; "
+            f"fn = functools.reduce(getattr, {func_path.split('.')!r}, "
+            f"importlib.import_module({mod_name!r})); "
+            "sys.exit(fn())"
+        )
+        return ResolvedTool(
+            tool_id="",
+            available=True,
+            source=source,
+            detail=f"managed venv python entrypoint {entry_spec} (trampoline bypass)",
+            argv_prefix=(str(venv_python), "-c", code),
+            binary_path=str(candidate),
+        )
+    script_py = directory / f"{stem}-script.py"
+    if script_py.is_file():
+        return ResolvedTool(
+            tool_id="",
+            available=True,
+            source=source,
+            detail=f"managed venv script {script_py} (trampoline bypass)",
+            argv_prefix=(str(venv_python), str(script_py)),
+            binary_path=str(candidate),
+        )
+    main_py = site_packages / stem / "__main__.py"
+    if main_py.is_file():
+        return ResolvedTool(
+            tool_id="",
+            available=True,
+            source=source,
+            detail=f"managed venv module {stem} (trampoline bypass)",
+            argv_prefix=(str(venv_python), "-m", stem),
+            binary_path=str(candidate),
+        )
+    return None
 
 
 def _find_in_managed(binary: str) -> Optional[ResolvedTool]:
@@ -515,6 +624,15 @@ def _find_in_managed(binary: str) -> Optional[ResolvedTool]:
                 # runtime does not execute them. A shell-free launcher descriptor
                 # (created by --provision) takes priority over this path.
                 continue
+            if (
+                os.name == "nt"
+                and source == "managed-venv"
+                and candidate.suffix.lower() == ".exe"
+                and _probe_dll_init_failed(candidate)
+            ):
+                fallback = _resolve_venv_python_entrypoint(directory, candidate, source)
+                if fallback is not None:
+                    return fallback
             return ResolvedTool(
                 tool_id="", available=True, source=source,
                 detail=f"managed executable {candidate}",
@@ -523,8 +641,26 @@ def _find_in_managed(binary: str) -> Optional[ResolvedTool]:
     return None
 
 
+def extra_host_bin_dirs(platform_name: Optional[str] = None) -> list[Path]:
+    """Extra non-default PATH directories checked on macOS and Linux."""
+    plat = (platform_name or sys.platform).lower()
+    if plat.startswith("win") or (platform_name is None and os.name == "nt"):
+        return []
+    if plat == "darwin":
+        return [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+    if plat.startswith("linux"):
+        return [Path.home() / ".local" / "bin", Path("/usr/local/bin"), Path("/snap/bin")]
+    return []
+
+
 def _resolve_host_path(tool_id: str, binary: str) -> Optional[ResolvedTool]:
     path = shutil.which(binary)
+    if not path:
+        for directory in extra_host_bin_dirs():
+            candidate = directory / binary
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                path = str(candidate)
+                break
     if not path:
         return None
     suffix = Path(path).suffix.lower()
@@ -541,6 +677,123 @@ def _resolve_host_path(tool_id: str, binary: str) -> Optional[ResolvedTool]:
         detail=f"host PATH executable {path}",
         argv_prefix=(path,), binary_path=path,
     )
+
+
+def _probe_windows_nmap(binary_path: str) -> bool:
+    """Return True if native Windows nmap responds to --version within 2.0s."""
+    try:
+        process = subprocess.run(
+            [binary_path, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=NMAP_PROBE_TIMEOUT_SEC,
+            **_creation_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return process.returncode == 0
+
+
+def _normalize_platform(platform_name: Optional[str] = None) -> str:
+    raw = (platform_name or sys.platform).strip().lower()
+    if raw in {"darwin", "mac", "macos", "osx"}:
+        return "darwin"
+    if raw.startswith("win") or raw == "nt":
+        return "windows"
+    return "linux"
+
+
+_INSTALL_HINTS: dict[str, dict[str, str]] = {
+    "holehe": {
+        "darwin": "uv tool install holehe (or ai-osint-hub doctor --provision)",
+        "linux": "uv tool install holehe (or ai-osint-hub doctor --provision)",
+        "windows": "uv tool install holehe (or ai-osint-hub doctor --provision)",
+    },
+    "maigret": {
+        "darwin": "uv tool install maigret (or ai-osint-hub doctor --provision)",
+        "linux": "uv tool install maigret (or ai-osint-hub doctor --provision)",
+        "windows": "uv tool install maigret (or ai-osint-hub doctor --provision)",
+    },
+    "h8mail": {
+        "darwin": "uv tool install h8mail (or ai-osint-hub doctor --provision)",
+        "linux": "uv tool install h8mail (or ai-osint-hub doctor --provision)",
+        "windows": "uv tool install h8mail (or ai-osint-hub doctor --provision)",
+    },
+    "sherlock": {
+        "darwin": "uv tool install sherlock-project (or brew install sherlock)",
+        "linux": "uv tool install sherlock-project (or ai-osint-hub doctor --provision)",
+        "windows": "uv tool install sherlock-project (or ai-osint-hub doctor --provision)",
+    },
+    "ghunt": {
+        "darwin": "uv tool install ghunt (or ai-osint-hub doctor --provision)",
+        "linux": "uv tool install ghunt (or ai-osint-hub doctor --provision)",
+        "windows": "uv tool install ghunt (or ai-osint-hub doctor --provision)",
+    },
+    "theharvester": {
+        "darwin": "ai-osint-hub doctor --provision (or brew install theharvester)",
+        "linux": "ai-osint-hub doctor --provision (or sudo apt install -y theharvester)",
+        "windows": "ai-osint-hub doctor --provision",
+    },
+    "phoneinfoga": {
+        "darwin": "brew install phoneinfoga (or ai-osint-hub doctor --provision)",
+        "linux": "ai-osint-hub doctor --provision",
+        "windows": "ai-osint-hub doctor --provision",
+    },
+    "nmap": {
+        "darwin": "brew install nmap",
+        "linux": "sudo apt install -y nmap",
+        "windows": "winget install Insecure.Nmap (or install in WSL: sudo apt install -y nmap)",
+    },
+    "amass": {
+        "darwin": "brew install amass",
+        "linux": "sudo snap install amass (or go install github.com/owasp-amass/amass/v4/...@master)",
+        "windows": "scoop install amass (or go install github.com/owasp-amass/amass/v4/...@master)",
+    },
+    "gobuster": {
+        "darwin": "brew install gobuster",
+        "linux": "sudo apt install -y gobuster",
+        "windows": "go install github.com/OJ/gobuster/v3@latest (or WSL: sudo apt install -y gobuster)",
+    },
+    "whatweb": {
+        "darwin": "brew install whatweb",
+        "linux": "sudo apt install -y whatweb",
+        "windows": "ai-osint-hub doctor --provision (installs in WSL2: sudo apt install -y whatweb)",
+    },
+    "hashcat": {
+        "darwin": "brew install hashcat",
+        "linux": "sudo apt install -y hashcat",
+        "windows": "ai-osint-hub doctor --provision (or winget install Hashcat.Hashcat)",
+    },
+    "hydra": {
+        "darwin": "brew install hydra",
+        "linux": "sudo apt install -y hydra",
+        "windows": "ai-osint-hub doctor --provision (installs in WSL2: sudo apt install -y hydra)",
+    },
+}
+
+_BUILTIN_TOOL_IDS = frozenset({
+    "dns_lookup", "http_headers", "tls_cert", "snscrape", "photon_crawler",
+    "github_osint", "virustotal_lookup", "shodan_lookup", "censys_lookup",
+    "hunter_lookup", "gravatar_lookup", "pgp_keyserver", "rdap_lookup",
+    "wayback_cdx", "darkweb_ahmia", "crtsh_lookup", "asn_bgp_lookup",
+    "favicon_hash", "media_forensics",
+})
+
+
+def install_hint(tool_id: str, platform_name: Optional[str] = None) -> str:
+    """Return a concise per-OS installation command for ``tool_id``."""
+    key = tool_id.strip().lower()
+    if key in _BUILTIN_TOOL_IDS:
+        return "Built-in Python collector (included with ai-osint-hub)"
+    plat = _normalize_platform(platform_name)
+    per_os = _INSTALL_HINTS.get(key)
+    if per_os and plat in per_os:
+        return per_os[plat]
+    if plat == "darwin":
+        return f"brew install {key} (or ai-osint-hub doctor --provision)"
+    if plat == "linux":
+        return f"sudo apt install -y {key} (or ai-osint-hub doctor --provision)"
+    return "ai-osint-hub doctor --provision"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -594,14 +847,42 @@ def _resolve_uncached(tool_id: str, binary: str, *, allow_wrappers: bool,
 
     managed = _find_in_managed(binary)
     if managed is not None:
-        return ResolvedTool(
-            tool_id=tool_id, available=managed.available, source=managed.source,
-            detail=managed.detail, argv_prefix=managed.argv_prefix,
-            binary_path=managed.binary_path, env_extra=dict(managed.env_extra),
-        )
+        if (
+            os.name == "nt"
+            and binary.strip().lower() in {"nmap", "nmap.exe"}
+            and managed.binary_path
+            and not _probe_windows_nmap(managed.binary_path)
+        ):
+            if allow_wsl:
+                wsl = _resolve_wsl(tool_id, "nmap")
+                if wsl is not None:
+                    return wsl
+        else:
+            return ResolvedTool(
+                tool_id=tool_id, available=managed.available, source=managed.source,
+                detail=managed.detail, argv_prefix=managed.argv_prefix,
+                binary_path=managed.binary_path, env_extra=dict(managed.env_extra),
+            )
 
     host = _resolve_host_path(tool_id, binary)
     if host is not None:
+        if (
+            os.name == "nt"
+            and binary.strip().lower() in {"nmap", "nmap.exe"}
+            and host.available
+            and host.binary_path
+            and not _probe_windows_nmap(host.binary_path)
+        ):
+            if allow_wsl:
+                wsl = _resolve_wsl(tool_id, "nmap")
+                if wsl is not None:
+                    return wsl
+            return ResolvedTool(
+                tool_id=tool_id, available=False, source="path",
+                detail=(f"native Windows nmap at {host.binary_path} timed out or failed "
+                        f"2.0s probe; WSL fallback unavailable"),
+                binary_path=host.binary_path,
+            )
         return host
 
     if allow_wsl:

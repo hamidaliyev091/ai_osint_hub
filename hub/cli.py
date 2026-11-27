@@ -13,10 +13,16 @@ All output is JSON when ``--json`` is passed, so the CLI is scriptable.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import socket
 import sys
+import threading
+import webbrowser
+from pathlib import Path
 from typing import Any, Optional
 
+from hub.bundle import BUNDLE_EXTENSION
 from hub.service import InvestigationService
 
 CLI_VERSION = "2.0.0"
@@ -88,11 +94,18 @@ def cmd_doctor(service: InvestigationService, args) -> int:
     """Verify (and optionally provision) the complete toolchain."""
     from hub.toolchain.doctor import format_doctor_report, run_doctor
 
-    result = run_doctor(provision=args.provision)
+    smoke = not getattr(args, "no_smoke", False)
+    params = inspect.signature(run_doctor).parameters
+    if "smoke" in params:
+        result = run_doctor(provision=args.provision, smoke=smoke)
+    else:
+        result = run_doctor(provision=args.provision)
     if args.json:
         _print_json(result)
     else:
         print(format_doctor_report(result))
+    if not smoke:
+        return 0
     return 0 if result["available"] == result["total"] else 1
 
 
@@ -319,6 +332,39 @@ def cmd_status(service: InvestigationService, args) -> int:
     return 0
 
 
+def _is_port_available(host: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in host and host != "0.0.0.0" else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _pick_free_port(host: str, preferred_port: int) -> int:
+    for candidate in range(preferred_port + 1, preferred_port + 21):
+        if _is_port_available(host, candidate):
+            return candidate
+    family = socket.AF_INET6 if ":" in host and host != "0.0.0.0" else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def _open_browser_soon(url: str) -> None:
+    def _launch() -> None:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+
+    timer = threading.Timer(0.6, _launch)
+    timer.daemon = True
+    timer.start()
+
+
 def cmd_serve(service: InvestigationService, args) -> int:
     """Launch the FastAPI AI OSINT Hub Web Workbench."""
     try:
@@ -327,8 +373,116 @@ def cmd_serve(service: InvestigationService, args) -> int:
         print(f"ERROR: web workbench unavailable: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         return 1
-    print(f"AI OSINT Hub Intelligence Workbench → http://{args.host}:{args.port}")
-    run_web(host=args.host, port=args.port)
+    chosen_port = int(args.port)
+    if getattr(args, "command", None) == "web":
+        if not _is_port_available(args.host, chosen_port):
+            if getattr(args, "no_port_fallback", False):
+                print(
+                    f"ERROR: port {chosen_port} on {args.host} is already in use",
+                    file=sys.stderr,
+                )
+                return 1
+            chosen_port = _pick_free_port(args.host, chosen_port)
+            print(f"Port {args.port} is busy; using free port {chosen_port}.")
+    url_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
+    url = f"http://{url_host}:{chosen_port}"
+    print(f"AI OSINT Hub Intelligence Workbench → {url}")
+    if getattr(args, "open", False):
+        _open_browser_soon(url)
+    run_web(host=args.host, port=chosen_port)
+    return 0
+
+
+def cmd_demo(service: InvestigationService, args) -> int:
+    result = service.seed_demo(overwrite=not args.no_overwrite)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    print(
+        f"✅ Seeded synthetic demo case {result.get('target_id')} "
+        f"({result.get('title', 'Aurora Meridian')})"
+    )
+    print(
+        f"   entities: {result.get('entity_count')}   "
+        f"claims: {result.get('claim_count')}   "
+        f"contradictions: {result.get('contradiction_count')}"
+    )
+    return 0
+
+
+def cmd_export(service: InvestigationService, args) -> int:
+    out_path = Path(args.out) if args.out else Path(f"{args.target_id}{BUNDLE_EXTENSION}")
+    try:
+        zip_bytes, manifest = service.export_bundle(
+            args.target_id,
+            out_path=out_path,
+            redact_pii=bool(args.redact_pii),
+        )
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        err = {"status": "error", "errors": [str(exc)]}
+        if args.json:
+            _print_json(err)
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    payload = {
+        "status": "ok",
+        "target_id": args.target_id,
+        "path": str(out_path.resolve()),
+        "bytes": len(zip_bytes),
+        "redacted": bool(manifest.get("redacted", False)),
+        "manifest": manifest,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        print(
+            f"✅ Exported {args.target_id} -> {payload['path']} "
+            f"({payload['bytes']} bytes, redacted={payload['redacted']}, "
+            f"files={len(manifest.get('files', {}))})"
+        )
+    return 0
+
+
+def cmd_import(service: InvestigationService, args) -> int:
+    try:
+        result = service.import_bundle(
+            args.bundle_path,
+            overwrite=bool(args.overwrite),
+            new_target_id=args.target_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError, OSError) as exc:
+        err = {"status": "error", "errors": [str(exc)]}
+        if args.json:
+            _print_json(err)
+        else:
+            print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(result)
+    else:
+        print(
+            f"✅ Imported {result['target_id']} into {result['path']} "
+            f"(files={result.get('file_count')}, redacted={result.get('redacted')})"
+        )
+    return 0
+
+
+def cmd_mcp_config(service: InvestigationService, args) -> int:
+    result = service.mcp_config(client=args.client)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    print(f"MCP client: {result['client']}")
+    print(f"Config path: {result['config_path_hint']}")
+    print()
+    print(result["snippet_json"])
     return 0
 
 
@@ -410,8 +564,20 @@ def cmd_ai(service: InvestigationService, args) -> int:
         if args.json:
             _print_json(result)
             return 0
-        print(f"AI status: enabled={result.get('enabled')} provider={result.get('provider')} "
-              f"model={result.get('model')}")
+        print(
+            f"AI status: enabled={result.get('enabled')} preset={result.get('preset')} "
+            f"provider={result.get('provider')} num_ctx={result.get('num_ctx')} "
+            f"keep_alive={result.get('keep_alive')}"
+        )
+        installed = result.get("installed_models") or []
+        missing = result.get("missing_models") or []
+        pulls = result.get("pull_commands") or []
+        if installed:
+            print("  installed models: " + ", ".join(installed))
+        if missing:
+            print("  missing models:   " + ", ".join(missing))
+        if pulls:
+            print("  pull commands:    " + " && ".join(pulls))
         return 0
     result = service.ai_reflect(args.target_id, provider=args.provider)
     if args.json:
@@ -459,6 +625,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify every tool with a real --version/--help smoke check")
     doctor.add_argument("--provision", action="store_true",
                         help="install missing tools into the managed bin dirs first")
+    doctor.add_argument("--no-smoke", action="store_true",
+                        help="inventory binaries without running --version/--help smoke checks")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=cmd_doctor)
 
@@ -481,7 +649,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     investigate = subparsers.add_parser(
         "investigate", help="run the autonomous investigation loop")
-    investigate.add_argument("raw_input", help="seed intelligence (name, email, username, domain, text)")
+    investigate.add_argument(
+        "raw_input",
+        nargs="?",
+        default="",
+        help="seed intelligence (name, email, username, domain, text; optional when structured flags are given)",
+    )
     investigate.add_argument("--target-id", default=None)
     investigate.add_argument("--max-iterations", type=int, default=None)
     investigate.add_argument("--max-tool-calls", type=int, default=None)
@@ -546,6 +719,52 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.set_defaults(handler=cmd_serve)
+
+    web_cmd = subparsers.add_parser(
+        "web", help="launch the Web Workbench (auto-picks free port; optional browser open)")
+    web_cmd.add_argument("--host", default="127.0.0.1")
+    web_cmd.add_argument("--port", type=int, default=8000)
+    web_cmd.add_argument("--open", action="store_true",
+                         help="open the workbench URL in the default browser")
+    web_cmd.add_argument("--no-port-fallback", action="store_true",
+                         help="fail instead of selecting a free port if --port is busy")
+    web_cmd.set_defaults(handler=cmd_serve)
+
+    demo_cmd = subparsers.add_parser(
+        "demo", help="seed the offline synthetic Aurora Meridian demo investigation")
+    demo_cmd.add_argument("--no-overwrite", action="store_true",
+                          help="refuse to overwrite an existing demo case")
+    demo_cmd.add_argument("--json", action="store_true")
+    demo_cmd.set_defaults(handler=cmd_demo)
+
+    export_cmd = subparsers.add_parser(
+        "export", help="export a case into a verified .osintcase.zip bundle")
+    export_cmd.add_argument("target_id")
+    export_cmd.add_argument("--out", default=None, help="output .osintcase.zip path")
+    export_cmd.add_argument("--redact-pii", action="store_true",
+                            help="scrub emails, phones, and secret tokens in the exported bundle")
+    export_cmd.add_argument("--json", action="store_true")
+    export_cmd.set_defaults(handler=cmd_export)
+
+    import_cmd = subparsers.add_parser(
+        "import", help="verify and import a .osintcase.zip case bundle")
+    import_cmd.add_argument("bundle_path")
+    import_cmd.add_argument("--overwrite", action="store_true",
+                            help="replace an existing case with the same target_id")
+    import_cmd.add_argument("--target-id", default=None,
+                            help="override target_id on import")
+    import_cmd.add_argument("--json", action="store_true")
+    import_cmd.set_defaults(handler=cmd_import)
+
+    mcp_cfg_cmd = subparsers.add_parser(
+        "mcp-config", help="print ready-to-paste MCP server config for an AI client")
+    mcp_cfg_cmd.add_argument(
+        "--client",
+        choices=["antigravity", "claude", "cursor", "vscode"],
+        default="antigravity",
+    )
+    mcp_cfg_cmd.add_argument("--json", action="store_true")
+    mcp_cfg_cmd.set_defaults(handler=cmd_mcp_config)
 
     status = subparsers.add_parser("status", help="current state + ranked pivots")
     status.add_argument("target_id")

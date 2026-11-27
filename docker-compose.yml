@@ -1,0 +1,45 @@
+services:
+  hub-core:
+    build:
+      context: .
+      target: core
+    profiles: ["core"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - osint_data:/data
+    environment:
+      AI_OSINT_HUB_HOME: /data
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  hub-full:
+    build:
+      context: .
+      target: full
+    profiles: ["full"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - osint_data:/data
+    environment:
+      AI_OSINT_HUB_HOME: /data
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ai"]
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  osint_data: {}
+  ollama_data: {}

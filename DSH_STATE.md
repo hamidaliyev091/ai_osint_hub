@@ -1034,6 +1034,9 @@ Phase 17: @-free usernames + email-derived seed handles + GitHub email→user/re
 Phase 18: Hybrid AI + Vision Forensics + Graph Analytics/Timeline/Diff/Waves +
           32/32 tools + Gruvbox Material Light Cytoscape Workbench + MCP App UI
           (723 passed, 18 skipped)
+v2.0.0 Public Release: Packaging/Docker/Launchers + Cross-Platform Locator +
+          Demo Case + Portable .osintcase.zip Bundles + Hardware AI Presets +
+          Workbench v2 UX + Full Security Audit + Release Docs Kit
 ```
 
 ## Phase 18 — Hybrid AI, Vision Forensics, Graph Analytics & Gruvbox Workbench (2026-11-27)
@@ -1076,6 +1079,25 @@ Phase 18: Hybrid AI + Vision Forensics + Graph Analytics/Timeline/Diff/Waves +
 - Independent Security Audit: **0 Critical / 0 High / 0 Medium** defects across all `hub/` changes.
 - `python -m hub.cli tools` → **`32/32 AVAILABLE · auth-ready 30/32`**.
 - `python -m pytest -q --tb=short` → **`723 passed, 18 skipped`** (0 failures; +35 new offline tests across `test_ai_layer.py`, `test_vision_media.py`, `test_graph_analytics_collectors.py`, and `test_workbench_gruvbox_security.py`; 18 skipped are opt-in `AI_OSINT_HUB_LIVE=1` live tests).
+
+## v2.0.0 Public Release — Packaging, UX, Bundles, Security Audit & Docs (2026-11-27)
+
+### Delivered
+
+- **Packaging, Containers, Launchers & Multi-OS CI (`pyproject.toml`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `scripts/launch.{ps1,sh}`, `.github/workflows/ci.yml`, `hub/tools/locator.py`, `hub/toolchain/doctor.py`):**
+  - Bundled `hub/static/**` package data (including `cytoscape.min.js`) and `Pillow>=10.0` in `pyproject.toml`.
+  - Multi-stage non-root `Dockerfile` (`core` & `full`, UID `10001`, `/data` volume, `HEALTHCHECK`) + `docker-compose.yml` (`127.0.0.1:8000` default bind) + one-click `launch.ps1`/`launch.sh`.
+  - Cross-platform `locator.py`: Windows `0xC0000142` managed-venv trampoline bypass (`theHarvester`), `2.0s` Windows `nmap` probe with WSL2 fallback, macOS/Linux extra host PATH search, `install_hint()`, and `doctor --no-smoke`.
+  - CI matrix expanded to `ubuntu-latest`, `windows-latest`, `macos-latest` × Python `3.11`/`3.13` + wheel asset check + `docker-build` job.
+- **Portable Bundles, Hardware AI Presets, CLI & MCP App (`hub/bundle.py`, `hub/ai/`, `hub/service.py`, `hub/cli.py`, `hub/mcp_server.py`):**
+  - `.osintcase.zip` export (`sqlite3.backup()`, optional `redact_pii=True`) and hardened import (Zip-Slip, backslash, symlink, streaming/ratio bomb caps, SHA-256 verification, `PRAGMA trusted_schema = OFF` + `integrity_check`).
+  - `AIHardwarePreset` (`disabled` default, `cpu_light`, `vram_8gb`, `vram_16gb_plus`, `cloud_byok`), `num_ctx`/`keep_alive`, and `get_ai_status` `pull_commands`.
+  - CLI `web`, `demo`, `export`, `import`, `mcp-config`, `doctor --no-smoke`, optional `investigate` `raw_input`; MCP `_meta.ui.visibility` + `content[0].text` fallback.
+- **Demo Case, Workbench v2 UX & Print Dossier (`hub/demo.py`, `hub/web.py`, `hub/reporting.py`):**
+  - Deterministic offline `case_demo_aurora` (`seed_demo_case`), `/api/demo`, `/api/investigations/{id}/bundle`, `/api/bundles/import`, `/api/mcp-config`, First-Run Empty State, Scope Authorization modal, `Ctrl/Cmd+K` Command Palette, DOM-built Markdown renderer (`http:`/`https:`/`mailto:` only), and `75ch` `@media print` polish.
+- **Static Security Audit, Offline QA & Docs (`tests/test_v2_release.py`, `README.md`, `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md`, `docs/MCP_USAGE.md`, `AGENTS.md`):**
+  - Independent static security audit: **0 Critical / 0 High / 0 Medium** findings across all release deliverables.
+  - Added `tests/test_v2_release.py` covering locator fallbacks, package data, `hub/demo.py`, `hub/bundle.py` round-trip & malicious bundle rejections, AI presets, CLI v2, Web v2 routes, DOM XSS safety, and MCP App fallback.
 
 ## Blockers
 None.

@@ -22,7 +22,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from hub.ai.models import AIConfig, AIProviderKind, AIStatusReport
+from hub.ai.models import (
+    AI_PRESETS_CATALOG,
+    AIConfig,
+    AIHardwarePreset,
+    AIProviderKind,
+    AIStatusReport,
+)
 from hub.security.redaction import masked_preview, register_secret, unregister_secret
 
 _LOCK = threading.RLock()
@@ -159,20 +165,90 @@ def save_ai_config(config: AIConfig) -> AIConfig:
     return config
 
 
+def _model_is_installed(required: str, installed: list[str]) -> bool:
+    req = (required or "").strip()
+    if not req:
+        return True
+    installed_set = {m.strip() for m in installed if m and m.strip()}
+    if req in installed_set:
+        return True
+    if ":" not in req and f"{req}:latest" in installed_set:
+        return True
+    return False
+
+
+def _required_ollama_models(config: AIConfig) -> list[str]:
+    if config.provider != AIProviderKind.OLLAMA and config.preset not in {
+        AIHardwarePreset.CPU_LIGHT,
+        AIHardwarePreset.VRAM_8GB,
+        AIHardwarePreset.VRAM_16GB_PLUS,
+    }:
+        return []
+    candidates = [config.ollama_model]
+    if config.vision_enabled and config.ollama_vision_model:
+        candidates.append(config.ollama_vision_model)
+    if config.ollama_embedding_model:
+        candidates.append(config.ollama_embedding_model)
+    unique: list[str] = []
+    for item in candidates:
+        name = (item or "").strip()
+        if name and name not in unique:
+            unique.append(name)
+    return unique
+
+
 def build_status_report(
     config: AIConfig,
     *,
     local_probes: dict[str, Any] | None = None,
 ) -> AIStatusReport:
     """Build a secret-redacted :class:`AIStatusReport` from ``config``."""
+    probes = dict(local_probes or {})
+    installed_models: list[str] = []
+    for probe_key in ("ollama", "lmstudio"):
+        probe = probes.get(probe_key)
+        if isinstance(probe, dict) and isinstance(probe.get("models"), list):
+            for name in probe["models"]:
+                text = str(name or "").strip()
+                if text and text not in installed_models:
+                    installed_models.append(text)
+
+    required_models = _required_ollama_models(config)
+    if "ollama" in probes:
+        ollama_installed = [
+            str(m).strip()
+            for m in (probes["ollama"].get("models") or [])
+            if str(m).strip()
+        ]
+        missing_models = [
+            m for m in required_models if not _model_is_installed(m, ollama_installed)
+        ]
+    else:
+        missing_models = list(required_models)
+    pull_commands = [f"ollama pull {m}" for m in missing_models]
+
+    effective_num_ctx = (
+        config.num_ctx
+        if "num_ctx" in config.model_fields_set or config.ollama_num_ctx == 8192
+        else config.ollama_num_ctx
+    )
+    effective_keep_alive = (
+        config.keep_alive
+        if "keep_alive" in config.model_fields_set or config.ollama_keep_alive == "5m"
+        else config.ollama_keep_alive
+    )
+
     active = bool(config.enabled and config.provider != AIProviderKind.DISABLED)
     return AIStatusReport(
         enabled=config.enabled,
+        preset=config.preset,
         provider=config.provider,
         active=active,
         config_path=str(ai_config_path()),
         vision_enabled=config.vision_enabled,
         reflection_enabled=config.reflection_enabled,
+        num_ctx=effective_num_ctx,
+        keep_alive=effective_keep_alive,
         models={
             "ollama": config.ollama_model,
             "ollama_vision": config.ollama_vision_model,
@@ -203,14 +279,52 @@ def build_status_report(
                 "masked": masked_preview(config.openai_api_key),
             },
         },
-        local_probes=dict(local_probes or {}),
+        local_probes=probes,
         hardware_profile={
+            "preset": config.preset.value,
             "target_vram_gb": 8,
             "target_ram_gb": 32,
+            "num_ctx": effective_num_ctx,
+            "keep_alive": effective_keep_alive,
             "ollama_num_ctx": config.ollama_num_ctx,
             "ollama_keep_alive": config.ollama_keep_alive,
         },
+        presets_catalog={k: dict(v) for k, v in AI_PRESETS_CATALOG.items()},
+        installed_models=installed_models,
+        missing_models=missing_models,
+        pull_commands=pull_commands,
     )
+
+
+def _apply_preset_defaults(persisted: dict[str, Any], preset: AIHardwarePreset, explicit_provider: str | None) -> None:
+    spec = AI_PRESETS_CATALOG[preset.value]
+    persisted["preset"] = preset.value
+    persisted["enabled"] = spec["enabled"]
+    persisted["vision_enabled"] = spec["vision_enabled"]
+    persisted["num_ctx"] = spec["num_ctx"]
+    persisted["ollama_num_ctx"] = spec["num_ctx"]
+    persisted["keep_alive"] = spec["keep_alive"]
+    persisted["ollama_keep_alive"] = spec["keep_alive"]
+
+    if preset == AIHardwarePreset.CLOUD_BYOK:
+        current_prov = str(persisted.get("provider") or "").strip().lower()
+        if explicit_provider:
+            persisted["provider"] = explicit_provider
+        elif current_prov in {"gemini", "deepseek", "openai_compat"}:
+            persisted["provider"] = current_prov
+        else:
+            persisted["provider"] = spec["provider"]
+    else:
+        persisted["provider"] = spec["provider"]
+
+    if preset in {
+        AIHardwarePreset.CPU_LIGHT,
+        AIHardwarePreset.VRAM_8GB,
+        AIHardwarePreset.VRAM_16GB_PLUS,
+    }:
+        persisted["ollama_model"] = spec["text_model"]
+        persisted["ollama_vision_model"] = spec["vision_model"]
+        persisted["ollama_embedding_model"] = spec["embedding_model"]
 
 
 def update_ai_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -221,21 +335,21 @@ def update_ai_config(data: dict[str, Any]) -> dict[str, Any]:
     persisted = _read_config_file()
     updates = dict(data)
 
-    if "enabled" in updates:
-        parsed = _parse_bool(updates["enabled"])
-        if parsed is not None:
-            updates["enabled"] = parsed
-    if "vision_enabled" in updates:
-        parsed = _parse_bool(updates["vision_enabled"])
-        if parsed is not None:
-            updates["vision_enabled"] = parsed
-    if "reflection_enabled" in updates:
-        parsed = _parse_bool(updates["reflection_enabled"])
-        if parsed is not None:
-            updates["reflection_enabled"] = parsed
+    for bool_key in ("enabled", "vision_enabled", "reflection_enabled"):
+        if bool_key in updates:
+            parsed = _parse_bool(updates[bool_key])
+            if parsed is not None:
+                updates[bool_key] = parsed
 
+    explicit_provider: str | None = None
     if "provider" in updates and updates["provider"] is not None:
-        updates["provider"] = AIProviderKind(str(updates["provider"]).strip().lower()).value
+        explicit_provider = AIProviderKind(str(updates["provider"]).strip().lower()).value
+        updates["provider"] = explicit_provider
+
+    # Apply hardware preset defaults FIRST so explicit overrides in the same payload win.
+    if "preset" in updates and updates["preset"] is not None:
+        preset_enum = AIHardwarePreset(str(updates["preset"]).strip().lower())
+        _apply_preset_defaults(persisted, preset_enum, explicit_provider)
 
     allowed_fields = set(AIConfig.model_fields)
     for key, value in updates.items():
@@ -250,6 +364,69 @@ def update_ai_config(data: dict[str, Any]) -> dict[str, Any]:
                 persisted[key] = text
         elif value is not None:
             persisted[key] = value
+
+    # Keep num_ctx/ollama_num_ctx and keep_alive/ollama_keep_alive synchronized.
+    if updates.get("num_ctx") is not None:
+        persisted["ollama_num_ctx"] = updates["num_ctx"]
+    elif updates.get("ollama_num_ctx") is not None:
+        persisted["num_ctx"] = updates["ollama_num_ctx"]
+
+    if updates.get("keep_alive") is not None:
+        persisted["ollama_keep_alive"] = updates["keep_alive"]
+    elif updates.get("ollama_keep_alive") is not None:
+        persisted["keep_alive"] = updates["ollama_keep_alive"]
+
+    # Map generic shorthand overrides (model/vision_model/embedding_model/base_url/api_key)
+    target_provider = str(persisted.get("provider") or "disabled").strip().lower()
+    if updates.get("model"):
+        model_val = str(updates["model"]).strip()
+        if target_provider == "ollama":
+            persisted["ollama_model"] = model_val
+        elif target_provider == "lmstudio":
+            persisted["lmstudio_model"] = model_val
+        elif target_provider == "gemini":
+            persisted["gemini_model"] = model_val
+        elif target_provider == "deepseek":
+            persisted["deepseek_model"] = model_val
+        elif target_provider == "openai_compat":
+            persisted["openai_model"] = model_val
+    if updates.get("vision_model") is not None:
+        vm_val = str(updates["vision_model"]).strip()
+        if target_provider == "ollama":
+            persisted["ollama_vision_model"] = vm_val
+        elif target_provider == "lmstudio":
+            persisted["lmstudio_vision_model"] = vm_val
+        elif target_provider == "openai_compat":
+            persisted["openai_vision_model"] = vm_val
+    if updates.get("embedding_model") is not None:
+        em_val = str(updates["embedding_model"]).strip()
+        if target_provider == "ollama":
+            persisted["ollama_embedding_model"] = em_val
+        elif target_provider == "lmstudio":
+            persisted["lmstudio_embedding_model"] = em_val
+        elif target_provider == "openai_compat":
+            persisted["openai_embedding_model"] = em_val
+    if updates.get("base_url"):
+        bu_val = str(updates["base_url"]).strip()
+        if target_provider == "ollama":
+            persisted["ollama_host"] = bu_val
+        elif target_provider == "lmstudio":
+            persisted["lmstudio_base_url"] = bu_val
+        elif target_provider == "gemini":
+            persisted["gemini_base_url"] = bu_val
+        elif target_provider == "deepseek":
+            persisted["deepseek_base_url"] = bu_val
+        elif target_provider == "openai_compat":
+            persisted["openai_base_url"] = bu_val
+    if "api_key" in updates and updates["api_key"] is not None:
+        ak_raw = str(updates["api_key"])
+        ak_val = ak_raw.strip()
+        if target_provider in {"gemini", "deepseek", "openai_compat"}:
+            ak_field = "openai_api_key" if target_provider == "openai_compat" else f"{target_provider}_api_key"
+            if ak_raw == "":
+                persisted[ak_field] = ""
+            elif ak_val and "…" not in ak_val:
+                persisted[ak_field] = ak_val
 
     # If enabling with no provider yet, default to local Ollama offline profile.
     if persisted.get("enabled") and persisted.get("provider", "disabled") == "disabled":

@@ -63,7 +63,10 @@ def get_service() -> InvestigationService:
 # MCP tools
 # ════════════════════════════════════════════════════════════════════════
 
-@mcp.tool()
+_APP_CALLABLE_META = {"ui": {"visibility": ["model", "app"]}}
+
+
+@mcp.tool(meta=_APP_CALLABLE_META)
 def investigate(raw_input: str, max_iterations: int = 10,
                 max_tool_calls: int = 20, wall_clock_timeout_sec: int = 600,
                 min_pivot_threshold: float = 0.12,
@@ -129,7 +132,7 @@ def investigate(raw_input: str, max_iterations: int = 10,
     )
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def step(target_id: str, pivot_id: Optional[str] = None) -> dict[str, Any]:
     """Execute exactly one Plan -> Execute -> Normalize -> Correlate -> Reflect cycle.
 
@@ -149,7 +152,7 @@ def step(target_id: str, pivot_id: Optional[str] = None) -> dict[str, Any]:
     return _service.step(target_id, pivot_id=pivot_id)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def status(target_id: str) -> dict[str, Any]:
     """Get current investigation state, objectives and ranked next pivots.
 
@@ -163,7 +166,7 @@ def status(target_id: str) -> dict[str, Any]:
     return _service.status(target_id)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def graph(target_id: str, view: str = "summary") -> dict[str, Any]:
     """Query the Entity-Resolved Knowledge Graph.
 
@@ -178,7 +181,7 @@ def graph(target_id: str, view: str = "summary") -> dict[str, Any]:
     return _service.graph(target_id, view=view)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def tools(refresh: bool = False) -> dict[str, Any]:
     """Live capability health check: installed binaries, python collectors, API keys.
 
@@ -195,7 +198,7 @@ def tools(refresh: bool = False) -> dict[str, Any]:
     return _service.tools(refresh=refresh)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def doctor(provision: bool = False) -> dict[str, Any]:
     """Verify that all 32 OSINT tools are installed and executable.
 
@@ -217,7 +220,7 @@ def doctor(provision: bool = False) -> dict[str, Any]:
     return run_doctor(provision=provision)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def report(target_id: str, format: str = "md") -> dict[str, Any]:
     """Generate the final evidence-cited intelligence dossier.
 
@@ -237,7 +240,7 @@ def report(target_id: str, format: str = "md") -> dict[str, Any]:
     return _service.report(target_id, fmt=format)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def analytics(target_id: str, source_id: Optional[str] = None,
               dest_id: Optional[str] = None) -> dict[str, Any]:
     """Compute graph centrality, communities, bridges, hash clusters & shortest path.
@@ -254,7 +257,7 @@ def analytics(target_id: str, source_id: Optional[str] = None,
     return _service.analytics(target_id, source_id=source_id, dest_id=dest_id)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def timeline(target_id: str) -> dict[str, Any]:
     """Return a chronological event timeline for an investigation.
 
@@ -268,7 +271,7 @@ def timeline(target_id: str) -> dict[str, Any]:
     return _service.timeline(target_id)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def diff_cases(target_id_a: str, target_id_b: str) -> dict[str, Any]:
     """Compare two investigations (added/removed entities, status changes, contradictions).
 
@@ -283,7 +286,7 @@ def diff_cases(target_id_a: str, target_id_b: str) -> dict[str, Any]:
     return _service.diff(target_id_a, target_id_b)
 
 
-@mcp.tool()
+@mcp.tool(meta=_APP_CALLABLE_META)
 def ai_reflect(target_id: str, provider: Optional[str] = None) -> dict[str, Any]:
     """Run quarantined AI reflection on an investigation and persist AI_INFERRED insights.
 
@@ -299,7 +302,10 @@ def ai_reflect(target_id: str, provider: Optional[str] = None) -> dict[str, Any]
 
 WORKBENCH_UI_URI = "ui://ai-osint-hub/workbench.html"
 _WORKBENCH_TOOL_META = {
-    "ui": {"resourceUri": WORKBENCH_UI_URI},
+    "ui": {
+        "resourceUri": WORKBENCH_UI_URI,
+        "visibility": ["model", "app"],
+    },
     "com.google.antigravity/ui": {
         "entrypoints": [
             {"type": "aux_pane", "title": "AI OSINT Hub"},
@@ -490,6 +496,28 @@ ul.list li:last-child { border-bottom: none; }
     return rpcRequest("tools/call", { name: name, arguments: args || {} });
   }
 
+  function extractToolData(result) {
+    if (!result || typeof result !== "object") return null;
+    if (result.structuredContent && typeof result.structuredContent === "object") {
+      return result.structuredContent;
+    }
+    if (Array.isArray(result.content)) {
+      for (var i = 0; i < result.content.length; i += 1) {
+        var block = result.content[i];
+        if (block && block.type === "text" && typeof block.text === "string") {
+          try {
+            var parsed = JSON.parse(block.text);
+            if (parsed && typeof parsed === "object") return parsed;
+          } catch (err) {}
+        }
+      }
+    }
+    if (result.target_id || result.investigations || result.stats) {
+      return result;
+    }
+    return null;
+  }
+
   function renderPayload(data) {
     if (!data || typeof data !== "object") return;
     var statusEl = document.getElementById("status-line");
@@ -557,7 +585,8 @@ ul.list li:last-child { border-bottom: none; }
         btn.addEventListener("click", function () {
           document.getElementById("case-input").value = c.target_id;
           callServerTool("open_workbench_view", { target_id: c.target_id }).then(function (res) {
-            if (res && res.structuredContent) renderPayload(res.structuredContent);
+            var payload = extractToolData(res);
+            if (payload) renderPayload(payload);
           }).catch(function () {});
         });
         li.appendChild(btn);
@@ -577,16 +606,22 @@ ul.list li:last-child { border-bottom: none; }
       else entry.resolve(msg.result);
       return;
     }
+    if (msg.method === "ui/notifications/tool-input") {
+      var statusEl = document.getElementById("status-line");
+      if (statusEl) statusEl.textContent = "Loading workbench data...";
+      return;
+    }
     if (msg.method === "ui/notifications/tool-result" && msg.params) {
-      var sc = msg.params.structuredContent || msg.params;
-      renderPayload(sc);
+      var payload = extractToolData(msg.params);
+      if (payload) renderPayload(payload);
     }
   });
 
   document.getElementById("btn-load").addEventListener("click", function () {
     var val = document.getElementById("case-input").value.trim();
     callServerTool("open_workbench_view", { target_id: val }).then(function (res) {
-      if (res && res.structuredContent) renderPayload(res.structuredContent);
+      var payload = extractToolData(res);
+      if (payload) renderPayload(payload);
     }).catch(function () {});
   });
 
@@ -594,13 +629,14 @@ ul.list li:last-child { border-bottom: none; }
     var val = document.getElementById("case-input").value.trim();
     if (!val) return;
     callServerTool("investigate", { raw_input: val, max_iterations: 4, max_tool_calls: 6 }).then(function (res) {
-      var sc = (res && res.structuredContent) || {};
+      var sc = extractToolData(res) || {};
       if (sc.target_id) {
         return callServerTool("open_workbench_view", { target_id: sc.target_id });
       }
       return res;
     }).then(function (res2) {
-      if (res2 && res2.structuredContent) renderPayload(res2.structuredContent);
+      var payload = extractToolData(res2);
+      if (payload) renderPayload(payload);
     }).catch(function () {});
   });
 
@@ -622,7 +658,7 @@ ul.list li:last-child { border-bottom: none; }
     WORKBENCH_UI_URI,
     name="AI OSINT Hub Workbench",
     mime_type="text/html;profile=mcp-app",
-    meta={"ui": {"prefersBorder": False}},
+    meta={"ui": {"prefersBorder": False, "csp": {"connectDomains": [], "resourceDomains": []}}},
 )
 def workbench_ui() -> str:
     """Self-contained Gruvbox Material Light MCP App workbench HTML."""

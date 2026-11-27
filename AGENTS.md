@@ -19,7 +19,13 @@ python -m hub.cli doctor                             # per-tool smoke check (32/
 python -m hub.cli doctor --provision                 # install missing tools, then re-check
 python -m hub.cli investigate "example.com" --max-iterations 3 --report md
 python -m hub.cli investigate "Linus Torvalds, goes by torvalds, kernel.org" --report md
-python -m hub.cli serve --host 127.0.0.1 --port 8000   # FastAPI Web Workbench + SSE
+python -m hub.cli web --open                            # Web Workbench (auto free port)
+python -m hub.cli demo                                  # seed synthetic case_demo_aurora
+python -m hub.cli export <target_id> [--redact-pii]     # export .osintcase.zip bundle
+python -m hub.cli import <bundle> [--overwrite]         # verify & import .osintcase.zip
+python -m hub.cli mcp-config --client antigravity       # print MCP client config snippet
+python -m hub.cli doctor --no-smoke                     # CI-friendly binary inventory (exit 0)
+python -m hub.cli serve --host 127.0.0.1 --port 8000    # FastAPI Web Workbench + SSE
 python -m hub.cli report <target_id> --format html --out dossier.html
 AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_live_smoke.py -q       # network smoke
 AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_toolchain_live.py -q   # 32/32 + live tools
@@ -268,9 +274,24 @@ repo. Tests use `tmp_path`/`AI_OSINT_HUB_HOME` fixtures.
   inherits `Low Mandatory Level` from a sandboxed parent folder and exits `-1073741502`,
   restore Medium integrity via `icacls .\.venv /setintegritylevel "(OI)(CI)M" /T /C /Q`.
 * `.github/workflows/ci.yml` runs the offline `pytest -q` matrix on
-  `ubuntu-latest` and `windows-latest` for Python `3.11` and `3.13`.
+  `ubuntu-latest`, `windows-latest`, and `macos-latest` for Python `3.11` and
+  `3.13`, verifies wheel `hub/static/vendor/cytoscape.min.js` package-data,
+  checks `ai-osint-hub doctor --no-smoke`, and validates non-root (`UID 10001`)
+  Docker builds.
 * `pyproject.toml` pins `mcp>=1.0,<2` because `hub/mcp_server.py` uses the
-  v1 `mcp.server.fastmcp.FastMCP` API (removed in `mcp 2.x`).
+  v1 `mcp.server.fastmcp.FastMCP` API (removed in `mcp 2.x`), bundles
+  `hub/static/**` via `[tool.setuptools.package-data]`, and includes `Pillow>=10.0`.
+* **v2.0.0 release invariants:** `hub/demo.py` (`DEMO_TARGET_ID="case_demo_aurora"`)
+  and `hub/bundle.py` (`.osintcase.zip`) accept optional `investigations_dir` so
+  `InvestigationService` passes `self.engine().state_root()`. Bundle imports
+  enforce Zip-Slip/backslash/symlink rejection, `MAX_UNCOMPRESSED_BYTES` /
+  `MAX_COMPRESSION_RATIO` streaming caps, SHA-256 verification, and SQLite
+  `PRAGMA trusted_schema = OFF` + `integrity_check`. `hub/tools/locator.py`
+  bypasses Windows `0xC0000142` uv-trampolines via `entry_points.txt`, falls
+  back Windows `nmap` timeouts (`2.0s`) to WSL2, and provides per-OS
+  `install_hint()`. `hub/ai/models.py` adds `AIHardwarePreset` (`disabled`
+  default) and `pull_commands`. `hub/web.py` DOM Markdown renderer enforces an
+  `http:`/`https:`/`mailto:` link allowlist (zero `innerHTML`/`backdrop-filter`).
 
 ## File layout quick map
 

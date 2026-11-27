@@ -766,8 +766,9 @@ code {{
 }}
 .claim {{ margin: 6px 0 6px 16px; padding-left: 8px; border-left: 2px solid var(--line); }}
 .artifact {{ color: var(--muted); font-size: 11px; }}
-ul {{ margin: 8px 0; padding-left: 24px; }}
+ul {{ margin: 8px 0; padding-left: 24px; max-width: 75ch; }}
 li {{ margin: 4px 0; }}
+p {{ max-width: 75ch; }}
 .muted {{ color: var(--muted); }}
 .snippet {{
   background: var(--inset);
@@ -804,15 +805,19 @@ footer {{
   font-variant-numeric: tabular-nums;
 }}
 @media print {{
-  @page {{ margin: 14mm; }}
-  body {{ background: #ffffff; color: #282828; }}
+  @page {{ margin: 14mm; size: auto; }}
+  body {{ background: #ffffff !important; color: #282828 !important; font-size: 10.5pt; line-height: 1.45; }}
   main {{ max-width: none; padding: 0; }}
-  .doc-header, .card, table, .ai-panel {{ background: #ffffff; border-color: #bdae93; break-inside: avoid; }}
-  th, .snippet, code {{ background: #f9f5d7; color: #282828; border-color: #bdae93; }}
-  h2 {{ color: #282828; border-color: #bdae93; break-after: avoid; }}
-  tr {{ break-inside: avoid; }}
+  .no-print {{ display: none !important; }}
+  .doc-header, .card, table, .ai-panel {{ background: #ffffff !important; border-color: #bdae93; break-inside: avoid; page-break-inside: avoid; }}
+  .claim, .snippet {{ break-inside: avoid; page-break-inside: avoid; }}
+  th, .snippet, code {{ background: #f9f5d7 !important; color: #282828 !important; border-color: #bdae93; }}
+  h1, h2, h3 {{ color: #282828; border-color: #bdae93; break-after: avoid; page-break-after: avoid; }}
+  thead {{ display: table-header-group; }}
+  tr {{ break-inside: avoid; page-break-inside: avoid; }}
   .badge {{ border-color: #665c54; color: #282828 !important; background: #f2e5bc !important; }}
-  a {{ color: #282828; }}
+  a {{ color: #282828; text-decoration: underline; }}
+  footer {{ margin-top: 20px; border-color: #bdae93; color: #504945; }}
 }}
 </style></head><body><main>
 """.replace("{{", "{").replace("}}", "}").replace("__TARGET__", _h(target_id))

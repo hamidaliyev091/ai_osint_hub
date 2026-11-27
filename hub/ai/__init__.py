@@ -17,7 +17,9 @@ from hub.ai.config import (
 )
 from hub.ai.embeddings import correlate_texts, deterministic_text_similarity, embed_texts
 from hub.ai.models import (
+    AI_PRESETS_CATALOG,
     AIConfig,
+    AIHardwarePreset,
     AIProviderKind,
     AIStatusReport,
     ReflectionProposal,
@@ -73,6 +75,8 @@ async def analyze_media_url(
 
 __all__ = [
     "AIConfig",
+    "AIHardwarePreset",
+    "AI_PRESETS_CATALOG",
     "AIProviderKind",
     "AIStatusReport",
     "ReflectionProposal",
