@@ -11,9 +11,9 @@ architectural pillars:
 |---|--------|---------------------------|
 | 1 | **Epistemic Memory & ERKG** | SQLite/WAL Entity-Resolved Knowledge Graph. Every entity attribute and relationship is a `Claim` citing immutable `EvidenceArtifact` records with a closed `EPISTEMIC_STATUS` enum and deterministic confidence. Execution ledger guarantees zero duplicate runs. Crash-safe, resumable. |
 | 2 | **Hypothesis-Driven Pivot Engine** | Explicit `CORROBORATION`/`RESOLUTION`/`EXPANSION`/`IDENTITY_LINK`/`VERIFICATION` hypotheses. Every `(entity, tool)` pivot is scored with a mathematical formula including hop-distance scope control. Deterministic stopping conditions. |
-| 3 | **Single-Source-of-Truth Tool Registry** | Pydantic capability manifests auto-generate LLM tool schemas, MCP definitions and CLI tables. Two-stage output pipeline: deterministic parsers → normalized delta → quarantine-safe LLM reflection. 28 capabilities, real async subprocess execution, cross-platform. |
-| 4 | **Hardened Security** | argv-only `create_subprocess_exec` (no shell), scrubbed environment, isolated scratch dirs, hard process-tree kill on timeout, semaphores + token buckets, code-enforced scope gate, `INTRUSIVE_BLOCKED` capabilities never spawn, indirect-prompt-injection quarantine around all external OSINT text. |
-| 5 | **MCP + CLI Parity & Evidence-Cited Dossier** | The same five operations over CLI and MCP (stdio): `investigate`, `step`, `graph`, `tools`, `report`. Every report claim cites its `[artifact_id]` and status, with a dedicated Collection Gaps / Dead Ends / Unverified Hypotheses section. |
+| 3 | **Single-Source-of-Truth Tool Registry** | Pydantic capability manifests auto-generate LLM tool schemas, MCP definitions and CLI tables. Two-stage output pipeline: deterministic parsers → normalized delta → quarantine-safe LLM reflection. 32 capabilities, real async subprocess execution, cross-platform. |
+| 4 | **Hardened Security** | argv-only `create_subprocess_exec` (no shell), scrubbed environment, isolated scratch dirs, hard process-tree kill on timeout, semaphores + token buckets, code-enforced scope gate, `INTRUSIVE_BLOCKED` capabilities never spawn, indirect-prompt-injection quarantine around all external OSINT and visual/OCR/EXIF text. |
+| 5 | **MCP + CLI + Web Workbench Parity** | Shared operations over CLI, MCP (stdio + `ui://` MCP App), and a Gruvbox Material Light FastAPI + Cytoscape.js workbench: `investigate`, `step`, `step-batch`, `graph`, `analytics`, `timeline`, `diff`, `tools`, `report`, `ai`. Every report claim cites its `[artifact_id]` and status. |
 
 ---
 
@@ -100,11 +100,11 @@ python -m hub.cli doctor     # real --version/--help smoke check per tool
 
 Missing binaries are reported as `MISSING` and are never mocked or faked.
 
-## Toolchain provisioning & resolution (28/28)
+## Toolchain provisioning & resolution (32/32)
 
 `python -m hub.cli doctor --provision` installs and smoke-verifies the complete
 toolchain; `python -m hub.cli doctor` re-checks it. On the reference Windows host
-this yields **28/28 AVAILABLE and smoke-healthy** with credential auth status per provider.
+this yields **32/32 AVAILABLE and smoke-healthy** with credential auth status per provider.
 
 Tool binaries are resolved in this priority order (`hub/tools/locator.py`):
 
@@ -132,7 +132,7 @@ Provisioning layers used by `--provision`:
 | `~/.ai_osint_hub/bin` | `phoneinfoga` | official Windows x86_64 release download |
 | WSL2 Ubuntu (apt) | `whatweb`, `hashcat`, `hydra` | bridged via `wsl.exe --exec`; `hydra` stays `INTRUSIVE_BLOCKED` |
 | Host PATH | `nmap`, `amass`, `gobuster` | already provisioned on the reference host |
-| Python-native | `dns_lookup`, `http_headers`, `tls_cert` | no binaries required |
+| Python-native | `dns_lookup`, `http_headers`, `tls_cert`, `crtsh_lookup`, `asn_bgp_lookup`, `favicon_hash`, `media_forensics`, `snscrape`, `photon_crawler`, `github_osint`, `gravatar_lookup`, `pgp_keyserver`, `rdap_lookup`, `wayback_cdx`, `darkweb_ahmia`, + 4 API collectors | no binaries required (`Pillow>=10.0` optional for full EXIF/pHash/dHash in `media_forensics`) |
 
 Writable per-tool config/state is redirected to `<repo>/.toolhome/<tool>` through
 trusted manifest env placeholders (`{tool_home}`) — this keeps sandboxed managed
@@ -143,7 +143,7 @@ venvs working and isolates tool config from the user's home directory.
 ## Quickstart
 
 ```bash
-# 0. Toolchain: verify all 28 tools with real smoke checks; install missing ones
+# 0. Toolchain: verify all 32 tools with real smoke checks; install missing ones
 python -m hub.cli doctor
 python -m hub.cli doctor --provision
 
@@ -155,11 +155,16 @@ python -m hub.cli investigate "hamid091 example.com target@example.com" \
     --max-iterations 8 --max-tool-calls 12 --timeout-sec 300 \
     --report md --out reports/case.md
 
-# 3. Drive the loop manually (agent-in-the-loop):
+# 3. Drive the loop manually (agent-in-the-loop) & analytics:
 python -m hub.cli status <target_id>                # ranked pivots + open hypotheses
 python -m hub.cli step <target_id> --action piv_xxx # execute exactly one pivot
 python -m hub.cli graph <target_id> --view entities
 python -m hub.cli graph <target_id> --view contradictions
+python -m hub.cli analytics <target_id> [--source <e1> --dest <e2>]
+python -m hub.cli timeline <target_id>
+python -m hub.cli diff <target_id_a> <target_id_b>
+python -m hub.cli ai status [--probe]
+python -m hub.cli ai reflect <target_id>
 python -m hub.cli report <target_id> --format json --out reports/case.json
 
 # 4. List stored investigations
@@ -210,7 +215,12 @@ Exposed MCP tools (same semantics as the CLI):
 | `graph(target_id, view)` | `summary`, `entities`, `claims`, `contradictions`, `hypotheses`, `ledger`, `provenance`, `json` |
 | `tools(refresh)` | live health check of every capability |
 | `doctor(provision=False)` | per-tool resolution + real `--version`/`--help` smoke check (optionally provision) |
-| `report(target_id, format)` | evidence-cited Markdown / JSON dossier |
+| `report(target_id, format)` | evidence-cited Markdown / JSON / HTML dossier |
+| `analytics(target_id, source_id?, dest_id?)` | degree & Brandes betweenness centrality, communities, bridges, hash clusters, shortest path |
+| `timeline(target_id)` | chronological event stream (intake, artifacts, ledger, entities, contradictions, AI insights) |
+| `diff_cases(target_id_a, target_id_b)` | compare two cases (added/removed entities, status changes, contradictions) |
+| `ai_reflect(target_id, provider?)` | quarantined AI reflection (persists `AI_INFERRED` insights when AI is enabled) |
+| `open_workbench_view(target_id="")` | Antigravity MCP App UI (`ui://ai-osint-hub/workbench.html`, `aux_pane`/`global` entrypoints) |
 
 See [docs/MCP_USAGE.md](docs/MCP_USAGE.md) for the full reference.
 
@@ -247,7 +257,7 @@ inputs with green/amber **Configured / Not Set** badges → **Save & Sync Keys**
 - Auth statuses in `tools`/`doctor`: `CONFIGURED`, `KEYLESS_LIMITED` (GitHub
   without token), `MISSING_KEY`, `PARTIAL` (e.g. Censys ID without a usable
   secret/PAT), `OPTIONAL_UNCONFIGURED` (ghunt/h8mail sessions). The pivot planner
-  skips unconfigured tools instead of wasting budget; all 28 stay in the matrix.
+  skips unconfigured tools instead of wasting budget; all 32 stay in the matrix.
 
 ## Multi-clue subject intake (Phase 8)
 
@@ -290,25 +300,33 @@ python -m hub.cli serve --host 127.0.0.1 --port 8000
 # → http://127.0.0.1:8000
 ```
 
-The FastAPI server (`hub/web.py`) serves an embedded dark-mode single-page
-**AI OSINT Hub Intelligence Workbench** (Tailwind CDN + vanilla JS, no Node build):
-multi-clue intake drawer with Quick/Standard/Deep budget presets and scope
-allowlist, interactive colour-coded ERKG graph (click nodes/edges for evidence
-snippet + SHA-256 + epistemic badge), live telemetry/hypotheses/contradictions
-tabs streaming over SSE, 1-click “Run Next Pivot”, and dossier viewer with
-`.md`/`.json`/print-ready `.html` exports.
+The FastAPI server (`hub/web.py`) serves a **Gruvbox Material Light**
+(`#fbf1c7`/`#f9f5d7`/`#3c3836`/`#af3a03`) 3-pane **AI OSINT Hub Intelligence
+Workbench** (offline vendored Cytoscape.js 3.35.0 at `/static/vendor/cytoscape.min.js`
+plus synchronized `<svg id="graph">` fallback, zero external CDN dependencies):
+multi-clue intake drawer, Case & Diff switcher, 32-tool Health & AI/Vision drawers,
+interactive ERKG graph (centrality sizing, community clustering, shortest-path
+highlighting, click-to-pivot), Timeline, Telemetry, AI & Vision Lab, and editorial
+`.md`/`.json`/print-ready `.html` dossier exports.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /` | Workbench SPA |
-| `GET /api/tools`, `POST /api/doctor` | Live 28/28 capability + toolchain health |
+| `GET /` | Workbench SPA (`GET /static/...` serves vendored Cytoscape.js) |
+| `GET /api/tools`, `POST /api/doctor` | Live 32/32 capability + toolchain health |
 | `GET /api/credentials`, `POST /api/credentials` | Masked API-key status / save keys, sync theHarvester config |
 | `POST /api/investigations` | Start (background + SSE) or run synchronously (`wait=true`) with raw intel + structured seeds + budgets/scope |
 | `GET /api/investigations` | Saved investigations list |
 | `GET /api/investigations/{id}` | Full state: entities, claims, contradictions, hypotheses, ledger, pivots, graph nodes/edges, artifact index |
 | `GET /api/investigations/{id}/stream` | SSE snapshot/iteration/ledger/graph_delta/done events |
 | `POST /api/investigations/{id}/step` | Manual agent-in-the-loop pivot execution |
-| `GET /api/investigations/{id}/report?format=md|json|html` | Dossier export (HTML is standalone print-ready) |
+| `POST /api/investigations/{id}/step-batch` | Execute a bounded parallel wave of non-conflicting pivots |
+| `GET /api/investigations/{id}/analytics` | Centrality, communities, bridges, hash clusters, optional `shortest_path` |
+| `GET /api/investigations/{id}/timeline` | Chronological investigation event stream |
+| `GET /api/investigations/{id}/diff/{other_id}` | Compare two investigations |
+| `GET /api/ai/status`, `POST /api/ai/config` | Masked AI provider config & local endpoint health probe |
+| `POST /api/investigations/{id}/reflect` | Run quarantined AI reflection on a case |
+| `POST /api/media/analyze` | SSRF-guarded media forensics (EXIF/GPS/pHash/dHash/OCR/optional VLM) |
+| `GET /api/investigations/{id}/report?format=md|json|html` | Dossier export (HTML is standalone print-ready with CSP) |
 
 `python -m hub.cli report <id> --format html --out dossier.html` produces the same
 standalone HTML dossier from the CLI.
@@ -503,6 +521,33 @@ standalone HTML dossier from the CLI.
   context or the mobile prefix applies; generic `00…` prefixes normalize to
   `+…`. Phoneinfoga therefore receives E.164 from intake/pivot params.
 
+## Phase 18 — Hybrid AI, Vision Forensics, Graph Analytics & Gruvbox Workbench
+
+- **Gruvbox Material Light Workbench + Cytoscape.js:** `hub/web.py` + vendored
+  `hub/static/vendor/cytoscape.min.js` render an offline 3-pane intelligence
+  workbench (`#fbf1c7`/`#f9f5d7`/`#3c3836`/`#af3a03`) with centrality sizing,
+  community filters, shortest-path highlighting, Timeline, Diff, AI & Vision Lab,
+  and editorial print-ready HTML dossiers (`hub/reporting.py`) with CSP headers.
+- **Hybrid Offline + Online AI Layer (`hub/ai/`):** disabled by default (`enabled=False`)
+  so the deterministic core runs with zero LLM. Supports local **Ollama** (8 GB
+  VRAM profile: `gemma4`, `qwen2.5vl:7b`, `embeddinggemma`, `num_ctx=8192`) and
+  **LM Studio**, plus **Gemini**, **DeepSeek**, and **OpenAI-compatible**
+  endpoints. Includes offline character n-gram TF-IDF + Jaro-Winkler fallback
+  embeddings, `$AI_OSINT_HUB_HOME/ai_config.json` (0600, masked previews,
+  registered with `hub.security.redaction`), and `ai_insights` SQLite table
+  (`AI_INFERRED` provenance, `direct=False`, confidence ≤ 0.35).
+- **Vision & Media Forensics (`media_forensics`):** SSRF-guarded media
+  inspection (SHA-256, EXIF/GPS/XMP/IPTC, 64-bit dHash & pHash, optional
+  shell-free `tesseract` OCR, optional quarantined VLM extraction) protected by
+  `<untrusted_visual_data>` quarantine (`hub/security/quarantine.py`).
+- **Graph Analytics, Parallel Pivots & 32-Tool Registry:** pure-Python degree &
+  Brandes betweenness centrality, connected components, label-propagation
+  communities, Tarjan bridges, `shortest_path` evidence chains, perceptual-hash
+  clustering (Hamming ≤ 6 / exact `mmh3`), `build_timeline`, `diff_investigations`,
+  bounded parallel waves (`step_batch` / `parallel_pivots`), MCP App UI
+  (`ui://ai-osint-hub/workbench.html`), and 3 new zero-auth passive collectors
+  (`crtsh_lookup`, `asn_bgp_lookup`, `favicon_hash`) + `media_forensics` → **32/32 tools**.
+
 ## Epistemic trust model
 
 Every claim has **exactly one** status (closed enum — no free-text statuses):
@@ -563,9 +608,9 @@ and listed in the dossier — never silently dropped.
 
 ## Capability matrix
 
-28 capabilities declared as strict Pydantic manifests (`hub/tools/capabilities.py`).
+32 capabilities declared as strict Pydantic manifests (`hub/tools/capabilities.py`).
 Modes: `PASSIVE`, `ACTIVE_RECON`, `INTRUSIVE_BLOCKED`. Run `python -m hub.cli tools`
-for live availability on your host; on the reference host all 28 are provisioned
+for live availability on your host; on the reference host all 32 are provisioned
 and smoke-healthy (`python -m hub.cli doctor`).
 
 | Tool | Mode | Accepts | Produces | Host binary |
@@ -598,8 +643,12 @@ and smoke-healthy (`python -m hub.cli doctor`).
 | `shodan_lookup` | PASSIVE · key: `SHODAN_API_KEY` | ip, domain | ip, port, service, subdomain, organization | python-native Shodan REST API (ports, banners, hostnames, ISP/ASN) |
 | `censys_lookup` | PASSIVE · key: Censys PAT or ID+Secret | ip, domain | ip, port, service, subdomain, organization | python-native Censys Platform API v3 (`asset/host`, certificate SANs, AS metadata) |
 | `hunter_lookup` | PASSIVE · key: `HUNTER_API_KEY` | domain, email | email, person, organization, social_profile | python-native Hunter.io v2 (domain search + email verifier) |
+| `crtsh_lookup` | PASSIVE | domain, subdomain | subdomain, domain, organization | python-native crt.sh Certificate Transparency JSON |
+| `asn_bgp_lookup` | PASSIVE | ip, asn | asn, organization, location, ip | python-native RIPEstat / BGPView ASN & RIR lookup (SSRF-guarded) |
+| `favicon_hash` | PASSIVE | domain, url | hash, service, url | python-native Shodan-compatible signed 32-bit mmh3 + SHA-256 (SSRF-guarded) |
+| `media_forensics` | PASSIVE | url | hash, location, person, organization, username, email, domain | python-native EXIF/GPS, pHash/dHash, optional OCR & quarantined VLM (SSRF-guarded) |
 
-All 28 deterministic parsers/tool adapters have fixture-driven characterisation tests
+All 32 deterministic parsers/tool adapters have fixture-driven characterisation tests
 (`tests/test_parsers.py`, `tests/test_builtin_collectors.py`). Parsers never raise on
 garbage output — failures are classified (`PARSE_ERROR`, `EMPTY_RESULT`, `TIMEOUT`,
 `MISSING_BINARY`, `RATE_LIMITED`, `SCOPE_BLOCKED`, `INTRUSIVE_BLOCKED`,
@@ -661,15 +710,18 @@ hub/
   models.py                 canonical Pydantic models + closed enums
   cooking.py                NL intake, username/email permutations (kept from v1)
   erkg/                     resolution, confidence, SQLite/WAL store, graph view,
-                            evidence ingestion
+                            analytics (centrality/clusters/path/timeline/diff), ingestion
+  ai/                       hybrid offline+online AI config, providers, embeddings,
+                            quarantined reflection runner (optional; disabled by default)
   tools/                    capability manifests, parse contract, async runtime,
                             deterministic parsers, python-native collectors
-  security/                 scope policy + prompt-injection quarantine
+  security/                 scope policy + prompt-injection & visual quarantine + redaction
   investigation/            hypotheses, pivot scorer, stopping, reflection, engine
-  reporting.py              evidence-cited Markdown/JSON dossier
-  service.py                five operations shared by CLI and MCP
+  reporting.py              evidence-cited Markdown/JSON/Gruvbox HTML dossier
+  web.py + static/          FastAPI Gruvbox Material Light workbench + vendored Cytoscape.js
+  service.py                shared operations (CLI+MCP+Web parity)
   cli.py                    python -m hub.cli
-  mcp_server.py             python -m hub.mcp_server (stdio)
+  mcp_server.py             python -m hub.mcp_server (stdio + ui:// MCP App)
   orchestrate.py            legacy v1 CLI compatibility shim
 tests/                      deterministic pytest suite + fixtures + mock tools
 docs/MCP_USAGE.md           MCP reference
@@ -701,9 +753,10 @@ integrations should use the CLI or MCP operations above.
 * Capabilities whose binaries are not installed are marked `MISSING`; their CLI
   invocations are flagged `invocation_verified: false` in the manifest where the
   flag combination could not be verified on the build host.
-* There is no built-in LLM client. The deterministic loop is complete on its own;
-  the `reflection` packet is the intended hand-off for an external reasoning model
-  through the MCP/CLI caller.
+* Optional AI features (`hub/ai/`) are disabled by default (`enabled=False`) and
+  strictly advisory: all AI-inferred insights and VLM extractions carry
+  `AI_INFERRED` provenance (`direct=False`, confidence ≤ 0.35 / ≤ 0.45) and
+  never elevate claims to `CONFIRMED` without deterministic corroboration.
 * Automatic contradiction *resolution* is detection-only: the engine records
   contradictions and pivots to collect independent evidence; it never guesses a
   winner.

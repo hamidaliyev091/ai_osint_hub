@@ -1079,6 +1079,81 @@ def _install_default_registry() -> None:
         notes="Ahmia clearnet index; may rate-limit (surfaced as collection failure).",
     ))
 
+    # ══════════════════════════════════════════════════════════════
+    # Phase 18 expansion — 3 zero-auth passive collectors + media_forensics
+    # ══════════════════════════════════════════════════════════════
+    register(_cap(
+        tool_id="crtsh_lookup", display_name="crt.sh Certificate Transparency",
+        description=("Query crt.sh public Certificate Transparency logs for a domain: "
+                     "discovers historical subdomains, SANs and certificate issuer orgs."),
+        accepted_entity_types=[EntityType.DOMAIN, EntityType.SUBDOMAIN],
+        produced_entity_types=[EntityType.SUBDOMAIN, EntityType.DOMAIN, EntityType.ORGANIZATION],
+        execution_mode=ExecutionMode.PASSIVE,
+        parameters={"domain": _param("domain", format_="domain",
+                                     description="Target domain for CT lookup")},
+        timeout_sec=30, rate_limit_rps=0.5, reliability=0.85, prior_yield=0.70,
+        invocation=InvocationSpec(kind="builtin",
+                                  builtin_ref="hub.tools.builtin.crtsh_lookup:collect"),
+        parser_ref="hub.tools.parsers.crtsh_lookup:parse",
+        notes="Queries crt.sh JSON endpoint; handles 429/502/503/timeout gracefully.",
+    ))
+    register(_cap(
+        tool_id="asn_bgp_lookup", display_name="ASN / BGP Network Lookup",
+        description=("Query RIPEstat / BGPView public JSON for IP or ASN routing metadata: "
+                     "ASNs, BGP prefixes, RIR, country location and holder organization."),
+        accepted_entity_types=[EntityType.IP, EntityType.ASN],
+        produced_entity_types=[EntityType.ASN, EntityType.ORGANIZATION,
+                               EntityType.LOCATION, EntityType.IP],
+        execution_mode=ExecutionMode.PASSIVE,
+        parameters={
+            "ip": _param("ip", format_="ip", required=False,
+                         description="Public IPv4/IPv6 address"),
+            "asn": _param("asn", format_="asn", required=False,
+                          description="Autonomous System Number (e.g. AS13335)"),
+        },
+        timeout_sec=30, rate_limit_rps=1.0, reliability=0.85, prior_yield=0.65,
+        invocation=InvocationSpec(kind="builtin",
+                                  builtin_ref="hub.tools.builtin.asn_bgp_lookup:collect"),
+        parser_ref="hub.tools.parsers.asn_bgp_lookup:parse",
+        notes="RIPEstat + BGPView public JSON; SSRF-guarded against private IPs.",
+    ))
+    register(_cap(
+        tool_id="favicon_hash", display_name="Favicon MurmurHash3 Fingerprinter",
+        description=("Fetch /favicon.ico (or <link rel=icon> fallback) via SSRF-safe HTTP "
+                     "and compute Shodan-compatible 32-bit signed MurmurHash3 + SHA-256."),
+        accepted_entity_types=[EntityType.DOMAIN, EntityType.URL],
+        produced_entity_types=[EntityType.HASH, EntityType.SERVICE, EntityType.URL],
+        execution_mode=ExecutionMode.PASSIVE,
+        parameters={"target": _param("target", format_="hostname",
+                                     description="Target domain or URL")},
+        timeout_sec=25, rate_limit_rps=1.0, reliability=0.85, prior_yield=0.55,
+        invocation=InvocationSpec(kind="builtin",
+                                  builtin_ref="hub.tools.builtin.favicon_hash:collect"),
+        parser_ref="hub.tools.parsers.favicon_hash:parse",
+        notes="Python-native pure-Python mmh3; manual SSRF-safe redirect handling.",
+    ))
+    register(_cap(
+        tool_id="media_forensics", display_name="Media Forensics & Perceptual Hash",
+        description=("SSRF-safe media download and forensic inspection: SHA-256, EXIF/XMP/IPTC "
+                     "metadata, GPS coordinates, 64-bit dHash/pHash, optional OCR and quarantined VLM."),
+        accepted_entity_types=[EntityType.URL],
+        produced_entity_types=[EntityType.HASH, EntityType.LOCATION, EntityType.PERSON,
+                               EntityType.ORGANIZATION, EntityType.USERNAME,
+                               EntityType.EMAIL, EntityType.DOMAIN],
+        execution_mode=ExecutionMode.PASSIVE,
+        parameters={
+            "url": _param("url", format_="url", required=False,
+                          description="Public image/media URL to inspect"),
+            "use_vlm": _param("use_vlm", type_="boolean", required=False,
+                              description="Enable optional quarantined VLM extraction"),
+        },
+        timeout_sec=60, rate_limit_rps=0.5, reliability=0.80, prior_yield=0.50,
+        invocation=InvocationSpec(kind="builtin",
+                                  builtin_ref="hub.tools.builtin.media_forensics:collect"),
+        parser_ref="hub.tools.parsers.media_forensics:parse",
+        notes="SSRF-guarded media forensics; VLM outputs carry AI_INFERRED provenance.",
+    ))
+
 
 def tools_by_mode(mode: ExecutionMode | str) -> list[str]:
     """List tool ids in an execution mode (computed live from the registry)."""

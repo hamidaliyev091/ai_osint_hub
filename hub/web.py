@@ -28,6 +28,8 @@ import asyncio
 import inspect
 import json
 import time
+from collections import deque
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import Body, FastAPI, HTTPException
@@ -38,11 +40,12 @@ from fastapi.responses import (
     PlainTextResponse,
     StreamingResponse,
 )
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
 
 from hub.erkg.graph import GraphView
 from hub.investigation.engine import EngineError
-from hub.models import EpistemicStatus
+from hub.models import EpistemicStatus, ScopeConfig
 from hub.security.quarantine import sanitize_untrusted
 from hub.service import InvestigationService
 
@@ -115,6 +118,49 @@ class CredentialsRequest(BaseModel):
     censys_api_secret: Optional[str] = None
     censys_token: Optional[str] = None
     hunter_api_key: Optional[str] = None
+
+
+class StepBatchRequest(BaseModel):
+    """Bounded parallel pivot wave request."""
+
+    max_pivots: int = Field(default=3, ge=1, le=8)
+
+
+class AIConfigRequest(BaseModel):
+    """AI & Vision configuration payload (keys are stored masked-only on read)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: Optional[bool] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    vision_model: Optional[str] = None
+    embedding_model: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    ollama_host: Optional[str] = None
+    lmstudio_base_url: Optional[str] = None
+    gemini_api_key: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_base_url: Optional[str] = None
+    num_ctx: Optional[int] = None
+    temperature: Optional[float] = None
+    keep_alive: Optional[str] = None
+
+
+class ReflectRequest(BaseModel):
+    """Optional provider override for case AI reflection."""
+
+    provider_override: Optional[str] = None
+
+
+class MediaAnalyzeRequest(BaseModel):
+    """Media forensics & optional VLM extraction request."""
+
+    url: str = Field(..., min_length=1, max_length=2048)
+    use_vlm: bool = False
+    target_id: Optional[str] = None
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -192,6 +238,173 @@ def _call(func, *args: Any, **kwargs: Any) -> Any:
         return func(*args, **kwargs)
     supported = {key: value for key, value in kwargs.items() if key in parameters}
     return func(*args, **supported)
+
+
+async def _call_maybe_async(func, *args: Any, **kwargs: Any) -> Any:
+    """Invoke sync or async function keeping supported kwargs only."""
+    result = _call(func, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _import_ai_layer() -> Any:
+    """Lazily import hub.ai so web server starts cleanly if AI package is absent."""
+    try:
+        from hub import ai as ai_layer
+
+        return ai_layer
+    except ImportError:
+        return None
+
+
+def _fallback_analytics(service: InvestigationService, target_id: str,
+                        source_id: Optional[str] = None,
+                        dest_id: Optional[str] = None) -> dict[str, Any]:
+    """Lightweight deterministic graph analytics fallback if service.analytics is absent."""
+    payload = build_investigation_payload(service, target_id)
+    graph = payload.get("graph") or {}
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    adj: dict[str, set[str]] = {n["id"]: set() for n in nodes}
+    edge_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for edge in edges:
+        src, dst = edge.get("subject"), edge.get("object")
+        if src in adj and dst in adj and src != dst:
+            adj[src].add(dst)
+            adj[dst].add(src)
+            edge_lookup.setdefault((src, dst), edge)
+            edge_lookup.setdefault((dst, src), edge)
+    n_count = max(1, len(nodes) - 1)
+    degree_centrality = {
+        nid: round(len(neighbors) / n_count, 4) for nid, neighbors in adj.items()
+    }
+    visited: set[str] = set()
+    clusters: list[dict[str, Any]] = []
+    for idx, node in enumerate(nodes):
+        nid = node["id"]
+        if nid in visited:
+            continue
+        comp: list[str] = []
+        queue = deque([nid])
+        visited.add(nid)
+        while queue:
+            cur = queue.popleft()
+            comp.append(cur)
+            for nxt in sorted(adj.get(cur, ())):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        clusters.append({"cluster_id": f"c{len(clusters) + 1}", "node_ids": comp, "size": len(comp)})
+
+    shortest: Optional[dict[str, Any]] = None
+    if source_id and dest_id and source_id in adj and dest_id in adj:
+        parent: dict[str, Optional[str]] = {source_id: None}
+        q = deque([source_id])
+        while q:
+            cur = q.popleft()
+            if cur == dest_id:
+                break
+            for nxt in sorted(adj.get(cur, ())):
+                if nxt not in parent:
+                    parent[nxt] = cur
+                    q.append(nxt)
+        if dest_id in parent:
+            path_ids: list[str] = []
+            cur_id: Optional[str] = dest_id
+            while cur_id is not None:
+                path_ids.append(cur_id)
+                cur_id = parent[cur_id]
+            path_ids.reverse()
+            path_edges = []
+            for a, b in zip(path_ids, path_ids[1:]):
+                e = edge_lookup.get((a, b)) or {}
+                path_edges.append({
+                    "claim_id": e.get("id"),
+                    "subject": a,
+                    "object": b,
+                    "predicate": e.get("predicate"),
+                    "status": e.get("status"),
+                    "artifact_ids": e.get("artifact_ids") or [],
+                })
+            shortest = {"found": True, "node_ids": path_ids, "edges": path_edges, "hops": len(path_edges)}
+        else:
+            shortest = {"found": False, "node_ids": [], "edges": [], "hops": 0}
+
+    return {
+        "status": "ok",
+        "target_id": target_id,
+        "centrality": {"degree": degree_centrality, "betweenness": {}},
+        "clusters": clusters,
+        "bridges": [],
+        "phash_correlations": [],
+        "shortest_path": shortest,
+    }
+
+
+def _fallback_timeline(service: InvestigationService, target_id: str) -> dict[str, Any]:
+    """Chronological timeline fallback when service.timeline is absent."""
+    payload = build_investigation_payload(service, target_id)
+    events: list[dict[str, Any]] = []
+    inv = payload.get("investigation") or {}
+    if inv.get("created_at"):
+        events.append({
+            "timestamp_utc": inv["created_at"],
+            "kind": "investigation_created",
+            "title": f"Investigation initialized ({target_id})",
+            "detail": inv.get("raw_input", ""),
+        })
+    for aid, art in (payload.get("artifacts") or {}).items():
+        events.append({
+            "timestamp_utc": art.get("timestamp_utc", ""),
+            "kind": "artifact",
+            "title": f"{art.get('source_tool', 'tool')} artifact",
+            "artifact_id": aid,
+            "status": art.get("epistemic_status"),
+            "detail": art.get("raw_evidence_snippet", "")[:160],
+        })
+    for entry in payload.get("ledger") or []:
+        events.append({
+            "timestamp_utc": entry.get("run_at", ""),
+            "kind": "ledger",
+            "title": f"{entry.get('tool_id', 'tool')} ({entry.get('status', '')})",
+            "entity_id": entry.get("entity_id"),
+            "artifact_id": entry.get("artifact_id"),
+            "detail": entry.get("error_message") or f"{entry.get('duration_ms', 0)}ms",
+        })
+    for ins in payload.get("ai_insights") or []:
+        events.append({
+            "timestamp_utc": ins.get("created_at", ""),
+            "kind": "ai_insight",
+            "title": f"AI {ins.get('kind', 'reflection')} ({ins.get('epistemic_provenance', 'AI_INFERRED')})",
+            "detail": ins.get("summary", "")[:200],
+        })
+    events.sort(key=lambda item: str(item.get("timestamp_utc") or ""))
+    return {"status": "ok", "target_id": target_id, "events": events}
+
+
+def _fallback_diff(service: InvestigationService, id_a: str, id_b: str) -> dict[str, Any]:
+    """Two-case entity/status diff fallback when service.diff is absent."""
+    a = build_investigation_payload(service, id_a)
+    b = build_investigation_payload(service, id_b)
+    a_map = {(e["type"], e["value"]): e for e in a.get("entities") or []}
+    b_map = {(e["type"], e["value"]): e for e in b.get("entities") or []}
+    added = [b_map[k] for k in sorted(set(b_map) - set(a_map))]
+    removed = [a_map[k] for k in sorted(set(a_map) - set(b_map))]
+    return {
+        "status": "ok",
+        "target_id_a": id_a,
+        "target_id_b": id_b,
+        "added_entities": added,
+        "removed_entities": removed,
+        "status_changes": [],
+        "new_contradictions": [],
+        "summary": {
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "common_count": len(set(a_map) & set(b_map)),
+        },
+    }
 
 
 def _error_payload(message: str) -> dict[str, Any]:
@@ -398,6 +611,12 @@ def build_investigation_payload(service: InvestigationService,
         entity_index = graph_view.entities
         artifacts = [_artifact_payload(artifact)
                      for artifact in store.list_artifacts(target_id)]
+        ai_insights: list[dict[str, Any]] = []
+        if hasattr(store, "list_ai_insights"):
+            try:
+                ai_insights = _value(store.list_ai_insights(target_id) or [], 1500)
+            except Exception:  # noqa: BLE001 - optional AI insights
+                ai_insights = []
         payload: dict[str, Any] = {
             "target_id": target_id,
             "investigation": _investigation_payload(investigation),
@@ -414,6 +633,7 @@ def build_investigation_payload(service: InvestigationService,
             "graph": build_workbench_graph(entities, claims, entity_index),
             "artifacts": {artifact["artifact_id"]: artifact
                           for artifact in artifacts},
+            "ai_insights": ai_insights,
         }
     finally:
         store.close()
@@ -609,6 +829,10 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
         pass
 
     svc: InvestigationService = app.state.service
+
+    static_dir = Path(__file__).resolve().parent / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     # ── UI ─────────────────────────────────────────────────────────
 
@@ -828,6 +1052,246 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
             return JSONResponse(jsonable_encoder(parsed))
         return PlainTextResponse(content=content, media_type="text/markdown")
 
+    # ── graph analytics / timeline / diff / parallel pivots ────────
+
+    @app.get("/api/investigations/{target_id}/analytics")
+    async def get_analytics(target_id: str,
+                            source_id: Optional[str] = None,
+                            dest_id: Optional[str] = None) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        try:
+            if hasattr(svc, "analytics"):
+                result = await _call_maybe_async(
+                    svc.analytics, target_id,
+                    source_id=source_id, dest_id=dest_id)
+            else:
+                result = _fallback_analytics(
+                    svc, target_id, source_id=source_id, dest_id=dest_id)
+        except LookupError:
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"analytics failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.get("/api/investigations/{target_id}/timeline")
+    async def get_timeline(target_id: str) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        try:
+            if hasattr(svc, "timeline"):
+                result = await _call_maybe_async(svc.timeline, target_id)
+            else:
+                result = _fallback_timeline(svc, target_id)
+        except LookupError:
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"timeline failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.get("/api/investigations/{target_id}/diff/{other_id}")
+    async def get_diff(target_id: str, other_id: str) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        if not _investigation_exists(svc, other_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {other_id}")
+        try:
+            if hasattr(svc, "diff"):
+                result = await _call_maybe_async(svc.diff, target_id, other_id)
+            else:
+                result = _fallback_diff(svc, target_id, other_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"diff failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.post("/api/investigations/{target_id}/step-batch")
+    async def step_batch_investigation(
+            target_id: str,
+            payload: Optional[StepBatchRequest] = Body(default=None)) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        max_pivots = payload.max_pivots if payload is not None else 3
+        try:
+            if hasattr(svc, "step_batch"):
+                result = await asyncio.to_thread(
+                    _call, svc.step_batch, target_id, max_pivots=max_pivots)
+                if inspect.isawaitable(result):
+                    result = await result
+            else:
+                result = await asyncio.to_thread(svc.step, target_id)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"step-batch failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    # ── AI & Vision Lab endpoints ──────────────────────────────────
+
+    @app.get("/api/ai/status")
+    async def get_ai_status(probe_local: bool = False) -> Any:
+        ai_layer = _import_ai_layer()
+        if ai_layer is None or not hasattr(ai_layer, "get_ai_status"):
+            return JSONResponse({
+                "status": "unavailable",
+                "enabled": False,
+                "provider": "disabled",
+                "available": False,
+                "providers": {},
+            })
+        try:
+            result = await _call_maybe_async(
+                ai_layer.get_ai_status, probe_local=probe_local)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"ai status failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.post("/api/ai/config")
+    async def post_ai_config(payload: AIConfigRequest) -> Any:
+        ai_layer = _import_ai_layer()
+        if ai_layer is None or not hasattr(ai_layer, "update_ai_config"):
+            return JSONResponse(
+                {"status": "unavailable", "errors": ["AI subsystem not available"]},
+                status_code=503)
+        data = payload.model_dump(exclude_none=True)
+        prov = str(data.get("provider") or "").strip().lower()
+        if data.get("model"):
+            model_field = {
+                "ollama": "ollama_model",
+                "lmstudio": "lmstudio_model",
+                "gemini": "gemini_model",
+                "deepseek": "deepseek_model",
+                "openai_compat": "openai_model",
+            }.get(prov or "ollama")
+            if model_field and model_field not in data:
+                data[model_field] = data.pop("model")
+        if data.get("vision_model") and "ollama_vision_model" not in data:
+            data["ollama_vision_model"] = data.pop("vision_model")
+        if data.get("base_url"):
+            url_field = {
+                "ollama": "ollama_host",
+                "lmstudio": "lmstudio_base_url",
+                "gemini": "gemini_base_url",
+                "deepseek": "deepseek_base_url",
+                "openai_compat": "openai_base_url",
+            }.get(prov or "ollama")
+            if url_field and url_field not in data:
+                data[url_field] = data.pop("base_url")
+        if data.get("api_key"):
+            key_field = {
+                "gemini": "gemini_api_key",
+                "deepseek": "deepseek_api_key",
+                "openai_compat": "openai_api_key",
+            }.get(prov)
+            if key_field and key_field not in data:
+                data[key_field] = data.pop("api_key")
+        try:
+            result = await _call_maybe_async(ai_layer.update_ai_config, data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"ai config failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        return JSONResponse(jsonable_encoder(_value(result, 1000)))
+
+    @app.post("/api/investigations/{target_id}/reflect")
+    async def post_reflect(target_id: str,
+                           payload: Optional[ReflectRequest] = Body(default=None)) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        ai_layer = _import_ai_layer()
+        if ai_layer is None or not hasattr(ai_layer, "run_case_reflection"):
+            return JSONResponse(
+                {"status": "unavailable", "target_id": target_id,
+                 "errors": ["AI reflection subsystem not available"]},
+                status_code=503)
+        provider_override = payload.provider_override if payload is not None else None
+        store = svc.engine().open_store(target_id)
+        try:
+            result = await _call_maybe_async(
+                ai_layer.run_case_reflection, store, target_id,
+                provider_override=provider_override)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"reflection failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        finally:
+            store.close()
+        return JSONResponse(jsonable_encoder(_value(result, 2000)))
+
+    @app.post("/api/media/analyze")
+    async def post_media_analyze(payload: MediaAnalyzeRequest) -> Any:
+        url = (payload.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="url is required")
+        ai_layer = _import_ai_layer()
+        if ai_layer is None or not hasattr(ai_layer, "analyze_media_url"):
+            return JSONResponse(
+                {"status": "unavailable",
+                 "errors": ["Vision & media forensics subsystem not available"]},
+                status_code=503)
+        scope = ScopeConfig()
+        if payload.target_id:
+            if not _investigation_exists(svc, payload.target_id):
+                raise HTTPException(status_code=404,
+                                    detail=f"investigation not found: {payload.target_id}")
+            store = svc.engine().open_store(payload.target_id)
+            try:
+                inv = store.get_investigation(payload.target_id)
+                if inv is not None:
+                    scope = inv.config.scope
+            finally:
+                store.close()
+        try:
+            result = await _call_maybe_async(
+                ai_layer.analyze_media_url, url,
+                use_vlm=payload.use_vlm, scope=scope)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"media analysis failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        return JSONResponse(jsonable_encoder(_value(result, 2000)))
+
     return app
 
 
@@ -863,174 +1327,561 @@ def _investigation_exists(service: InvestigationService, target_id: str) -> bool
 
 
 def _ensure_html_document(content: str) -> str:
-    """Keep the reporting HTML as-is; wrap a fragment into a dark document."""
+    """Keep the reporting HTML as-is; wrap a fragment into a Gruvbox Light document."""
     text = content or ""
     if text.lstrip().lower().startswith("<!doctype") or "<html" in text.lower():
         return text
     return (
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"color-scheme\" content=\"dark\">"
+        "<meta name=\"color-scheme\" content=\"light\">"
         "<title>Intelligence Dossier</title>"
-        "<style>body{background:#0b1120;color:#e2e8f0;font:14px/1.5 sans-serif;"
-        "padding:32px}pre{white-space:pre-wrap;word-break:break-word}</style>"
+        "<style>body{background:#fbf1c7;color:#3c3836;font:14px/1.55 sans-serif;"
+        "padding:32px}pre{white-space:pre-wrap;word-break:break-word;"
+        "background:#f2e5bc;border:1px solid #d5c4a1;padding:16px;border-radius:6px}</style>"
         f"</head><body><pre>{_text(text, 200_000)}</pre></body></html>"
     )
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Embedded single-page workbench (Tailwind CDN + offline CSS fallback)
+# Embedded single-page workbench (Gruvbox Material Light + offline Cytoscape)
 # ════════════════════════════════════════════════════════════════════════
 
 WORKBENCH_HTML = r"""<!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
 <title>AI OSINT Hub Intelligence Workbench</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<!-- offline; replaces https://cdn.tailwindcss.com -->
 <style>
-:root { color-scheme: dark; --bg:#0b1020; --panel:#111827; --panel2:#0f172a;
-        --line:#1f2937; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; }
+:root {
+  color-scheme: light;
+  --bg: #fbf1c7;
+  --panel: #f9f5d7;
+  --panel2: #f2e5bc;
+  --line: #d5c4a1;
+  --text: #282828;
+  --text-body: #3c3836;
+  --muted: #665c54;
+  --accent: #af3a03;
+  --accent-hover: #b5381e;
+  --green: #427b58;
+  --olive: #79740e;
+  --ochre: #b57614;
+  --crimson: #9d0006;
+  --slate: #076678;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --dark-legacy-bg: #0b1020;
+  --bg: #1d2021;
+  --panel: #282828;
+  --panel2: #32302f;
+  --line: #504945;
+  --text: #fbf1c7;
+  --text-body: #ebdbb2;
+  --muted: #a89984;
+  --accent: #fe8019;
+  --accent-hover: #d65d0e;
+  --green: #8ec07c;
+  --olive: #b8bb26;
+  --ochre: #fabd2f;
+  --crimson: #fb4934;
+  --slate: #83a598;
+}
 * { box-sizing: border-box; }
 html, body { height: 100%; }
-body { margin:0; background:radial-gradient(1200px 700px at 20% -10%, #16213f 0%, var(--bg) 55%);
-       color:var(--text); font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-#workbench { display:flex; flex-direction:column; height:100vh; min-height:0; }
-header { display:flex; align-items:center; gap:12px; padding:12px 16px;
-         border-bottom:1px solid var(--line); background:rgba(9,14,30,.85); backdrop-filter:blur(6px); }
-header h1 { font-size:16px; margin:0; letter-spacing:.01em; color:#f8fafc; }
-header .pill { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.06em;
-               padding:2px 9px; border-radius:999px; border:1px solid #334155; background:#0f172a; color:#93c5fd; }
-header .muted { color:var(--muted); font-size:12px; }
-main { flex:1; min-height:0; display:grid; grid-template-columns:320px minmax(0,1fr) 330px;
-       gap:12px; padding:12px; }
-@media (max-width:1150px) { main { grid-template-columns:1fr; overflow:auto; } }
-.panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
-         min-height:0; display:flex; flex-direction:column; overflow:hidden; }
-.panel > h2 { margin:0; padding:10px 12px; font-size:12px; text-transform:uppercase;
-              letter-spacing:.08em; color:var(--muted); border-bottom:1px solid var(--line); }
-.panel-body { padding:12px; overflow:auto; min-height:0; }
-label { display:block; font-size:11px; color:var(--muted); margin:8px 0 3px; text-transform:uppercase;
-        letter-spacing:.05em; }
-input, textarea, select { width:100%; background:#0b1220; color:var(--text);
-        border:1px solid #263243; border-radius:8px; padding:6px 8px; font:inherit; font-size:13px; }
-input:focus, textarea:focus { outline:1px solid var(--accent); border-color:var(--accent); }
-textarea { min-height:88px; resize:vertical; }
-button { background:#1d4ed8; color:#eff6ff; border:1px solid #1d4ed8; border-radius:8px;
-         padding:7px 12px; font:inherit; font-weight:600; cursor:pointer; }
-button:hover { background:#2563eb; }
-button.secondary { background:#0f172a; border-color:#334155; color:#cbd5e1; }
-button.secondary:hover { background:#172036; }
-.grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-.spacer { flex:1; }
-.muted { color:var(--muted); }
-.tabs { display:flex; gap:6px; padding:8px 10px; border-bottom:1px solid var(--line); }
-.tab { background:transparent; border-color:transparent; color:var(--muted); padding:5px 10px; }
-.tab.active { background:#172036; color:#e2e8f0; border-color:#334155; }
-.tab-panel { display:none; flex:1; min-height:0; }
-.tab-panel.active { display:flex; flex-direction:column; }
-#graph-wrap { flex:1; min-height:0; padding:6px; }
-#graph { width:100%; height:100%; min-height:340px; display:block;
-         background:radial-gradient(900px 500px at 50% 40%, #0d1730 0%, #0a0f1f 70%);
-         border-radius:10px; }
-#graph text { font-size:11px; fill:#cbd5e1; pointer-events:none; }
-#graph .edge-line { stroke:#334155; stroke-width:1.4; cursor:pointer; }
-#graph .edge-line:hover { stroke:#38bdf8; stroke-width:2.2; }
-#graph .edge-label { font-size:9.5px; fill:#64748b; }
-#graph .node-circle { stroke:#0b1020; stroke-width:2; cursor:pointer; }
-#graph .node-circle:hover { stroke:#f8fafc; stroke-width:3; }
-#graph .node-label { font-size:10.5px; fill:#e2e8f0; }
-#graph .empty { font-size:13px; fill:#64748b; }
-.dossier-pre { margin:0; padding:12px; background:#0b1220; border:1px solid var(--line);
-       border-radius:10px; white-space:pre-wrap; word-break:break-word; font:12px/1.55 ui-monospace,
-       Consolas, "Cascadia Mono", monospace; color:#cbd5e1; min-height:320px; }
-.telemetry-section { margin-bottom:16px; }
-.telemetry-section h3 { margin:0 0 6px; font-size:12px; color:#93c5fd;
-       text-transform:uppercase; letter-spacing:.06em; }
-.telemetry-list { list-style:none; margin:0; padding:0; }
-.telemetry-list li { padding:5px 8px; margin:3px 0; background:var(--panel2);
-       border:1px solid var(--line); border-radius:7px; font-size:12px; }
-.badge { display:inline-block; padding:1px 7px; border-radius:999px; font-size:10.5px;
-       font-weight:700; letter-spacing:.03em; border:1px solid #334155; color:#cbd5e1;
-       background:#0f172a; }
-.badge.CONFIRMED { background:#052e16; color:#4ade80; border-color:#166534; }
-.badge.CORROBORATED { background:#052e2b; color:#2dd4bf; border-color:#115e59; }
-.badge.SINGLE_SOURCE_LEAD { background:#3b2f0b; color:#fbbf24; border-color:#854d0e; }
-.badge.HYPOTHESIS { background:#1e293b; color:#94a3b8; }
-.badge.CONTRADICTED { background:#450a0a; color:#f87171; border-color:#7f1d1d; }
-.badge.COLLECTION_FAILURE { background:#1f2937; color:#9ca3af; }
-#inspector dl { margin:0; }
-#inspector dt { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em;
-       color:var(--muted); margin-top:10px; }
-#inspector dd { margin:2px 0 0; font-size:12.5px; word-break:break-word; }
-#artifact-snippet { background:#0b1220; border:1px solid var(--line); border-radius:8px;
-       padding:8px; white-space:pre-wrap; word-break:break-word; font-size:11.5px;
-       max-height:190px; overflow:auto; margin:0; color:#cbd5e1; }
-.claim-line { font-size:12px; padding:4px 6px; margin:3px 0; background:var(--panel2);
-       border:1px solid var(--line); border-radius:6px; }
-#ui-message { min-height:16px; color:#fca5a5; font-size:12px; }
-.dl-row { display:flex; gap:8px; flex-wrap:wrap; padding:10px; border-bottom:1px solid var(--line); }
-a.dl-link { display:inline-block; text-decoration:none; font-size:12px; font-weight:600;
-       color:#bfdbfe; border:1px solid #334155; background:#0f172a; border-radius:8px;
-       padding:6px 10px; }
-a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
-.modal-backdrop { position:fixed; inset:0; background:rgba(2,6,23,.78); z-index:60;
-  display:flex; align-items:center; justify-content:center; padding:20px; }
-.modal-backdrop[hidden] { display:none !important; }
-.modal-card { width:min(560px, 96vw); max-height:90vh; overflow:auto; background:#0f172a;
-  border:1px solid #334155; border-radius:14px; padding:18px 20px;
-  box-shadow:0 24px 80px rgba(0,0,0,.6); }
-.modal-card h2 { margin:0 0 4px; font-size:17px; color:#f8fafc; }
-.modal-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:12px; }
-.modal-grid .full { grid-column:1 / -1; }
-.cred-row { display:flex; align-items:center; justify-content:space-between; gap:10px;
-  margin-top:6px; font-size:12px; color:#cbd5e1; }
-.cred-badge { border:1px solid #334155; border-radius:999px; padding:1px 8px;
-  font-size:10.5px; font-weight:700; letter-spacing:.03em; }
-.cred-badge.ok { color:#4ade80; border-color:#166534; background:#052e16; }
-.cred-badge.miss { color:#fbbf24; border-color:#854d0e; background:#3b2f0b; }
-.cred-badge.info { color:#93c5fd; border-color:#1e40af; background:#0c1e3a; }
-#graph-toolbar { display:flex; align-items:center; gap:6px; flex-wrap:wrap;
-  padding:8px 10px; border-bottom:1px solid var(--line); background:var(--panel2); }
-#graph-toolbar button { padding:4px 9px; font-size:11px; }
-#node-search { flex:1 1 160px; min-width:120px; margin:0; padding:5px 8px; font-size:12px; }
-#type-filters { display:flex; flex-wrap:wrap; gap:4px; padding:6px 10px;
-  border-bottom:1px solid var(--line); }
-.graph-toggle { display:inline-flex; align-items:center; gap:5px; font-size:11px;
-  color:#cbd5e1; margin:0; text-transform:none; letter-spacing:0; cursor:pointer; }
-.graph-toggle input { width:auto; margin:0; }
-.filter-pill { border:1px solid #334155; background:#0f172a; color:#cbd5e1;
-  border-radius:999px; padding:2px 8px; font-size:10.5px; cursor:pointer; }
-.filter-pill.active { border-color:#38bdf8; color:#f8fafc; background:#0c4a6e; }
-.filter-pill .count { opacity:.7; margin-left:3px; }
-.node-dim { opacity:.18; }
-.node-match .node-circle { stroke:#facc15; stroke-width:4; }
-#ui-message.error { color:#fca5a5; font-weight:600; }
-.pill.completed { color:#4ade80; border-color:#166534; background:#052e16; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-body);
+  font: 13.5px/1.5 "Inter", "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+}
+.mono, code, pre, #artifact-sha, #artifact-confidence, #target-label, #stats-line,
+.telemetry-list, .timeline-ts, .pivot-score {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+#workbench { display: flex; flex-direction: column; height: 100vh; min-height: 0; }
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+  flex-wrap: wrap;
+}
+header h1 {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+header .pill {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--slate);
+}
+header .muted { color: var(--muted); font-size: 12px; }
+main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 344px minmax(0, 1fr) 360px;
+  gap: 16px;
+  padding: 16px;
+  max-width: 3440px;
+  width: 100%;
+  margin: 0 auto;
+}
+#workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 360px; }
+#workbench.rail-right-collapsed main { grid-template-columns: 344px minmax(0, 1fr) 0px; }
+#workbench.rail-left-collapsed.rail-right-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 0px; }
+#workbench.rail-left-collapsed .intake-panel,
+#workbench.rail-right-collapsed .inspector-panel {
+  border-width: 0;
+  padding: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
+@media (max-width: 1200px) {
+  main,
+  #workbench.rail-left-collapsed main,
+  #workbench.rail-right-collapsed main,
+  #workbench.rail-left-collapsed.rail-right-collapsed main {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+  #workbench.rail-left-collapsed .intake-panel,
+  #workbench.rail-right-collapsed .inspector-panel {
+    display: none;
+  }
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel > h2 {
+  margin: 0;
+  padding: 8px 16px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+}
+.panel-body { padding: 16px; overflow: auto; min-height: 0; }
+label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 8px 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+input, textarea, select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+input:focus, textarea:focus, select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+textarea { min-height: 80px; resize: vertical; }
+button {
+  background: var(--accent);
+  color: #fbf1c7;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.secondary {
+  background: var(--panel2);
+  border-color: var(--line);
+  color: var(--text);
+}
+button.secondary:hover { background: var(--bg); border-color: var(--muted); }
+button.compact { padding: 4px 8px; font-size: 11.5px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.tab {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+  padding: 6px 12px;
+  border-radius: 4px;
+}
+.tab.active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--line);
+  border-bottom: 2px solid var(--accent);
+}
+.tab-panel { display: none; flex: 1; min-height: 0; }
+.tab-panel.active { display: flex; flex-direction: column; }
+#graph-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 360px;
+  padding: 8px;
+  background: var(--bg);
+}
+#cy-graph {
+  width: 100%;
+  height: 100%;
+  min-height: 344px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+#graph {
+  width: 100%;
+  height: 100%;
+  min-height: 344px;
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.graph-hidden {
+  position: absolute !important;
+  left: -99999px !important;
+  width: 960px !important;
+  height: 620px !important;
+  pointer-events: none;
+}
+#graph text { font-size: 11px; fill: var(--text-body); pointer-events: none; }
+#graph .edge-line { stroke: var(--line); stroke-width: 1.5; cursor: pointer; }
+#graph .edge-line:hover { stroke: var(--accent); stroke-width: 2.4; }
+#graph .edge-line.path-highlight { stroke: var(--accent); stroke-width: 3.2; }
+#graph .edge-label { font-size: 9.5px; fill: var(--muted); }
+#graph .node-circle { stroke: var(--bg); stroke-width: 2; cursor: pointer; }
+#graph .node-circle:hover { stroke: var(--text); stroke-width: 3; }
+#graph .node-label { font-size: 10.5px; fill: var(--text); }
+#graph .empty { font-size: 13px; fill: var(--muted); }
+.dossier-pre {
+  margin: 0;
+  padding: 16px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 12px/1.6 ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  min-height: 320px;
+}
+.telemetry-section { margin-bottom: 24px; }
+.telemetry-section h3 {
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 4px;
+}
+.telemetry-list { list-style: none; margin: 0; padding: 0; }
+.telemetry-list li {
+  padding: 8px;
+  margin: 4px 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--line);
+  color: var(--text-body);
+  background: var(--panel2);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.badge.CONFIRMED { background: #e8eed8; color: var(--green); border-color: #8ea67c; }
+.badge.CORROBORATED { background: #e8eed8; color: var(--olive); border-color: #a39e4b; }
+.badge.SINGLE_SOURCE_LEAD { background: #f6ead0; color: var(--ochre); border-color: #d7a64f; }
+.badge.HYPOTHESIS { background: var(--panel2); color: var(--muted); border-color: var(--line); }
+.badge.CONTRADICTED { background: #f6e0dc; color: var(--crimson); border-color: #c96e6b; }
+.badge.COLLECTION_FAILURE { background: #f2e2dc; color: var(--crimson); border-color: var(--line); }
+.badge.AI_INFERRED { background: #e2ecef; color: var(--slate); border-color: #7ca5ae; }
+[data-theme="dark"] .badge.CONFIRMED { background: #1d2c21; border-color: #427b58; }
+[data-theme="dark"] .badge.CORROBORATED { background: #262919; border-color: #79740e; }
+[data-theme="dark"] .badge.SINGLE_SOURCE_LEAD { background: #332612; border-color: #b57614; }
+[data-theme="dark"] .badge.CONTRADICTED { background: #361717; border-color: #9d0006; }
+[data-theme="dark"] .badge.AI_INFERRED { background: #17272c; border-color: #076678; }
+#inspector dl { margin: 8px 0 0; }
+#inspector dt {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-top: 8px;
+}
+#inspector dd { margin: 4px 0 0; font-size: 12.5px; word-break: break-word; }
+#artifact-snippet {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11.5px;
+  max-height: 192px;
+  overflow: auto;
+  margin: 0;
+  color: var(--text);
+}
+.claim-line {
+  font-size: 12px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+#ui-message { min-height: 16px; color: var(--crimson); font-size: 12px; margin: 8px 0 0; }
+.dl-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+}
+a.dl-link {
+  display: inline-block;
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 4px;
+  padding: 6px 12px;
+}
+a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(40, 40, 40, 0.55);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.modal-backdrop[hidden] { display: none !important; }
+.modal-card {
+  width: min(560px, 96vw);
+  max-height: 90vh;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 24px;
+}
+.modal-card h2 { margin: 0 0 8px; font-size: 16px; color: var(--text); }
+.modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+.modal-grid .full { grid-column: 1 / -1; }
+.cred-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-body);
+}
+.cred-badge {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.cred-badge.ok { color: var(--green); border-color: var(--green); background: #e8eed8; }
+.cred-badge.miss { color: var(--ochre); border-color: var(--ochre); background: #f6ead0; }
+.cred-badge.info { color: var(--slate); border-color: var(--slate); background: #e2ecef; }
+#graph-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+#graph-toolbar button { padding: 4px 8px; font-size: 11.5px; }
+#node-search { flex: 1 1 150px; min-width: 120px; margin: 0; padding: 4px 8px; font-size: 12px; }
+#cluster-filter { width: auto; min-width: 110px; margin: 0; padding: 4px 8px; font-size: 11.5px; }
+#type-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.graph-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-body);
+  margin: 0;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.graph-toggle input { width: auto; margin: 0; }
+.filter-pill {
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--text-body);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.filter-pill.active { border-color: var(--accent); color: #fbf1c7; background: var(--accent); }
+.filter-pill .count { opacity: 0.8; margin-left: 4px; }
+.node-dim { opacity: 0.18; }
+.node-match .node-circle { stroke: var(--accent); stroke-width: 4; }
+#ui-message.error { color: var(--crimson); font-weight: 600; }
+.pill.completed { color: var(--green); border-color: var(--green); background: #e8eed8; }
+.rail-card {
+  margin-top: 16px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.rail-card summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text);
+}
+.tool-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+}
+.tool-row:last-child { border-bottom: none; }
+.ai-box {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--slate);
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.quarantine-alert {
+  background: #f6e0dc;
+  border: 1px solid var(--crimson);
+  color: var(--crimson);
+  border-radius: 4px;
+  padding: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
 </style>
 </head>
 <body>
 <div id="workbench">
   <header>
+    <button id="toggle-left-rail" class="secondary compact" type="button" title="Toggle Left Rail">Rail</button>
     <h1>AI OSINT Hub Intelligence Workbench</h1>
     <span id="status-pill" class="pill" aria-live="polite">idle</span>
     <span id="target-label" class="muted"></span>
     <span class="spacer"></span>
     <span id="stats-line" class="muted"></span>
-    <button id="open-api-keys" class="secondary" type="button"
+    <button id="toggle-theme" class="secondary compact" type="button" title="Toggle Light/Dark theme">Theme</button>
+    <button id="open-api-keys" class="secondary compact" type="button"
             aria-haspopup="dialog" aria-controls="api-keys-modal">API Keys</button>
+    <button id="toggle-right-rail" class="secondary compact" type="button" title="Toggle Inspector">Inspector</button>
   </header>
   <main>
-    <section class="panel intake-panel" aria-label="Intake">
-      <h2>Intake</h2>
+    <section class="panel intake-panel" aria-label="Intake and Case Rail">
+      <h2>Case &amp; Intake</h2>
       <div class="panel-body">
+        <div class="rail-card" style="margin-top:0;margin-bottom:16px">
+          <div class="row">
+            <label for="case-select" style="margin:0;flex:1">Active Investigation</label>
+            <button id="refresh-cases-btn" class="secondary compact" type="button">Refresh</button>
+          </div>
+          <select id="case-select" aria-label="Select investigation" style="margin-top:4px">
+            <option value="">— current / new —</option>
+          </select>
+          <div class="row" style="margin-top:8px">
+            <select id="diff-target-select" aria-label="Compare against case" style="flex:1">
+              <option value="">Diff against case…</option>
+            </select>
+            <button id="run-diff-btn" class="secondary compact" type="button">Diff</button>
+          </div>
+        </div>
+
         <form id="intake" autocomplete="off">
           <label for="in-raw">Free-form intelligence</label>
-          <textarea id="in-raw" placeholder="Paste any OSINT notes, names, handles, emails, domains, phones, URLs, IPs…"></textarea>
+          <textarea id="in-raw" placeholder="Paste OSINT notes, names, handles, emails, domains, phones, URLs, IPs…"></textarea>
           <label for="in-name">Full name</label>
-          <input id="in-name" type="text" placeholder="e.g. John Smith">
+          <input id="in-name" type="text" placeholder="Target display name">
           <div class="grid2">
             <div><label for="in-usernames">Usernames</label><input id="in-usernames" type="text" placeholder="comma or space separated"></div>
             <div><label for="in-emails">Emails</label><input id="in-emails" type="text" placeholder="comma separated"></div>
@@ -1051,29 +1902,79 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
               <input id="in-wait" type="checkbox" style="width:auto;margin-right:6px"> Wait for completion
             </label>
           </div>
-          <details style="margin-top:10px">
+          <details style="margin-top:8px">
             <summary class="muted" style="cursor:pointer;font-size:12px">Budgets &amp; thresholds</summary>
-            <div class="grid2" style="margin-top:6px">
+            <div class="grid2" style="margin-top:8px">
               <div><label for="in-max-iterations">Max iterations</label><input id="in-max-iterations" type="number" value="16" min="1" max="500"></div>
               <div><label for="in-max-tool-calls">Max tool calls</label><input id="in-max-tool-calls" type="number" value="20" min="1" max="1000"></div>
               <div><label for="in-timeout">Wall clock (s)</label><input id="in-timeout" type="number" value="600" min="5"></div>
               <div><label for="in-threshold">Min pivot score</label><input id="in-threshold" type="number" value="0.12" min="0" max="1" step="0.01"></div>
             </div>
           </details>
-          <div class="row" style="margin-top:12px">
+          <div class="row" style="margin-top:16px">
             <button id="run-investigation" type="submit">Start Investigation</button>
             <button id="run-pivot" class="secondary" type="button">Run Next Pivot</button>
-            <button id="clear-form" class="secondary" type="button">Clear Form</button>
+            <button id="run-batch-pivots" class="secondary compact" type="button">Step Batch (3x)</button>
+            <button id="clear-form" class="secondary compact" type="button">Clear Form</button>
           </div>
           <p id="ui-message" role="alert"></p>
         </form>
+
+        <details id="tools-health-drawer" class="rail-card">
+          <summary>32-Tool Health &amp; Scope Policy</summary>
+          <div class="row" style="margin-top:8px">
+            <span id="tools-summary-badge" class="badge">checking…</span>
+            <span class="spacer"></span>
+            <button id="refresh-tools-btn" class="secondary compact" type="button">Refresh</button>
+            <button id="run-doctor-btn" class="secondary compact" type="button">Doctor</button>
+          </div>
+          <div id="scope-policy-summary" class="muted mono" style="font-size:11px;margin-top:8px">Default: passive-only, SSRF-guarded</div>
+          <div id="tools-health-list" style="margin-top:8px;max-height:220px;overflow:auto"></div>
+        </details>
+
+        <details id="ai-config-drawer" class="rail-card">
+          <summary>AI &amp; Vision Config</summary>
+          <div style="margin-top:8px">
+            <div class="row">
+              <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
+                <input id="ai-enabled" type="checkbox" style="width:auto;margin-right:6px"> Enable AI Reflection / VLM
+              </label>
+              <span class="spacer"></span>
+              <span id="ai-status-badge" class="badge AI_INFERRED">disabled</span>
+            </div>
+            <label for="ai-provider">Provider</label>
+            <select id="ai-provider">
+              <option value="disabled">disabled</option>
+              <option value="ollama">ollama (local)</option>
+              <option value="lmstudio">lmstudio (local)</option>
+              <option value="gemini">gemini</option>
+              <option value="deepseek">deepseek</option>
+              <option value="openai_compat">openai_compat</option>
+            </select>
+            <div class="grid2">
+              <div><label for="ai-model">Text Model</label><input id="ai-model" type="text" placeholder="gemma4"></div>
+              <div><label for="ai-vision-model">Vision Model</label><input id="ai-vision-model" type="text" placeholder="qwen2.5vl:7b"></div>
+            </div>
+            <label for="ai-base-url">Base URL (optional)</label>
+            <input id="ai-base-url" type="text" placeholder="http://127.0.0.1:11434">
+            <label for="ai-api-key">Provider API Key (write-only)</label>
+            <input id="ai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="optional cloud key">
+            <div class="row" style="margin-top:8px">
+              <button id="save-ai-config" class="compact" type="button">Save AI Config</button>
+              <button id="refresh-ai-status" class="secondary compact" type="button">Probe</button>
+            </div>
+            <p id="ai-config-message" class="muted" style="font-size:11.5px;margin:8px 0 0"></p>
+          </div>
+        </details>
       </div>
     </section>
 
     <section class="panel visualization-panel" aria-label="Visualization">
       <nav class="tabs" role="tablist">
         <button class="tab active" type="button" data-tab="graph">Graph</button>
-        <button class="tab" type="button" data-tab="telemetry">Telemetry</button>
+        <button class="tab" type="button" data-tab="timeline">Timeline</button>
+        <button class="tab" type="button" data-tab="telemetry">Telemetry &amp; Pivots</button>
+        <button class="tab" type="button" data-tab="ai">AI &amp; Vision Lab</button>
         <button class="tab" type="button" data-tab="dossier">Dossier</button>
       </nav>
       <div id="tab-graph" class="tab-panel active">
@@ -1081,8 +1982,13 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
           <button id="zoom-in" type="button" class="secondary" title="Zoom in">Zoom +</button>
           <button id="zoom-out" type="button" class="secondary" title="Zoom out">Zoom −</button>
           <button id="zoom-reset" type="button" class="secondary" title="Reset view">Reset</button>
+          <button id="toggle-graph-engine" type="button" class="secondary" title="Switch Cytoscape / SVG renderer">View: Auto</button>
           <input id="node-search" type="search" placeholder="Search nodes…"
                  aria-label="Search graph nodes">
+          <select id="cluster-filter" aria-label="Filter by graph cluster">
+            <option value="">All clusters</option>
+          </select>
+          <button id="clear-path-btn" type="button" class="secondary" title="Clear shortest-path highlight">Clear Path</button>
           <label class="graph-toggle" title="Show unverified planner hypotheses">
             <input id="show-hypotheses" type="checkbox">
             Show Hypotheses (<span id="hyp-count">0</span>)
@@ -1094,15 +2000,68 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         </div>
         <div id="type-filters" aria-label="Entity type filters"></div>
         <div id="graph-wrap">
+          <div id="cy-graph" class="graph-hidden" aria-label="Interactive Cytoscape knowledge graph"></div>
           <svg id="graph" viewBox="0 0 960 620" preserveAspectRatio="xMidYMid meet"
                role="img" aria-label="Entity-resolved knowledge graph"></svg>
         </div>
       </div>
-      <div id="tab-telemetry" class="tab-panel">
-        <div class="panel-body" id="telemetry">
-          <p class="muted">Start an investigation to see ledger, hypotheses and contradictions.</p>
+
+      <div id="tab-timeline" class="tab-panel">
+        <div class="dl-row">
+          <button id="refresh-timeline-btn" class="secondary compact" type="button">Refresh Timeline</button>
+          <span id="timeline-summary" class="muted mono" style="font-size:12px"></span>
+        </div>
+        <div class="panel-body">
+          <div class="telemetry-section">
+            <h3>Chronological Investigation Timeline</h3>
+            <ul id="timeline-list" class="telemetry-list">
+              <li class="muted">Start or select an investigation to inspect timeline events.</li>
+            </ul>
+          </div>
+          <div class="telemetry-section">
+            <h3>Case Diff Comparison</h3>
+            <div id="diff-results" class="muted" style="font-size:12px">Select a comparison case in the left rail and click Diff.</div>
+          </div>
         </div>
       </div>
+
+      <div id="tab-telemetry" class="tab-panel">
+        <div class="panel-body" id="telemetry">
+          <p class="muted">Start an investigation to see ledger, hypotheses, pivots, analytics and contradictions.</p>
+        </div>
+      </div>
+
+      <div id="tab-ai" class="tab-panel">
+        <div class="panel-body">
+          <div class="ai-box">
+            <div class="row">
+              <strong style="color:var(--text)">AI Case Reflection (Quarantined)</strong>
+              <span class="badge AI_INFERRED">AI_INFERRED</span>
+              <span class="spacer"></span>
+              <button id="run-reflect-btn" class="compact" type="button">Run Reflection</button>
+            </div>
+            <p class="muted" style="font-size:12px;margin:8px 0">
+              AI reflections operate strictly over sanitized evidence packets and never auto-promote claims to CONFIRMED.
+            </p>
+            <div id="ai-insights-list"></div>
+          </div>
+          <div class="ai-box">
+            <strong style="color:var(--text)">Vision &amp; Media Forensics Lab</strong>
+            <p class="muted" style="font-size:12px;margin:8px 0">
+              SSRF-guarded media download, SHA-256, EXIF/GPS, 64-bit dHash/pHash, OCR, visual prompt-injection detection, and optional quarantined VLM extraction.
+            </p>
+            <div class="row" style="margin-top:8px">
+              <input id="media-url-input" type="url" placeholder="https://..." style="flex:1">
+              <label class="graph-toggle">
+                <input id="media-use-vlm" type="checkbox"> Use VLM
+              </label>
+              <button id="analyze-media-btn" class="compact" type="button">Analyze Media</button>
+            </div>
+            <pre id="media-results" class="dossier-pre" style="min-height:140px;margin-top:8px">No media analyzed yet.</pre>
+          </div>
+        </div>
+      </div>
+
       <div id="tab-dossier" class="tab-panel">
         <div class="dl-row">
           <a id="download-md" class="dl-link" href="#" download>Download Markdown</a>
@@ -1122,12 +2081,20 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
           <span id="epistemic-badge" class="badge">—</span>
           <span id="inspector-title" class="muted" style="font-size:12px">select a node or edge</span>
         </div>
+        <div class="row" style="margin-top:8px">
+          <button id="inspect-pivot-btn" class="compact" type="button" disabled>Pivot Entity</button>
+          <button id="set-path-source-btn" class="secondary compact" type="button" disabled>Set Path Source</button>
+          <button id="find-path-btn" class="secondary compact" type="button" disabled>Shortest Path</button>
+        </div>
+        <div id="path-status-line" class="muted mono" style="font-size:11px;margin-top:4px"></div>
         <dl>
           <dt>SHA-256</dt><dd id="artifact-sha">—</dd>
           <dt>Source tool</dt><dd id="artifact-tool">—</dd>
           <dt>Confidence</dt><dd id="artifact-confidence">—</dd>
           <dt>Evidence snippet</dt><dd><pre id="artifact-snippet">Select a graph node or edge to inspect its cited evidence artifact.</pre></dd>
         </dl>
+        <div id="inspector-quarantine"></div>
+        <div id="inspector-contradictions"></div>
         <div id="inspector-claims"></div>
       </div>
     </aside>
@@ -1136,7 +2103,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
        aria-modal="true" aria-labelledby="api-keys-title">
     <div class="modal-card">
       <h2 id="api-keys-title">API Keys</h2>
-      <p class="muted" style="margin:0 0 6px;font-size:12px">
+      <p class="muted" style="margin:0 0 8px;font-size:12px">
         Stored locally in the credential vault and synced to theHarvester. Secrets are
         never shown again after saving.
       </p>
@@ -1174,7 +2141,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
           <div class="cred-row"><span>Hunter.io</span><span id="cred-status-hunter" class="cred-badge info">—</span></div>
         </div>
       </div>
-      <div class="row" style="margin-top:14px">
+      <div class="row" style="margin-top:16px">
         <button id="save-api-keys" type="button">Save &amp; Sync Keys</button>
         <button id="close-api-keys" class="secondary" type="button">Close</button>
       </div>
@@ -1186,20 +2153,37 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
 (function () {
   "use strict";
   var state = {
-    targetId: null, source: null, payload: null,
+    targetId: null,
+    source: null,
+    payload: null,
+    analytics: null,
+    cy: null,
+    pathSourceId: null,
+    selectedNode: null,
     graphView: {
       x: 0, y: 0, scale: 1, hidden: {}, search: "",
+      cluster: "",
+      renderer: "auto",
+      shortestPathNodes: {},
+      shortestPathEdges: {},
       showHypotheses: false,   // guessed permutations hidden by default
       showEdgeLabels: false    // permanent edge text off by default
     }
   };
   var TYPE_COLORS = {
-    person: "#f472b6", username: "#60a5fa", email: "#34d399", domain: "#fbbf24",
-    subdomain: "#f59e0b", ip: "#a78bfa", asn: "#8b5cf6", organization: "#f87171",
-    phone: "#22d3ee", repository: "#94a3b8", social_profile: "#38bdf8",
-    breach_record: "#ef4444", crypto_address: "#e879f9", service: "#4ade80",
-    credential: "#fb7185", hash: "#cbd5e1", port: "#facc15", location: "#2dd4bf",
-    url: "#93c5fd"
+    person: "#af3a03", username: "#076678", email: "#427b58", domain: "#b57614",
+    subdomain: "#d65d0e", ip: "#458588", asn: "#689d6a", organization: "#9d0006",
+    phone: "#076678", repository: "#665c54", social_profile: "#427b58",
+    breach_record: "#9d0006", crypto_address: "#b57614", service: "#79740e",
+    credential: "#cc241d", hash: "#7c6f64", port: "#d79921", location: "#689d6a",
+    url: "#458588"
+  };
+  var TYPE_SHAPES = {
+    person: "diamond", organization: "round-rectangle", domain: "hexagon",
+    subdomain: "round-hexagon", ip: "rectangle", asn: "barrel",
+    email: "ellipse", username: "ellipse", phone: "tag",
+    hash: "cut-rectangle", service: "round-triangle", url: "vee",
+    location: "pentagon", breach_record: "octagon", credential: "star"
   };
   var SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -1270,7 +2254,9 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     setStatus("COMPLETED", true);
     refreshState().then(function () {
       fetchDossier();
+      fetchTimeline();
       updateDownloads();
+      refreshCases();
     }).catch(function (err) { showError(err); });
   }
   function waitForCompletionAfterTimeout() {
@@ -1343,10 +2329,14 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     }).then(function (data) {
       if (!data || !data.target_id) { throw new Error("no target_id returned"); }
       state.targetId = data.target_id;
+      state.pathSourceId = null;
+      state.graphView.shortestPathNodes = {};
+      state.graphView.shortestPathEdges = {};
       setText("target-label", data.target_id);
       setStatus(data.status === "started" ? "running" : String(data.status || ""));
       if (data.status === "started") { connectStream(); }
       updateDownloads();
+      refreshCases();
       return refreshState();
     }).catch(function (err) { setStatus("error"); showError(err); });
   }
@@ -1406,12 +2396,15 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       state.payload = payload;
       renderGraph(payload);
       renderTelemetry(payload);
+      renderAiInsights(payload);
+      updateScopeSummary(payload);
       setText("stats-line", summarize(payload));
+      fetchAnalytics();
       clearError();
     }).catch(function (err) {
       // Uvicorn may briefly reject fetches while a heavy subprocess/SSE poll is
       // running. During an active investigation, retry silently instead of
-      // painting a red "Failed to fetch" banner over a healthy run.
+      // painting a red banner over a healthy run.
       if (isTransientNetworkError(err)) {
         if (state.targetId) {
           window.setTimeout(function () { refreshState(); }, 1200);
@@ -1459,6 +2452,39 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         if (state.payload) { renderGraph(state.payload); }
       });
       container.appendChild(pill);
+    });
+  }
+
+  function clusterNodeLookup() {
+    var map = {};
+    var clusters = (state.analytics && (state.analytics.clusters || state.analytics.communities)) || [];
+    clusters.forEach(function (cluster, idx) {
+      var cid = Array.isArray(cluster) ? ("c" + (idx + 1)) : String(cluster.cluster_id || ("c" + (idx + 1)));
+      var members = Array.isArray(cluster) ? cluster : (cluster.node_ids || []);
+      members.forEach(function (nid) {
+        map[nid] = cid;
+      });
+    });
+    return map;
+  }
+
+  function updateClusterSelect() {
+    var sel = byId("cluster-filter");
+    if (!sel) { return; }
+    var prev = state.graphView.cluster || "";
+    sel.textContent = "";
+    var allOpt = make("option", "", "All clusters");
+    allOpt.value = "";
+    sel.appendChild(allOpt);
+    var clusters = (state.analytics && (state.analytics.clusters || state.analytics.communities)) || [];
+    clusters.forEach(function (cluster, idx) {
+      var members = Array.isArray(cluster) ? cluster : (cluster.node_ids || []);
+      var cid = Array.isArray(cluster) ? ("c" + (idx + 1)) : String(cluster.cluster_id || ("c" + (idx + 1)));
+      var size = Array.isArray(cluster) ? members.length : (cluster.size || members.length);
+      var opt = make("option", "", cid + " (" + size + ")");
+      opt.value = cid;
+      if (cid === prev) { opt.selected = true; }
+      sel.appendChild(opt);
     });
   }
 
@@ -1581,15 +2607,19 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       empty.setAttribute("y", "44");
       empty.textContent = "No graph data yet — start an investigation.";
       svg.appendChild(empty);
+      renderCytoscape([], [], {}, payload);
       return;
     }
     var hypothesisCount = nodes.filter(function (node) {
       return !!node.is_hypothesis;
     }).length;
     setText("hyp-count", String(hypothesisCount));
+    var clusters = clusterNodeLookup();
+    var clusterFilter = state.graphView.cluster || "";
     var visibleNodes = nodes.filter(function (node) {
       if (state.graphView.hidden[node.type]) { return false; }
       if (node.is_hypothesis && !state.graphView.showHypotheses) { return false; }
+      if (clusterFilter && clusters[node.id] !== clusterFilter) { return false; }
       return true;
     });
     var visibleIds = {};
@@ -1603,10 +2633,13 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     var search = String(state.graphView.search || "").toLowerCase();
     var nodeRadius = visibleNodes.length > 90 ? 11 : 15;
     var showEdgeLabels = !!state.graphView.showEdgeLabels;
+    var pathEdges = state.graphView.shortestPathEdges || {};
+    var pathNodes = state.graphView.shortestPathNodes || {};
     visibleEdges.forEach(function (edge) {
       var from = positions[edge.subject], to = positions[edge.object];
       if (!from || !to) { return; }
-      var line = svgNode("line", "edge-line");
+      var isPath = !!pathEdges[edge.id];
+      var line = svgNode("line", "edge-line" + (isPath ? " path-highlight" : ""));
       line.setAttribute("x1", from.x); line.setAttribute("y1", from.y);
       line.setAttribute("x2", to.x); line.setAttribute("y2", to.y);
       line.addEventListener("click", function () { inspectClaim(edge, payload); });
@@ -1633,11 +2666,14 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         var haystack = (String(node.type) + " " + String(node.value)).toLowerCase();
         group.setAttribute("class", "node " +
           (haystack.indexOf(search) !== -1 ? "node-match" : "node-dim"));
+      } else if (Object.keys(pathNodes).length) {
+        group.setAttribute("class", "node " +
+          (pathNodes[node.id] ? "node-match" : "node-dim"));
       }
       group.setAttribute("transform", "translate(" + position.x + "," + position.y + ")");
       var circle = svgNode("circle", "node-circle");
       circle.setAttribute("r", String(nodeRadius));
-      circle.setAttribute("fill", TYPE_COLORS[node.type] || "#94a3b8");
+      circle.setAttribute("fill", TYPE_COLORS[node.type] || "#665c54");
       circle.addEventListener("click", function () { inspectEntity(node, payload); });
       var tip = svgNode("title");
       tip.textContent = node.type + ": " + node.value;
@@ -1660,13 +2696,153 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     });
     svg.appendChild(viewport);
     applyGraphTransform();
+    renderCytoscape(visibleNodes, visibleEdges, positions, payload);
     clearError();
+  }
+
+  function syncGraphRendererVisibility() {
+    var cyEl = byId("cy-graph");
+    var svgEl = byId("graph");
+    var toggleBtn = byId("toggle-graph-engine");
+    if (!cyEl || !svgEl) { return; }
+    var canCy = typeof window.cytoscape === "function";
+    var useCy = (state.graphView.renderer === "cy" && canCy) ||
+      (state.graphView.renderer === "auto" && canCy);
+    cyEl.classList.toggle("graph-hidden", !useCy);
+    svgEl.classList.toggle("graph-hidden", useCy);
+    if (toggleBtn) {
+      toggleBtn.textContent = useCy ? "View: Cytoscape" : "View: SVG";
+    }
+  }
+
+  function renderCytoscape(visibleNodes, visibleEdges, positions, payload) {
+    syncGraphRendererVisibility();
+    var cyEl = byId("cy-graph");
+    if (!cyEl || typeof window.cytoscape !== "function") { return; }
+    var degreeMap = (state.analytics && (state.analytics.degree_centrality ||
+      (state.analytics.centrality && state.analytics.centrality.degree))) || {};
+    var search = String(state.graphView.search || "").toLowerCase();
+    var pathNodes = state.graphView.shortestPathNodes || {};
+    var pathEdges = state.graphView.shortestPathEdges || {};
+    var hasPath = Object.keys(pathNodes).length > 0;
+    var elements = [];
+    var nodeMap = {};
+    var edgeMap = {};
+    visibleNodes.forEach(function (node) {
+      nodeMap[node.id] = node;
+      var deg = Number(degreeMap[node.id] || 0);
+      var size = Math.round(28 + Math.min(28, deg * 44));
+      var matchesSearch = search ?
+        (String(node.type) + " " + String(node.value)).toLowerCase().indexOf(search) !== -1 : false;
+      var classes = [];
+      if (search) { classes.push(matchesSearch ? "matched" : "dimmed"); }
+      else if (hasPath) { classes.push(pathNodes[node.id] ? "path-node" : "dimmed"); }
+      if (node.is_hypothesis) { classes.push("hyp"); }
+      elements.push({
+        data: {
+          id: node.id,
+          label: String(node.value || "").slice(0, 22),
+          type: node.type,
+          status: node.status,
+          color: TYPE_COLORS[node.type] || "#665c54",
+          shape: TYPE_SHAPES[node.type] || "ellipse",
+          size: size
+        },
+        position: positions[node.id] || { x: 480, y: 310 },
+        classes: classes.join(" ")
+      });
+    });
+    visibleEdges.forEach(function (edge) {
+      edgeMap[edge.id] = edge;
+      var conf = Number(edge.confidence || 0.3);
+      var classes = [];
+      if (pathEdges[edge.id]) { classes.push("path-edge"); }
+      else if (hasPath) { classes.push("dimmed"); }
+      if (edge.status === "CONTRADICTED") { classes.push("contradicted"); }
+      elements.push({
+        data: {
+          id: edge.id,
+          source: edge.subject,
+          target: edge.object,
+          label: state.graphView.showEdgeLabels ?
+            (edge.predicate + " " + conf.toFixed(2)) : "",
+          width: Math.max(1.2, Math.min(4.5, 1 + conf * 3.2))
+        },
+        classes: classes.join(" ")
+      });
+    });
+    if (state.cy) {
+      try { state.cy.destroy(); } catch (err) { /* ignore */ }
+      state.cy = null;
+    }
+    var styleList = [
+      {
+        selector: "node",
+        style: {
+          "background-color": "data(color)",
+          "shape": "data(shape)",
+          "width": "data(size)",
+          "height": "data(size)",
+          "label": "data(label)",
+          "color": "#282828",
+          "font-size": "10px",
+          "font-family": "Inter, Segoe UI, sans-serif",
+          "text-valign": "bottom",
+          "text-margin-y": 5,
+          "border-width": 2,
+          "border-color": "#fbf1c7"
+        }
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": "data(width)",
+          "line-color": "#bdae93",
+          "target-arrow-color": "#bdae93",
+          "target-arrow-shape": "triangle",
+          "curve-style": "bezier",
+          "label": "data(label)",
+          "font-size": "9px",
+          "color": "#665c54",
+          "text-background-color": "#fbf1c7",
+          "text-background-opacity": 0.9
+        }
+      },
+      { selector: "node.hyp", style: { "border-style": "dashed", "border-color": "#b57614" } },
+      { selector: "node.matched", style: { "border-width": 4, "border-color": "#af3a03" } },
+      { selector: "node.path-node", style: { "border-width": 4, "border-color": "#af3a03" } },
+      { selector: "edge.path-edge", style: { "line-color": "#af3a03", "target-arrow-color": "#af3a03", "width": 3.5 } },
+      { selector: "edge.contradicted", style: { "line-color": "#9d0006", "target-arrow-color": "#9d0006", "line-style": "dashed" } },
+      { selector: ".dimmed", style: { "opacity": 0.2 } }
+    ];
+    state.cy = window.cytoscape({
+      container: cyEl,
+      elements: elements,
+      style: styleList,
+      layout: { name: "preset" },
+      minZoom: 0.25,
+      maxZoom: 3.5,
+      wheelSensitivity: 0.25
+    });
+    state.cy.on("tap", "node", function (evt) {
+      var node = nodeMap[evt.target.id()];
+      if (node && state.payload) { inspectEntity(node, state.payload); }
+    });
+    state.cy.on("tap", "edge", function (evt) {
+      var edge = edgeMap[evt.target.id()];
+      if (edge && state.payload) { inspectClaim(edge, state.payload); }
+    });
+    state.cy.fit(undefined, 28);
   }
 
   function zoomGraph(factor) {
     var view = state.graphView;
     view.scale = Math.max(0.3, Math.min(3.5, view.scale * factor));
     applyGraphTransform();
+    if (state.cy) {
+      state.cy.zoom(state.cy.zoom() * factor);
+      state.cy.center();
+    }
   }
 
   function resetGraphView() {
@@ -1674,6 +2850,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     state.graphView.y = 0;
     state.graphView.scale = 1;
     applyGraphTransform();
+    if (state.cy) { state.cy.fit(undefined, 28); }
   }
 
   function configureGraphInteraction() {
@@ -1739,7 +2916,36 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     return null;
   }
 
-  function renderInspector(title, badge, artifact, claims) {
+  function renderInspectorExtras(entityId, artifact, payload) {
+    var qBox = byId("inspector-quarantine");
+    if (qBox) {
+      qBox.textContent = "";
+      var snippet = artifact ? String(artifact.raw_evidence_snippet || "") : "";
+      if (snippet.indexOf("INJECTION") !== -1 || snippet.indexOf("</untrusted") !== -1) {
+        qBox.appendChild(make("div", "quarantine-alert",
+          "Quarantine notice: untrusted OSINT snippet sanitized."));
+      }
+    }
+    var cBox = byId("inspector-contradictions");
+    if (cBox) {
+      cBox.textContent = "";
+      var contradictions = (payload && payload.contradictions) || [];
+      var matched = entityId ? contradictions.filter(function (c) {
+        return c.subject_id === entityId;
+      }) : [];
+      if (matched.length) {
+        cBox.appendChild(make("div", "muted", "Contradictions (" + matched.length + ")"));
+        matched.forEach(function (c) {
+          var row = make("div", "claim-line");
+          row.appendChild(make("span", "badge CONTRADICTED", "CONTRADICTED"));
+          row.appendChild(make("span", "", " " + String(c.predicate || "")));
+          cBox.appendChild(row);
+        });
+      }
+    }
+  }
+
+  function renderInspector(title, badge, artifact, claims, entityId, payload) {
     setText("inspector-title", title);
     var badgeNode = byId("epistemic-badge");
     if (badgeNode) {
@@ -1750,6 +2956,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     setText("artifact-tool", artifact ? artifact.source_tool : "—");
     setText("artifact-confidence", artifact ? Number(artifact.confidence || 0).toFixed(3) : "—");
     setText("artifact-snippet", artifact ? artifact.raw_evidence_snippet : "No evidence artifact attached.");
+    renderInspectorExtras(entityId, artifact, payload);
     var container = byId("inspector-claims");
     if (!container) { return; }
     while (container.firstChild) { container.removeChild(container.firstChild); }
@@ -1767,12 +2974,22 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
   }
 
   function inspectEntity(node, payload) {
+    state.selectedNode = node;
+    var pivotBtn = byId("inspect-pivot-btn");
+    var srcBtn = byId("set-path-source-btn");
+    var dstBtn = byId("find-path-btn");
+    if (pivotBtn) { pivotBtn.disabled = false; }
+    if (srcBtn) { srcBtn.disabled = false; }
+    if (dstBtn) { dstBtn.disabled = !state.pathSourceId || state.pathSourceId === node.id; }
     var claims = node.claims || [];
     renderInspector(node.type + ": " + node.value, node.status,
-      firstArtifact(claims, payload), claims);
+      firstArtifact(claims, payload), claims, node.id, payload);
   }
 
   function inspectClaim(edge, payload) {
+    state.selectedNode = null;
+    var pivotBtn = byId("inspect-pivot-btn");
+    if (pivotBtn) { pivotBtn.disabled = true; }
     var claim = {
       predicate: edge.predicate,
       object: edge.object,
@@ -1781,7 +2998,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       artifact_ids: edge.artifact_ids || []
     };
     renderInspector("edge: " + edge.predicate, edge.status,
-      firstArtifact([claim], payload), [claim]);
+      firstArtifact([claim], payload), [claim], null, payload);
   }
 
   function renderTelemetry(payload) {
@@ -1791,6 +3008,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     var ledger = payload.ledger || [];
     var hypotheses = payload.hypotheses || [];
     var contradictions = payload.contradictions || [];
+    var pivots = payload.pivots || [];
 
     function section(title, rows, emptyText) {
       var box = make("section", "telemetry-section");
@@ -1804,6 +3022,21 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       box.appendChild(list);
       return box;
     }
+
+    container.appendChild(section("Queued Next Pivots", pivots.slice(0, 15).map(function (pivot) {
+      var item = make("li", "row");
+      var label = make("span", "", pivot.tool_id + " · score ");
+      label.appendChild(make("span", "pivot-score", Number(pivot.score || 0).toFixed(3)));
+      item.appendChild(label);
+      item.appendChild(make("span", "muted", " — " + String(pivot.rationale || "").slice(0, 80)));
+      item.appendChild(make("span", "spacer"));
+      var btn = make("button", "secondary compact", "Execute");
+      btn.type = "button";
+      btn.addEventListener("click", function () { runSpecificPivot(pivot.pivot_id); });
+      item.appendChild(btn);
+      return item;
+    }), "No pending ranked pivots."));
+
     container.appendChild(section("Execution ledger", ledger.slice(-40).map(function (entry) {
       var item = make("li");
       item.appendChild(make("b", "", entry.tool_id));
@@ -1812,12 +3045,14 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       if (entry.error_code) { item.appendChild(make("span", "", " · " + entry.error_code)); }
       return item;
     }), "No tool executions yet."));
+
     container.appendChild(section("Open / recent hypotheses", hypotheses.slice(-40).map(function (hypothesis) {
       var item = make("li");
       item.appendChild(make("span", "badge", hypothesis.status));
       item.appendChild(make("span", "", " " + hypothesis.type + " — " + hypothesis.question));
       return item;
     }), "No hypotheses yet."));
+
     container.appendChild(section("Contradictions", contradictions.map(function (contradiction) {
       var item = make("li");
       item.appendChild(make("span", "badge CONTRADICTED", "CONTRADICTED"));
@@ -1825,6 +3060,291 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         contradiction.subject + (contradiction.resolved ? " (resolved)" : " (unresolved)")));
       return item;
     }), "No functional contradictions detected."));
+
+    var analyticsBox = make("section", "telemetry-section");
+    analyticsBox.appendChild(make("h3", "", "Graph Analytics Summary"));
+    analyticsBox.id = "analytics-summary-box";
+    analyticsBox.appendChild(make("p", "muted", "Analytics load automatically for active investigations."));
+    container.appendChild(analyticsBox);
+    renderAnalyticsSummary();
+  }
+
+  function renderAnalyticsSummary() {
+    var box = byId("analytics-summary-box");
+    if (!box || !state.analytics) { return; }
+    while (box.children.length > 1) { box.removeChild(box.lastChild); }
+    var a = state.analytics;
+    var clusters = a.clusters || a.communities || [];
+    var bridges = a.bridge_entities || a.bridges || [];
+    var phashes = a.perceptual_hash_clusters || a.phash_correlations || [];
+    var summary = make("p", "mono", "clusters: " + clusters.length +
+      " · bridges: " + bridges.length + " · phash/favicon groups: " + phashes.length);
+    box.appendChild(summary);
+    var deg = a.degree_centrality || (a.centrality && a.centrality.degree) || {};
+    var top = Object.keys(deg).sort(function (x, y) { return deg[y] - deg[x]; }).slice(0, 6);
+    if (top.length) {
+      var list = make("ul", "telemetry-list");
+      top.forEach(function (nid) {
+        var li = make("li");
+        li.textContent = nid + " · degree centrality " + Number(deg[nid] || 0).toFixed(3);
+        list.appendChild(li);
+      });
+      box.appendChild(list);
+    }
+  }
+
+  function fetchAnalytics() {
+    if (!state.targetId) { return Promise.resolve(); }
+    return api("/api/investigations/" + encodeURIComponent(state.targetId) + "/analytics")
+      .then(function (data) {
+        state.analytics = data;
+        updateClusterSelect();
+        renderAnalyticsSummary();
+        if (state.payload) { renderGraph(state.payload); }
+      }).catch(function () { /* non-blocking advisory analytics */ });
+  }
+
+  function findShortestPath() {
+    if (!state.targetId || !state.pathSourceId || !state.selectedNode) { return; }
+    var destId = state.selectedNode.id;
+    api("/api/investigations/" + encodeURIComponent(state.targetId) +
+      "/analytics?source_id=" + encodeURIComponent(state.pathSourceId) +
+      "&dest_id=" + encodeURIComponent(destId))
+      .then(function (data) {
+        var sp = data && data.shortest_path;
+        state.graphView.shortestPathNodes = {};
+        state.graphView.shortestPathEdges = {};
+        if (sp && sp.found) {
+          var pathIds = sp.path || sp.node_ids || [];
+          pathIds.forEach(function (id) { state.graphView.shortestPathNodes[id] = true; });
+          (sp.edges || []).forEach(function (e) { if (e.claim_id) { state.graphView.shortestPathEdges[e.claim_id] = true; } });
+          var hops = (sp.length !== undefined && sp.length !== null) ? sp.length : (sp.hops || 0);
+          setText("path-status-line", "Path found: " + hops + " hops");
+        } else {
+          setText("path-status-line", "No path between selected entities");
+        }
+        if (state.payload) { renderGraph(state.payload); }
+      }).catch(function (err) { showError(err); });
+  }
+
+  function clearShortestPath() {
+    state.pathSourceId = null;
+    state.graphView.shortestPathNodes = {};
+    state.graphView.shortestPathEdges = {};
+    setText("path-status-line", "");
+    var dstBtn = byId("find-path-btn");
+    if (dstBtn) { dstBtn.disabled = true; }
+    if (state.payload) { renderGraph(state.payload); }
+  }
+
+  function fetchTimeline() {
+    if (!state.targetId) { return Promise.resolve(); }
+    return api("/api/investigations/" + encodeURIComponent(state.targetId) + "/timeline")
+      .then(function (data) {
+        var list = byId("timeline-list");
+        if (!list) { return; }
+        list.textContent = "";
+        var events = (data && data.events) || [];
+        setText("timeline-summary", events.length + " event(s)");
+        if (!events.length) {
+          list.appendChild(make("li", "muted", "No timeline events recorded yet."));
+          return;
+        }
+        events.forEach(function (ev) {
+          var li = make("li");
+          li.appendChild(make("span", "timeline-ts muted", String(ev.timestamp_utc || "") + " "));
+          li.appendChild(make("span", "badge", String(ev.event_type || ev.kind || "event")));
+          li.appendChild(make("strong", "", " " + String(ev.title || "")));
+          if (ev.detail) {
+            li.appendChild(make("div", "muted", String(ev.detail).slice(0, 180)));
+          }
+          list.appendChild(li);
+        });
+      }).catch(function () { /* ignore transient timeline errors */ });
+  }
+
+  function runCaseDiff() {
+    var otherId = byId("diff-target-select") ? byId("diff-target-select").value : "";
+    if (!state.targetId || !otherId) {
+      setText("diff-results", "Select an active investigation and a comparison case first.");
+      return;
+    }
+    activateTab("timeline");
+    api("/api/investigations/" + encodeURIComponent(state.targetId) +
+      "/diff/" + encodeURIComponent(otherId)).then(function (data) {
+      var box = byId("diff-results");
+      if (!box) { return; }
+      box.textContent = "";
+      var summary = data.summary || {};
+      box.appendChild(make("div", "mono",
+        "Compared " + state.targetId + " vs " + otherId + " — added: " +
+        (summary.added_count || (data.added_entities || []).length) +
+        " · removed: " + (summary.removed_count || (data.removed_entities || []).length) +
+        " · status changes: " + (data.status_changes || []).length));
+      var ul = make("ul", "telemetry-list");
+      (data.added_entities || []).slice(0, 25).forEach(function (ent) {
+        ul.appendChild(make("li", "", "+ " + ent.type + ": " + (ent.canonical_value || ent.value || "")));
+      });
+      (data.removed_entities || []).slice(0, 25).forEach(function (ent) {
+        ul.appendChild(make("li", "", "- " + ent.type + ": " + (ent.canonical_value || ent.value || "")));
+      });
+      box.appendChild(ul);
+    }).catch(function (err) { showError(err); });
+  }
+
+  function renderAiInsights(payload) {
+    var list = byId("ai-insights-list");
+    if (!list) { return; }
+    list.textContent = "";
+    var items = (payload && payload.ai_insights) || [];
+    if (!items.length) {
+      list.appendChild(make("p", "muted", "No AI reflections recorded for this case yet."));
+      return;
+    }
+    items.forEach(function (ins) {
+      var card = make("div", "claim-line");
+      var head = make("div", "row");
+      head.appendChild(make("span", "badge AI_INFERRED", ins.epistemic_provenance || "AI_INFERRED"));
+      head.appendChild(make("span", "mono muted",
+        " " + (ins.provider || "") + "/" + (ins.model || "") + " · " + (ins.kind || "reflection")));
+      card.appendChild(head);
+      card.appendChild(make("div", "", ins.summary || ""));
+      list.appendChild(card);
+    });
+  }
+
+  function refreshAiStatus(probe) {
+    return api("/api/ai/status" + (probe ? "?probe_local=true" : "")).then(function (data) {
+      var enabled = !!data.enabled;
+      var provider = String(data.provider || "disabled");
+      var badge = byId("ai-status-badge");
+      if (badge) { badge.textContent = enabled ? provider : "disabled"; }
+      var enEl = byId("ai-enabled");
+      if (enEl) { enEl.checked = enabled; }
+      var provEl = byId("ai-provider");
+      if (provEl && provider) { provEl.value = provider; }
+      var models = data.models || {};
+      var endpoints = data.endpoints || {};
+      var modelVal = data.model || models[provider] || models.ollama || "";
+      var visionVal = data.vision_model || models.ollama_vision || "";
+      var baseVal = data.base_url || endpoints[provider] || "";
+      if (modelVal && byId("ai-model")) { byId("ai-model").value = modelVal; }
+      if (visionVal && byId("ai-vision-model")) { byId("ai-vision-model").value = visionVal; }
+      if (baseVal && byId("ai-base-url")) { byId("ai-base-url").value = baseVal; }
+      var reachable = !!(data.active || data.available);
+      setText("ai-config-message", "AI status: " + (enabled ? provider : "disabled") +
+        (reachable ? " (active)" : " (idle)"));
+    }).catch(function () { /* ignore if ai subsystem absent */ });
+  }
+
+  function saveAiConfig() {
+    var body = {
+      enabled: byId("ai-enabled") ? !!byId("ai-enabled").checked : false,
+      provider: byId("ai-provider") ? byId("ai-provider").value : "disabled",
+      model: byId("ai-model") ? byId("ai-model").value.trim() : "",
+      vision_model: byId("ai-vision-model") ? byId("ai-vision-model").value.trim() : "",
+      base_url: byId("ai-base-url") ? byId("ai-base-url").value.trim() : ""
+    };
+    var apiKey = byId("ai-api-key") ? byId("ai-api-key").value.trim() : "";
+    if (apiKey) { body.api_key = apiKey; }
+    setText("ai-config-message", "Saving AI config…");
+    api("/api/ai/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (data) {
+      if (byId("ai-api-key")) { byId("ai-api-key").value = ""; }
+      setText("ai-config-message", "Saved AI config (" + String(data.provider || body.provider) + ").");
+      refreshAiStatus(false);
+    }).catch(function (err) {
+      setText("ai-config-message", String(err.message || err));
+    });
+  }
+
+  function runCaseReflection() {
+    if (!state.targetId) { showError(new Error("select or start an investigation first")); return; }
+    api("/api/investigations/" + encodeURIComponent(state.targetId) + "/reflect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function () {
+      return refreshState();
+    }).catch(function (err) { showError(err); });
+  }
+
+  function analyzeMedia() {
+    var url = byId("media-url-input") ? byId("media-url-input").value.trim() : "";
+    if (!url) { setText("media-results", "Enter an http(s) media URL first."); return; }
+    var useVlm = byId("media-use-vlm") ? !!byId("media-use-vlm").checked : false;
+    setText("media-results", "Analyzing media…");
+    api("/api/media/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: url, use_vlm: useVlm, target_id: state.targetId || null })
+    }).then(function (data) {
+      setText("media-results", JSON.stringify(data, null, 2));
+    }).catch(function (err) {
+      setText("media-results", "Error: " + String(err.message || err));
+    });
+  }
+
+  function updateScopeSummary(payload) {
+    var el = byId("scope-policy-summary");
+    if (!el || !payload || !payload.investigation) { return; }
+    var cfg = payload.investigation.config || {};
+    var scope = cfg.scope || {};
+    var domains = (scope.allow_domains || []).join(", ") || "unrestricted";
+    el.textContent = "Active recon: " + (scope.allow_active_recon ? "enabled" : "disabled") +
+      " · allow_domains: " + domains;
+  }
+
+  function refreshToolsHealth() {
+    api("/api/tools").then(function (data) {
+      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0) + " ready");
+      var list = byId("tools-health-list");
+      if (!list) { return; }
+      list.textContent = "";
+      (data.tools || []).forEach(function (tool) {
+        var row = make("div", "tool-row");
+        row.appendChild(make("span", "mono", tool.tool_id || ""));
+        var badgeCls = tool.available ? "badge CONFIRMED" : "badge COLLECTION_FAILURE";
+        row.appendChild(make("span", badgeCls, tool.available ? "ready" : "missing"));
+        list.appendChild(row);
+      });
+    }).catch(function () { /* ignore */ });
+  }
+
+  function runDoctorCheck() {
+    setText("tools-summary-badge", "running doctor…");
+    api("/api/doctor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provision: false })
+    }).then(function (data) {
+      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0) + " ok");
+      refreshToolsHealth();
+    }).catch(function (err) { showError(err); });
+  }
+
+  function refreshCases() {
+    return api("/api/investigations").then(function (data) {
+      var items = (data && data.investigations) || [];
+      ["case-select", "diff-target-select"].forEach(function (selId, idx) {
+        var sel = byId(selId);
+        if (!sel) { return; }
+        var cur = idx === 0 ? (state.targetId || sel.value) : sel.value;
+        sel.textContent = "";
+        var def = make("option", "", idx === 0 ? "— current / new —" : "Diff against case…");
+        def.value = "";
+        sel.appendChild(def);
+        items.forEach(function (item) {
+          var opt = make("option", "", item.target_id + " (" + item.status + ")");
+          opt.value = item.target_id;
+          if (item.target_id === cur) { opt.selected = true; }
+          sel.appendChild(opt);
+        });
+      });
+    }).catch(function () { /* ignore */ });
   }
 
   function fetchDossier() {
@@ -1863,18 +3383,46 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     });
   }
 
-  function runNextPivot() {
+  function runSpecificPivot(pivotId) {
     if (!state.targetId) { showError(new Error("start an investigation first")); return; }
     clearError();
     setStatus("stepping");
     api("/api/investigations/" + encodeURIComponent(state.targetId) + "/step", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: "{}"
+      body: JSON.stringify(pivotId ? { pivot_id: pivotId } : {})
     }).then(function (data) {
       setStatus(data && data.status ? String(data.status) : "stepped");
       return refreshState();
     }).catch(function (err) { setStatus("error"); showError(err); });
+  }
+
+  function runNextPivot() {
+    runSpecificPivot(null);
+  }
+
+  function runBatchPivots() {
+    if (!state.targetId) { showError(new Error("start an investigation first")); return; }
+    clearError();
+    setStatus("stepping batch");
+    api("/api/investigations/" + encodeURIComponent(state.targetId) + "/step-batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_pivots: 3 })
+    }).then(function (data) {
+      setStatus(data && data.status ? String(data.status) : "stepped");
+      return refreshState();
+    }).catch(function (err) { setStatus("error"); showError(err); });
+  }
+
+  function pivotSelectedEntity() {
+    if (!state.selectedNode || !state.payload) { return; }
+    var pivots = state.payload.pivots || [];
+    var match = null;
+    for (var i = 0; i < pivots.length; i += 1) {
+      if (pivots[i].entity_id === state.selectedNode.id) { match = pivots[i]; break; }
+    }
+    runSpecificPivot(match ? match.pivot_id : null);
   }
 
   function renderCredentialStatuses(payload) {
@@ -1959,11 +3507,15 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         panels[panelIndex].id === "tab-" + name);
     }
     if (name === "dossier") { fetchDossier(); }
+    if (name === "timeline") { fetchTimeline(); }
+    if (name === "graph" && state.cy) { state.cy.resize(); state.cy.fit(undefined, 28); }
   }
 
   function wire() {
     byId("intake").addEventListener("submit", startInvestigation);
     byId("run-pivot").addEventListener("click", runNextPivot);
+    var batchBtn = byId("run-batch-pivots");
+    if (batchBtn) { batchBtn.addEventListener("click", runBatchPivots); }
     var clearButton = byId("clear-form");
     if (clearButton) { clearButton.addEventListener("click", clearForm); }
     var zoomIn = byId("zoom-in");
@@ -1972,6 +3524,28 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
     if (zoomOut) { zoomOut.addEventListener("click", function () { zoomGraph(0.85); }); }
     var zoomReset = byId("zoom-reset");
     if (zoomReset) { zoomReset.addEventListener("click", resetGraphView); }
+    var toggleEngine = byId("toggle-graph-engine");
+    if (toggleEngine) {
+      toggleEngine.addEventListener("click", function () {
+        var canCy = typeof window.cytoscape === "function";
+        if (!canCy) { state.graphView.renderer = "svg"; }
+        else {
+          var currentlyCy = state.graphView.renderer !== "svg";
+          state.graphView.renderer = currentlyCy ? "svg" : "cy";
+        }
+        syncGraphRendererVisibility();
+        if (state.payload) { renderGraph(state.payload); }
+      });
+    }
+    var clusterSel = byId("cluster-filter");
+    if (clusterSel) {
+      clusterSel.addEventListener("change", function () {
+        state.graphView.cluster = clusterSel.value || "";
+        if (state.payload) { renderGraph(state.payload); }
+      });
+    }
+    var clearPathBtn = byId("clear-path-btn");
+    if (clearPathBtn) { clearPathBtn.addEventListener("click", clearShortestPath); }
     var nodeSearch = byId("node-search");
     if (nodeSearch) {
       nodeSearch.addEventListener("input", function () {
@@ -1994,6 +3568,71 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
       });
     }
     configureGraphInteraction();
+    var toggleLeft = byId("toggle-left-rail");
+    if (toggleLeft) {
+      toggleLeft.addEventListener("click", function () {
+        byId("workbench").classList.toggle("rail-left-collapsed");
+        if (state.cy) { window.setTimeout(function () { state.cy.resize(); }, 50); }
+      });
+    }
+    var toggleRight = byId("toggle-right-rail");
+    if (toggleRight) {
+      toggleRight.addEventListener("click", function () {
+        byId("workbench").classList.toggle("rail-right-collapsed");
+        if (state.cy) { window.setTimeout(function () { state.cy.resize(); }, 50); }
+      });
+    }
+    var toggleTheme = byId("toggle-theme");
+    if (toggleTheme) {
+      toggleTheme.addEventListener("click", function () {
+        var root = document.documentElement;
+        if (root.getAttribute("data-theme") === "dark") { root.removeAttribute("data-theme"); }
+        else { root.setAttribute("data-theme", "dark"); }
+      });
+    }
+    var caseSelect = byId("case-select");
+    if (caseSelect) {
+      caseSelect.addEventListener("change", function () {
+        if (!caseSelect.value) { return; }
+        state.targetId = caseSelect.value;
+        setText("target-label", state.targetId);
+        updateDownloads();
+        refreshState();
+        fetchTimeline();
+      });
+    }
+    var refreshCasesBtn = byId("refresh-cases-btn");
+    if (refreshCasesBtn) { refreshCasesBtn.addEventListener("click", refreshCases); }
+    var diffBtn = byId("run-diff-btn");
+    if (diffBtn) { diffBtn.addEventListener("click", runCaseDiff); }
+    var refreshTlBtn = byId("refresh-timeline-btn");
+    if (refreshTlBtn) { refreshTlBtn.addEventListener("click", fetchTimeline); }
+    var refreshToolsBtn = byId("refresh-tools-btn");
+    if (refreshToolsBtn) { refreshToolsBtn.addEventListener("click", refreshToolsHealth); }
+    var runDoctorBtn = byId("run-doctor-btn");
+    if (runDoctorBtn) { runDoctorBtn.addEventListener("click", runDoctorCheck); }
+    var saveAiBtn = byId("save-ai-config");
+    if (saveAiBtn) { saveAiBtn.addEventListener("click", saveAiConfig); }
+    var probeAiBtn = byId("refresh-ai-status");
+    if (probeAiBtn) { probeAiBtn.addEventListener("click", function () { refreshAiStatus(true); }); }
+    var reflectBtn = byId("run-reflect-btn");
+    if (reflectBtn) { reflectBtn.addEventListener("click", runCaseReflection); }
+    var mediaBtn = byId("analyze-media-btn");
+    if (mediaBtn) { mediaBtn.addEventListener("click", analyzeMedia); }
+    var inspectPivotBtn = byId("inspect-pivot-btn");
+    if (inspectPivotBtn) { inspectPivotBtn.addEventListener("click", pivotSelectedEntity); }
+    var setPathSrcBtn = byId("set-path-source-btn");
+    if (setPathSrcBtn) {
+      setPathSrcBtn.addEventListener("click", function () {
+        if (!state.selectedNode) { return; }
+        state.pathSourceId = state.selectedNode.id;
+        setText("path-status-line", "Path source: " + state.selectedNode.value);
+        var dstBtn = byId("find-path-btn");
+        if (dstBtn) { dstBtn.disabled = true; }
+      });
+    }
+    var findPathBtn = byId("find-path-btn");
+    if (findPathBtn) { findPathBtn.addEventListener("click", findShortestPath); }
     var openKeys = byId("open-api-keys");
     if (openKeys) { openKeys.addEventListener("click", openApiKeys); }
     var closeKeys = byId("close-api-keys");
@@ -2012,7 +3651,18 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
         activateTab(event.currentTarget.getAttribute("data-tab"));
       });
     }
+    var cyScript = byId("cytoscape-vendor-script");
+    if (cyScript) {
+      cyScript.addEventListener("load", function () {
+        if (state.payload) { renderGraph(state.payload); }
+        else { syncGraphRendererVisibility(); }
+      });
+    }
     updateDownloads();
+    refreshCases();
+    refreshToolsHealth();
+    refreshAiStatus(false);
+    syncGraphRendererVisibility();
   }
 
   if (document.readyState === "loading") {
@@ -2022,6 +3672,7 @@ a.dl-link:hover { border-color:#38bdf8; color:#f8fafc; }
   }
 })();
 </script>
+<script id="cytoscape-vendor-script" src="/static/vendor/cytoscape.min.js" defer></script>
 </body>
 </html>
 """

@@ -21,7 +21,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "Pillow>=10.0"]
+vision = ["Pillow>=10.0"]
 
 [project.scripts]
 ai-osint-hub = "hub.cli:main"

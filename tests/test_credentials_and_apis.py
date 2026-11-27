@@ -306,7 +306,7 @@ class TestCredentialsWebApi:
         rows = {row["tool_id"]: row for row in payload["tools"]}
         assert rows["virustotal_lookup"]["auth_status"] == "CONFIGURED"
         assert rows["virustotal_lookup"]["auth_ready"] is True
-        assert payload["total"] == 28
+        assert payload["total"] == 32
 
 
 # ════════════════════════════════════════════════════════════════════════

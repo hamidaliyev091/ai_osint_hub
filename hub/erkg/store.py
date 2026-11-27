@@ -208,6 +208,21 @@ CREATE TABLE IF NOT EXISTS iterations (
     record_json TEXT NOT NULL,
     PRIMARY KEY (investigation_id, iteration)
 );
+
+CREATE TABLE IF NOT EXISTS ai_insights (
+    insight_id TEXT PRIMARY KEY,
+    investigation_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL DEFAULT 0,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    cited_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+    epistemic_provenance TEXT NOT NULL DEFAULT 'AI_INFERRED',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_insights_inv ON ai_insights(investigation_id, created_at);
 """
 
 
@@ -1123,6 +1138,83 @@ class ERKGStore:
             (investigation_id,),
         )
         return [IterationRecord.model_validate_json(r["record_json"]) for r in rows]
+
+    # ════════════════════════════════════════════════════════════════
+    # AI insights (quarantined advisory reflections / VLM summaries)
+    # ════════════════════════════════════════════════════════════════
+
+    def add_ai_insight(
+        self,
+        investigation_id: str,
+        *,
+        insight_id: Optional[str] = None,
+        iteration: int = 0,
+        provider: str = "ollama",
+        model: str = "",
+        kind: str = "reflection",
+        summary: str = "",
+        payload: Optional[dict[str, Any]] = None,
+        payload_json: Optional[str] = None,
+        cited_artifact_ids: Optional[Iterable[str]] = None,
+        cited_artifact_ids_json: Optional[str] = None,
+        epistemic_provenance: str = "AI_INFERRED",
+        created_at: Optional[str] = None,
+    ) -> str:
+        """Persist an AI-inferred insight (advisory; never promotes claims)."""
+        stamp = created_at or utc_now()
+        if payload_json is None:
+            payload_json = canonical_json(payload if payload is not None else {})
+        if cited_artifact_ids_json is None:
+            cited_artifact_ids_json = canonical_json(
+                list(cited_artifact_ids) if cited_artifact_ids is not None else []
+            )
+        iid = insight_id or short_id(
+            "ins", investigation_id, iteration, provider, model, kind, summary, stamp
+        )
+        self._write(
+            """INSERT OR REPLACE INTO ai_insights
+               (insight_id, investigation_id, iteration, provider, model, kind,
+                summary, payload_json, cited_artifact_ids_json, epistemic_provenance,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                iid, investigation_id, int(iteration), str(provider), str(model),
+                str(kind), str(summary), payload_json, cited_artifact_ids_json,
+                str(epistemic_provenance or "AI_INFERRED"), stamp,
+            ),
+        )
+        return iid
+
+    def list_ai_insights(self, investigation_id: str) -> list[dict[str, Any]]:
+        """List stored AI insights for an investigation, oldest first."""
+        rows = self._query_all(
+            "SELECT * FROM ai_insights WHERE investigation_id=? ORDER BY created_at, iteration",
+            (investigation_id,),
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            try:
+                cited = json.loads(row["cited_artifact_ids_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                cited = []
+            results.append({
+                "insight_id": row["insight_id"],
+                "investigation_id": row["investigation_id"],
+                "iteration": int(row["iteration"]),
+                "provider": row["provider"],
+                "model": row["model"],
+                "kind": row["kind"],
+                "summary": row["summary"],
+                "payload": payload,
+                "cited_artifact_ids": cited if isinstance(cited, list) else [],
+                "epistemic_provenance": row["epistemic_provenance"],
+                "created_at": row["created_at"],
+            })
+        return results
 
     # ════════════════════════════════════════════════════════════════
     # Stats

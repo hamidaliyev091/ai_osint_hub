@@ -346,6 +346,84 @@ def cmd_list(service: InvestigationService, args) -> int:
     return 0
 
 
+def cmd_analytics(service: InvestigationService, args) -> int:
+    result = service.analytics(
+        args.target_id, source_id=args.source, dest_id=args.dest
+    )
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    summary = result.get("summary", {})
+    print(f"Analytics for {result['target_id']}: "
+          f"nodes={summary.get('nodes')} edges={summary.get('edges')} "
+          f"components={summary.get('components')} communities={summary.get('communities')} "
+          f"bridges={summary.get('bridge_entities')} hash_clusters={summary.get('perceptual_hash_clusters')}")
+    for item in result.get("top_central_entities", [])[:8]:
+        print(f"  {item['entity_id']:22} {item['type']:12} {item['value']:30} "
+              f"deg={item['degree']} betw={item['betweenness_centrality']:.4f}")
+    sp = result.get("shortest_path")
+    if sp:
+        if sp.get("found"):
+            print(f"  shortest_path ({sp['length']} hops): {' -> '.join(sp['path'])}")
+        else:
+            print(f"  shortest_path: no path between {sp.get('source_id')} and {sp.get('dest_id')}")
+    return 0
+
+
+def cmd_timeline(service: InvestigationService, args) -> int:
+    result = service.timeline(args.target_id)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    print(f"Timeline for {result['target_id']} ({result['count']} events):")
+    for ev in result.get("events", [])[:40]:
+        print(f"  [{ev['timestamp_utc']}] {ev['event_type']:18} {ev['title']} — {str(ev.get('detail', ''))[:80]}")
+    return 0
+
+
+def cmd_diff(service: InvestigationService, args) -> int:
+    result = service.diff(args.target_id_a, args.target_id_b)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    summary = result.get("summary", {})
+    print(f"Diff {result['target_id_a']} -> {result['target_id_b']}: "
+          f"+{summary.get('added_count', 0)} added, "
+          f"-{summary.get('removed_count', 0)} removed, "
+          f"{summary.get('status_change_count', 0)} status changes, "
+          f"{summary.get('new_contradictions_count', 0)} new contradictions")
+    return 0
+
+
+def cmd_ai(service: InvestigationService, args) -> int:
+    if args.ai_action == "status":
+        result = service.ai_status(probe_local=args.probe)
+        if args.json:
+            _print_json(result)
+            return 0
+        print(f"AI status: enabled={result.get('enabled')} provider={result.get('provider')} "
+              f"model={result.get('model')}")
+        return 0
+    result = service.ai_reflect(args.target_id, provider=args.provider)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    print(f"AI reflection ({result.get('status', 'ok')}): {result.get('summary', '')}")
+    return 0
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Parser
 # ════════════════════════════════════════════════════════════════════════
@@ -477,6 +555,36 @@ def build_parser() -> argparse.ArgumentParser:
     listing = subparsers.add_parser("list", help="list stored investigations")
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(handler=cmd_list)
+
+    analytics = subparsers.add_parser("analytics", help="graph centrality, clusters, bridges & path")
+    analytics.add_argument("target_id")
+    analytics.add_argument("--source", default=None, help="source entity_id for shortest path")
+    analytics.add_argument("--dest", default=None, help="destination entity_id for shortest path")
+    analytics.add_argument("--json", action="store_true")
+    analytics.set_defaults(handler=cmd_analytics)
+
+    timeline = subparsers.add_parser("timeline", help="chronological investigation event timeline")
+    timeline.add_argument("target_id")
+    timeline.add_argument("--json", action="store_true")
+    timeline.set_defaults(handler=cmd_timeline)
+
+    diff = subparsers.add_parser("diff", help="compare two investigations")
+    diff.add_argument("target_id_a")
+    diff.add_argument("target_id_b")
+    diff.add_argument("--json", action="store_true")
+    diff.set_defaults(handler=cmd_diff)
+
+    ai_cmd = subparsers.add_parser("ai", help="AI status and quarantined case reflection")
+    ai_sub = ai_cmd.add_subparsers(dest="ai_action", required=True)
+    ai_status = ai_sub.add_parser("status", help="show masked AI configuration & health")
+    ai_status.add_argument("--probe", action="store_true", help="probe local Ollama/LM Studio")
+    ai_status.add_argument("--json", action="store_true")
+    ai_status.set_defaults(handler=cmd_ai)
+    ai_reflect = ai_sub.add_parser("reflect", help="run quarantined reflection on a case")
+    ai_reflect.add_argument("target_id")
+    ai_reflect.add_argument("--provider", default=None)
+    ai_reflect.add_argument("--json", action="store_true")
+    ai_reflect.set_defaults(handler=cmd_ai)
     return parser
 
 

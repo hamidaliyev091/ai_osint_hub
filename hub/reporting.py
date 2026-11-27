@@ -261,6 +261,27 @@ def build_dossier(store: ERKGStore, target_id: str, *,
     for entry in ledger:
         tool_activity[entry.tool_id][entry.status.value] += 1
 
+    ai_insights: list[dict[str, Any]] = []
+    if hasattr(store, "list_ai_insights"):
+        try:
+            for row in store.list_ai_insights(target_id) or []:
+                ai_insights.append({
+                    "insight_id": str(row.get("insight_id", "")),
+                    "iteration": int(row.get("iteration", 0) or 0),
+                    "provider": _safe(row.get("provider", ""), 80),
+                    "model": _safe(row.get("model", ""), 120),
+                    "kind": _safe(row.get("kind", "reflection"), 80),
+                    "summary": _safe(row.get("summary", ""), 2000),
+                    "epistemic_provenance": _safe(
+                        row.get("epistemic_provenance", "AI_INFERRED"), 40),
+                    "cited_artifact_ids": [
+                        str(aid) for aid in (row.get("cited_artifact_ids") or []) if aid
+                    ],
+                    "created_at": str(row.get("created_at", "")),
+                })
+        except Exception:  # noqa: BLE001 - optional AI table must not break dossier
+            ai_insights = []
+
     return {
         "dossier_version": DOSSIER_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -310,6 +331,7 @@ def build_dossier(store: ERKGStore, target_id: str, *,
         "tool_activity": {tool: dict(counts)
                           for tool, counts in sorted(tool_activity.items())},
         "provenance_artifacts": [_artifact_summary(artifact) for artifact in artifacts],
+        "ai_insights": ai_insights,
     }
 
 
@@ -558,6 +580,29 @@ def render_markdown(dossier: dict[str, Any]) -> str:
         "truncated in this dossier.",
         "",
     ]
+
+    ai_insights = dossier.get("ai_insights") or []
+    if ai_insights:
+        lines += [
+            "## 8. AI-Assisted Reflection & Hypotheses (AI_INFERRED — Requires Verification)",
+            "",
+            "> Advisory AI synthesis generated from quarantined OSINT evidence. "
+            "Treat every item below as `AI_INFERRED` until corroborated by deterministic tools.",
+            "",
+        ]
+        for insight in ai_insights:
+            prov = _md_value(insight.get("epistemic_provenance") or "AI_INFERRED", 40)
+            provider = _md_value(insight.get("provider") or "unknown", 60)
+            model = _md_value(insight.get("model") or "unknown", 80)
+            kind = _md_value(insight.get("kind") or "reflection", 60)
+            summary_txt = _md_value(insight.get("summary") or "", 1000)
+            cites = _cite(insight.get("cited_artifact_ids") or [])
+            lines.append(
+                f"- **[{prov}]** `{kind}` ({provider}/{model}, iter {insight.get('iteration', 0)}): "
+                f"{summary_txt} {cites}"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -579,7 +624,7 @@ def _h(value: Any, max_len: int = 400) -> str:
 
 
 def render_html(dossier: dict[str, Any]) -> str:
-    """Standalone, print-ready HTML dossier (dark theme + print CSS)."""
+    """Standalone, editorial print-ready HTML dossier (Gruvbox Material Light + print CSS)."""
     investigation = dossier["investigation"]
     summary = dossier["summary"]
     target_id = investigation["target_id"]
@@ -590,59 +635,197 @@ def render_html(dossier: dict[str, Any]) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Intelligence Dossier — __TARGET__</title>
 <style>
-:root { color-scheme: dark; }
+:root {
+  color-scheme: light;
+  --canvas: #fbf1c7;
+  --surface: #f9f5d7;
+  --inset: #f2e5bc;
+  --ink: #282828;
+  --ink-body: #3c3836;
+  --muted: #665c54;
+  --line: #d5c4a1;
+  --accent: #af3a03;
+  --green: #427b58;
+  --olive: #79740e;
+  --ochre: #b57614;
+  --crimson: #9d0006;
+  --slate: #076678;
+}
 * { box-sizing: border-box; }
-body {{ margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
-       background:#0b1120; color:#e2e8f0; }}
-main {{ max-width:1100px; margin:0 auto; padding:32px 24px 64px; }}
-h1 {{ font-size:26px; margin:0 0 4px; color:#f8fafc; }}
-h2 {{ margin:36px 0 12px; padding-bottom:6px; border-bottom:1px solid #1e293b;
-      font-size:19px; color:#93c5fd; }}
-h3 {{ margin:22px 0 8px; font-size:15px; color:#cbd5e1; }}
-.meta {{ color:#94a3b8; font-size:12px; }}
-.badge {{ display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
-          font-weight:600; letter-spacing:.02em; border:1px solid #334155; }}
-.CONFIRMED {{ background:#052e16; color:#4ade80; border-color:#166534; }}
-.CORROBORATED {{ background:#052e2b; color:#2dd4bf; border-color:#115e59; }}
-.SINGLE_SOURCE_LEAD {{ background:#3b2f0b; color:#fbbf24; border-color:#854d0e; }}
-.HYPOTHESIS {{ background:#1e293b; color:#94a3b8; }}
-.CONTRADICTED {{ background:#450a0a; color:#f87171; border-color:#7f1d1d; }}
-.COLLECTION_FAILURE {{ background:#1f2937; color:#9ca3af; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; }}
-.card {{ background:#111827; border:1px solid #1f2937; border-radius:10px; padding:12px; }}
-.card b {{ display:block; font-size:22px; color:#f8fafc; }}
-table {{ width:100%; border-collapse:collapse; margin:8px 0 16px; font-size:12.5px; }}
-th, td {{ text-align:left; padding:6px 8px; border-bottom:1px solid #1f2937;
-          vertical-align:top; }}
-th {{ color:#94a3b8; font-weight:600; }}
-code {{ background:#111827; border:1px solid #1f2937; border-radius:4px;
-        padding:1px 5px; font-size:12px; color:#e2e8f0; word-break:break-all; }}
-.claim {{ margin:4px 0 4px 14px; }}
-.artifact {{ color:#64748b; font-size:11px; }}
-ul {{ margin:6px 0; padding-left:20px; }}
-.muted {{ color:#94a3b8; }}
-.snippet {{ background:#0f172a; border-left:3px solid #334155; padding:6px 10px;
-            margin:6px 0; font-family:ui-monospace,Consolas,monospace; font-size:11.5px;
-            white-space:pre-wrap; word-break:break-word; }}
-footer {{ margin-top:40px; color:#64748b; font-size:11px; }}
+body {{
+  margin: 0;
+  font: 14px/1.55 "Inter", "Segoe UI", system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif;
+  background: var(--canvas);
+  color: var(--ink-body);
+}}
+main {{ max-width: 1120px; margin: 0 auto; padding: 32px 24px 64px; }}
+.doc-header {{
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 24px;
+  margin-bottom: 24px;
+}}
+.kicker {{
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 8px;
+}}
+h1 {{ font-size: 26px; margin: 0 0 8px; color: var(--ink); letter-spacing: -0.01em; }}
+h2 {{
+  margin: 32px 0 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 18px;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+}}
+h3 {{ margin: 24px 0 8px; font-size: 14.5px; color: var(--ink); font-weight: 700; }}
+.meta {{
+  color: var(--muted);
+  font-size: 12px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}}
+.mono {{
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}}
+.badge {{
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--line);
+  background: var(--inset);
+  color: var(--ink-body);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}}
+.CONFIRMED {{ background: #e8eed8; color: var(--green); border-color: #8ea67c; }}
+.CORROBORATED {{ background: #e8eed8; color: var(--olive); border-color: #a39e4b; }}
+.SINGLE_SOURCE_LEAD {{ background: #f6ead0; color: var(--ochre); border-color: #d7a64f; }}
+.HYPOTHESIS {{ background: var(--inset); color: var(--muted); border-color: var(--line); }}
+.CONTRADICTED {{ background: #f6e0dc; color: var(--crimson); border-color: #c96e6b; }}
+.COLLECTION_FAILURE {{ background: #f2e2dc; color: var(--crimson); border-color: var(--line); }}
+.AI_INFERRED {{ background: #e2ecef; color: var(--slate); border-color: #7ca5ae; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 16px; }}
+.card {{
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+}}
+.card b {{
+  display: block;
+  font-size: 24px;
+  color: var(--ink);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}}
+.card span {{ font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0 24px;
+  font-size: 12.5px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}}
+th, td {{
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}}
+th {{
+  background: var(--inset);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}}
+code {{
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  color: var(--ink);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}}
+.claim {{ margin: 6px 0 6px 16px; padding-left: 8px; border-left: 2px solid var(--line); }}
+.artifact {{ color: var(--muted); font-size: 11px; }}
+ul {{ margin: 8px 0; padding-left: 24px; }}
+li {{ margin: 4px 0; }}
+.muted {{ color: var(--muted); }}
+.snippet {{
+  background: var(--inset);
+  border-left: 3px solid var(--accent);
+  padding: 8px 12px;
+  margin: 4px 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-body);
+}}
+.ai-panel {{
+  background: var(--surface);
+  border: 1px solid #7ca5ae;
+  border-left: 4px solid var(--slate);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 16px 0;
+}}
+.ai-item {{
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}}
+.ai-item:last-child {{ border-bottom: none; padding-bottom: 0; }}
+footer {{
+  margin-top: 40px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}}
 @media print {{
-  body {{ background:#fff; color:#111; }}
-  main {{ max-width:none; padding:0; }}
-  h2 {{ color:#1d4ed8; border-color:#cbd5e1; }}
-  .card, .snippet, code {{ background:#f8fafc; color:#111; border-color:#cbd5e1; }}
-  .badge {{ border-color:#475569; color:#111 !important; background:#f1f5f9 !important; }}
-  a {{ color:#111; }}
+  @page {{ margin: 14mm; }}
+  body {{ background: #ffffff; color: #282828; }}
+  main {{ max-width: none; padding: 0; }}
+  .doc-header, .card, table, .ai-panel {{ background: #ffffff; border-color: #bdae93; break-inside: avoid; }}
+  th, .snippet, code {{ background: #f9f5d7; color: #282828; border-color: #bdae93; }}
+  h2 {{ color: #282828; border-color: #bdae93; break-after: avoid; }}
+  tr {{ break-inside: avoid; }}
+  .badge {{ border-color: #665c54; color: #282828 !important; background: #f2e5bc !important; }}
+  a {{ color: #282828; }}
 }}
 </style></head><body><main>
 """.replace("{{", "{").replace("}}", "}").replace("__TARGET__", _h(target_id))
     parts.append(head)
+    parts.append('<div class="doc-header">')
+    parts.append('<div class="kicker">Evidence-Cited Intelligence Dossier</div>')
     parts.append(f"<h1>Intelligence Dossier — <code>{_h(target_id)}</code></h1>")
     parts.append(
         f'<div class="meta">Generated {_h(generated_at)} · status '
         f'<b>{_h(investigation.get("status"))}</b> · stop reason '
         f'<code>{_h(investigation.get("stop_reason"))}</code> · '
         f'{_h(investigation.get("iterations"))} iterations · '
-        f'{_h(investigation.get("tool_calls"))} tool calls</div>')
+        f'{_h(investigation.get("tool_calls"))} tool calls</div></div>')
 
     # Summary cards.
     counters = [
@@ -654,7 +837,7 @@ footer {{ margin-top:40px; color:#64748b; font-size:11px; }}
     ]
     parts.append('<h2>1. Executive Summary</h2><div class="grid">')
     for label, value in counters:
-        parts.append(f'<div class="card"><b>{_h(value)}</b>{_h(label)}</div>')
+        parts.append(f'<div class="card"><b>{_h(value)}</b><span>{_h(label)}</span></div>')
     parts.append("</div>")
     parts.append("<h3>Claim status distribution</h3><table><tr><th>Status</th><th>Claims</th></tr>")
     statuses = summary.get("claim_statuses") or {}
@@ -835,6 +1018,41 @@ footer {{ margin-top:40px; color:#64748b; font-size:11px; }}
         "characters are stripped and snippets are truncated. This dossier is generated "
         "by AI OSINT Hub v2.</p>"
     )
+
+    ai_insights = dossier.get("ai_insights") or []
+    if ai_insights:
+        parts.append(
+            "<h2>8. AI-Assisted Reflection &amp; Hypotheses "
+            "(AI_INFERRED — Requires Verification)</h2>"
+            '<div class="ai-panel">'
+            '<p class="muted" style="margin-top:0">Advisory AI synthesis over '
+            "quarantined evidence. All items carry <code>AI_INFERRED</code> provenance "
+            "and require deterministic tool corroboration.</p>"
+        )
+        for insight in ai_insights:
+            prov = insight.get("epistemic_provenance") or "AI_INFERRED"
+            cites = ", ".join(
+                f"<code>{_h(aid)}</code>"
+                for aid in (insight.get("cited_artifact_ids") or [])[:12]
+                if aid
+            )
+            parts.append('<div class="ai-item">')
+            parts.append(
+                f'<div><span class="badge AI_INFERRED">{_h(prov, 40)}</span> '
+                f'<code>{_h(insight.get("kind") or "reflection", 60)}</code> '
+                f'<span class="meta">{_h(insight.get("provider") or "unknown", 60)}/'
+                f'{_h(insight.get("model") or "unknown", 80)} · '
+                f'iter {_h(insight.get("iteration", 0))} · '
+                f'{_h(insight.get("created_at") or "", 64)}</span></div>'
+            )
+            parts.append(
+                f'<p style="margin:8px 0 4px">{_h(insight.get("summary") or "", 2000)}</p>'
+            )
+            if cites:
+                parts.append(f'<div class="artifact">Cited artifacts: {cites}</div>')
+            parts.append("</div>")
+        parts.append("</div>")
+
     parts.append(f"<footer>{_h(DOSSIER_VERSION)} · generated {_h(generated_at)}</footer>")
     parts.append("</main></body></html>")
     return "".join(parts)

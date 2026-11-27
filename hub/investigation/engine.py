@@ -224,10 +224,17 @@ class InvestigationEngine:
             outcome: InvestigationOutcome | None = None
             max_loop = config.budgets.max_iterations + 3
             for _ in range(max_loop):
-                step = await self._step_internal(store, paths, forced_pivot_id=None,
-                                                 runner=runner)
-                if step.stopped:
-                    break
+                if config.parallel_pivots > 1:
+                    wave = await self._step_wave_internal(
+                        store, paths, max_pivots=config.parallel_pivots, runner=runner
+                    )
+                    if wave.get("stopped"):
+                        break
+                else:
+                    step = await self._step_internal(store, paths, forced_pivot_id=None,
+                                                     runner=runner)
+                    if step.stopped:
+                        break
             final = self._outcome(store, paths, config.target_id)
             return final
         finally:
@@ -266,10 +273,19 @@ class InvestigationEngine:
         runner = self._ensure_runner(investigation.config)
         try:
             for _ in range(investigation.config.budgets.max_iterations + 3):
-                step = await self._step_internal(store, paths, forced_pivot_id=None,
-                                                 runner=runner)
-                if step.stopped:
-                    break
+                if investigation.config.parallel_pivots > 1:
+                    wave = await self._step_wave_internal(
+                        store, paths,
+                        max_pivots=investigation.config.parallel_pivots,
+                        runner=runner,
+                    )
+                    if wave.get("stopped"):
+                        break
+                else:
+                    step = await self._step_internal(store, paths, forced_pivot_id=None,
+                                                     runner=runner)
+                    if step.stopped:
+                        break
             return self._outcome(store, paths, target_id)
         finally:
             await self._close_runner(runner)
@@ -288,6 +304,23 @@ class InvestigationEngine:
         try:
             return await self._step_internal(store, paths, forced_pivot_id=pivot_id,
                                              runner=runner)
+        finally:
+            await self._close_runner(runner)
+            store.close()
+
+    async def step_batch(self, target_id: str, max_pivots: int = 3) -> dict[str, Any]:
+        """Execute up to ``max_pivots`` non-conflicting pivots concurrently."""
+        store = self.open_store(target_id)
+        investigation = store.get_investigation(target_id)
+        if investigation is None:
+            store.close()
+            raise EngineError(f"investigation not found: {target_id}")
+        paths = self.paths(target_id)
+        runner = self._ensure_runner(investigation.config)
+        try:
+            return await self._step_wave_internal(
+                store, paths, max_pivots=max(1, int(max_pivots)), runner=runner
+            )
         finally:
             await self._close_runner(runner)
             store.close()
@@ -983,6 +1016,8 @@ class InvestigationEngine:
             except Exception as exc:  # noqa: BLE001 - reflection is advisory
                 errors.append(f"reflection packet failed: {type(exc).__name__}: {exc}")
                 reflection = None
+        if refreshed.config.ai_reflection_auto and refreshed.config.reflection_enabled:
+            await self._maybe_run_ai_reflection(store, target_id)
         if decision_after.should_stop:
             finalized = self._finalize(store, refreshed, decision_after)
             finalized.record = record
@@ -1008,6 +1043,443 @@ class InvestigationEngine:
             stats=store.stats(target_id),
             objectives=[o.model_dump(mode="json") for o in refreshed.objectives],
         )
+
+    async def _maybe_run_ai_reflection(self, store: ERKGStore, target_id: str) -> None:
+        """Safely invoke optional post-iteration AI reflection (never fails core loop)."""
+        try:
+            from hub.ai import run_case_reflection
+
+            await run_case_reflection(store, target_id)
+        except Exception:  # noqa: BLE001 - missing/offline AI never breaks deterministic core
+            pass
+
+    @staticmethod
+    def _select_wave_pivots(ranking: PivotRanking, max_pivots: int) -> list[PivotCandidate]:
+        """Select up to ``max_pivots`` non-conflicting above-threshold pivots."""
+        above = [c for c in ranking.all_candidates if c.score >= ranking.threshold]
+        ordered = list(ranking.selected)
+        seen_ids = {c.pivot_id for c in ordered}
+        for candidate in above:
+            if candidate.pivot_id not in seen_ids:
+                ordered.append(candidate)
+                seen_ids.add(candidate.pivot_id)
+        chosen: list[PivotCandidate] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for candidate in ordered:
+            if len(chosen) >= max_pivots:
+                break
+            pair = (candidate.entity_id, candidate.tool_id)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            chosen.append(candidate)
+        return chosen
+
+    async def _step_wave_internal(
+        self,
+        store: ERKGStore,
+        paths: "InvestigationPaths",
+        *,
+        max_pivots: int,
+        runner: Any,
+    ) -> dict[str, Any]:
+        """Execute a bounded parallel wave of non-conflicting pivots."""
+        investigation = store.get_investigation(paths.target_id)
+        if investigation is None:
+            raise EngineError(f"investigation not found: {paths.target_id}")
+        target_id = investigation.target_id
+        if investigation.status != RunStatus.ACTIVE:
+            graph = GraphView(store, target_id, investigation.seed_entity_ids)
+            return {
+                "target_id": target_id,
+                "status": "stopped",
+                "stopped": True,
+                "stop_reason": investigation.stop_reason or investigation.status.value,
+                "iteration": investigation.iteration_count,
+                "executed": [],
+                "next_pivots": [],
+                "graph_summary": graph.summary(),
+                "stats": store.stats(target_id),
+                "objectives": [o.model_dump(mode="json") for o in investigation.objectives],
+            }
+
+        elapsed = self._elapsed_seconds(investigation)
+        pre_decision = evaluate_stop(investigation=investigation, elapsed_seconds=elapsed)
+        if pre_decision.should_stop:
+            return self._finalize(store, investigation, pre_decision).as_dict()
+
+        graph = GraphView(store, target_id, investigation.seed_entity_ids)
+        available = self._available_tool_ids(investigation)
+        available -= self._circuit_breaker_tools(store, target_id)
+        new_hypotheses = self._hypothesis_generator(store, investigation).generate(
+            investigation, graph, available
+        )
+        if new_hypotheses:
+            graph = GraphView(store, target_id, investigation.seed_entity_ids)
+
+        ranking = self._rank_pivots(
+            store, investigation, graph, available_tool_ids=available
+        )
+        post_decision = evaluate_stop(
+            investigation=investigation,
+            elapsed_seconds=elapsed,
+            pivot_generated=ranking.generated,
+            pivot_above_threshold=ranking.above_threshold,
+        )
+        if post_decision.should_stop:
+            return self._finalize(store, investigation, post_decision).as_dict()
+
+        remaining_calls = max(
+            1, investigation.config.budgets.max_tool_calls - investigation.tool_calls
+        )
+        remaining_iters = max(
+            1, investigation.config.budgets.max_iterations - investigation.iteration_count
+        )
+        wave_limit = max(1, min(int(max_pivots), remaining_calls, remaining_iters))
+        wave_pivots = self._select_wave_pivots(ranking, wave_limit)
+        if not wave_pivots:
+            return self._finalize(store, investigation, post_decision).as_dict()
+
+        timestamp = utc_now()
+        prepared: list[tuple[PivotCandidate, Any, bool, Optional[ErrorCode], str]] = []
+        runnable_indices: list[int] = []
+
+        for pivot in wave_pivots:
+            capability = cap_registry.get_tool(pivot.tool_id)
+            if capability is None:
+                prepared.append((pivot, None, False, ErrorCode.UNKNOWN_TOOL, f"unknown tool '{pivot.tool_id}'"))
+                continue
+            try:
+                decision = self._policy_check(capability, pivot, investigation)
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                prepared.append((pivot, capability, True, ErrorCode.SCOPE_BLOCKED,
+                                 f"policy gate error: {type(exc).__name__}: {exc}"))
+                continue
+            if not decision.allowed:
+                prepared.append((pivot, capability, True,
+                                 decision.error_code or ErrorCode.SCOPE_BLOCKED, decision.reason))
+                continue
+            phash = param_hash(pivot.tool_id, pivot.params)
+            claimed = store.try_claim_execution(ExecutionRecord(
+                investigation_id=target_id,
+                entity_id=pivot.entity_id,
+                tool_id=pivot.tool_id,
+                param_hash=phash,
+                status=ExecutionStatus.ERROR,
+                error_code=ErrorCode.SPAWN_ERROR,
+                artifact_id=None,
+                run_at=timestamp,
+                duration_ms=0,
+                error_message="in_flight: claimed by another worker",
+            ))
+            if not claimed:
+                continue
+            runnable_indices.append(len(prepared))
+            prepared.append((pivot, capability, False, None, ""))
+
+        if not prepared:
+            return {
+                "target_id": target_id,
+                "status": "active",
+                "stopped": False,
+                "stop_reason": "pivot_in_flight",
+                "iteration": investigation.iteration_count,
+                "executed": [],
+                "next_pivots": [p.model_dump(mode="json") for p in ranking.selected],
+                "graph_summary": graph.summary(),
+                "stats": store.stats(target_id),
+                "objectives": [o.model_dump(mode="json") for o in investigation.objectives],
+            }
+
+        async def _exec_one(idx: int) -> tuple[int, ToolRunResult, int]:
+            piv, cap, _pd, _ec, _em = prepared[idx]
+            t0 = time.monotonic()
+            try:
+                res = await self._run_capability(runner, cap, piv, investigation, paths)
+            except Exception as exc:  # noqa: BLE001
+                res = ToolRunResult(
+                    tool_id=cap.tool_id,
+                    entity_id=piv.entity_id,
+                    params=piv.params,
+                    status=ExecutionStatus.ERROR,
+                    error_code=ErrorCode.SPAWN_ERROR,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                    started_at=timestamp,
+                )
+            elapsed_ms = res.duration_ms or int((time.monotonic() - t0) * 1000)
+            return idx, res, elapsed_ms
+
+        exec_results: dict[int, tuple[ToolRunResult, int]] = {}
+        if runnable_indices:
+            gathered = await asyncio.gather(
+                *(_exec_one(idx) for idx in runnable_indices),
+                return_exceptions=False,
+            )
+            for idx, res, elapsed_ms in gathered:
+                exec_results[idx] = (res, elapsed_ms)
+
+        executed_summaries: list[dict[str, Any]] = []
+        last_record: Optional[IterationRecord] = None
+        last_ingest = IngestResult()
+        last_pivot: Optional[PivotCandidate] = None
+        last_status: Optional[ExecutionStatus] = None
+
+        for idx, (pivot, capability, policy_denied, pre_err_code, pre_err_msg) in enumerate(prepared):
+            current_inv = store.get_investigation(target_id)
+            assert current_inv is not None
+            iteration_no = current_inv.iteration_count + 1
+            pivot_ts = utc_now()
+            errors: list[str] = []
+            parse_output = ParseOutput()
+            ingest = IngestResult()
+            stdout = ""
+            duration_ms = 0
+            tool_called = False
+            run_status = ExecutionStatus.ERROR
+            error_code = pre_err_code
+            error_message = pre_err_msg
+
+            if idx in exec_results:
+                run_result, duration_ms = exec_results[idx]
+                tool_called = True
+                stdout = run_result.stdout or ""
+                run_status = run_result.status
+                error_code = run_result.error_code
+                error_message = run_result.error_message
+                if error_code == ErrorCode.RATE_LIMITED:
+                    try:
+                        from hub.tools import cooldown
+
+                        if pivot.tool_id in cooldown.COOLDOWN_TOOLS:
+                            cooldown.mark_rate_limited(pivot.tool_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if run_status == ExecutionStatus.SUCCESS and capability is not None:
+                    try:
+                        parser = self._parser_for(capability)
+                        target_value = _primary_param_value(pivot.params)
+                        parsed_raw = parser(stdout, target_value)
+                        parse_output = coerce_parse_output(
+                            parsed_raw, parser_version=capability.parser_version
+                        )
+                        errors.extend(parse_output.warnings)
+                    except Exception as exc:  # noqa: BLE001
+                        parse_output = ParseOutput()
+                        run_status = ExecutionStatus.ERROR
+                        error_code = ErrorCode.PARSE_ERROR
+                        error_message = f"parser failed: {type(exc).__name__}: {exc}"
+                        errors.append(error_message)
+
+            phash = param_hash(pivot.tool_id, pivot.params)
+            raw_path = self._write_raw_artifact(paths, iteration_no, pivot.tool_id, stdout)
+            snippet = self._evidence_snippet(parse_output, error_message)
+            artifact = EvidenceArtifact(
+                artifact_id=short_id("art", target_id, pivot.tool_id, phash, pivot_ts),
+                investigation_id=target_id,
+                source_tool=pivot.tool_id,
+                invocation_params_hash=phash,
+                timestamp_utc=pivot_ts,
+                raw_evidence_snippet=snippet,
+                raw_output_sha256=sha256_text(stdout),
+                parser_version=(capability.parser_version if capability else "unknown"),
+                epistemic_status=(
+                    EpistemicStatus.SINGLE_SOURCE_LEAD
+                    if run_status == ExecutionStatus.SUCCESS and error_code is None
+                    else EpistemicStatus.COLLECTION_FAILURE
+                ),
+                confidence=(
+                    capability.reliability
+                    if capability and run_status == ExecutionStatus.SUCCESS
+                    else 0.0
+                ),
+                raw_output_path=raw_path,
+                stdout_bytes=len(stdout.encode("utf-8", errors="replace")),
+                truncated=len(stdout) >= self._raw_output_limit,
+            )
+
+            if run_status == ExecutionStatus.SUCCESS and error_code is None:
+                ledger_status = (
+                    ExecutionStatus.EMPTY if parse_output.is_empty else ExecutionStatus.SUCCESS
+                )
+                if ledger_status == ExecutionStatus.EMPTY:
+                    error_code = ErrorCode.EMPTY_RESULT
+            elif run_status == ExecutionStatus.TIMEOUT:
+                ledger_status = ExecutionStatus.TIMEOUT
+            else:
+                ledger_status = ExecutionStatus.ERROR
+
+            closed_before = len(
+                store.list_hypotheses(target_id, statuses=[HypothesisStatus.OPEN])
+            )
+            with store.transaction():
+                store.add_artifact(artifact)
+                if ledger_status in (ExecutionStatus.SUCCESS, ExecutionStatus.EMPTY) and capability is not None:
+                    try:
+                        ingest = EvidenceIngestor(store).ingest(
+                            target_id,
+                            parse_output,
+                            artifact_id=artifact.artifact_id,
+                            tool_id=pivot.tool_id,
+                            accepted_types=capability.accepted_entity_types,
+                            timestamp=pivot_ts,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"ingest failed: {type(exc).__name__}: {exc}")
+                        ledger_status = ExecutionStatus.ERROR
+                        error_code = ErrorCode.PARSE_ERROR
+                store.record_execution(
+                    ExecutionRecord(
+                        investigation_id=target_id,
+                        entity_id=pivot.entity_id,
+                        tool_id=pivot.tool_id,
+                        param_hash=phash,
+                        status=ledger_status,
+                        error_code=error_code,
+                        artifact_id=artifact.artifact_id,
+                        run_at=pivot_ts,
+                        duration_ms=duration_ms,
+                        error_message=error_message,
+                    )
+                )
+                self._refresh_scope_ips(store, store.get_investigation(target_id))
+                hypothesis_mod.correlate_after_run(
+                    store,
+                    target_id,
+                    executed_entity_id=pivot.entity_id,
+                    executed_tool_id=pivot.tool_id,
+                    run_status=ledger_status,
+                    new_claims=ingest.new_claims,
+                )
+                self._refresh_objectives(store, current_inv)
+                record = IterationRecord(
+                    iteration=iteration_no,
+                    timestamp_utc=pivot_ts,
+                    action={
+                        "pivot_id": pivot.pivot_id,
+                        "tool": pivot.tool_id,
+                        "params": pivot.params,
+                        "entity_id": pivot.entity_id,
+                        "hypothesis_id": pivot.hypothesis_id,
+                        "score": pivot.score,
+                        "policy_denied": policy_denied,
+                        "parallel_wave": True,
+                    },
+                    result={
+                        "status": ledger_status.value,
+                        "error_code": error_code.value if error_code else None,
+                        "error_message": error_message,
+                        "duration_ms": duration_ms,
+                        "stdout_bytes": artifact.stdout_bytes,
+                        "parse": parse_output.summary(),
+                        "ingest": ingest.as_dict() if ledger_status != ExecutionStatus.ERROR else {},
+                        "warnings": errors[:5],
+                    },
+                    artifact_ids=[artifact.artifact_id],
+                    new_entity_ids=ingest.new_entity_ids,
+                    new_claims=ingest.new_claims,
+                    contradictions=ingest.contradictions,
+                    hypotheses_opened=len(new_hypotheses) if idx == 0 else 0,
+                    hypotheses_closed=max(
+                        0,
+                        closed_before
+                        - len(store.list_hypotheses(target_id, statuses=[HypothesisStatus.OPEN])),
+                    ),
+                    candidates_considered=ranking.generated,
+                    candidate_count=ranking.above_threshold,
+                    duration_ms=duration_ms,
+                )
+                store.record_iteration(target_id, record)
+                store.bump_counters(
+                    target_id,
+                    iterations=1,
+                    tool_calls=1 if tool_called else 0,
+                    timestamp=pivot_ts,
+                )
+
+            executed_summaries.append({
+                "iteration": iteration_no,
+                "pivot_id": pivot.pivot_id,
+                "tool_id": pivot.tool_id,
+                "entity_id": pivot.entity_id,
+                "status": ledger_status.value,
+                "error_code": error_code.value if error_code else None,
+                "new_entities": len(ingest.new_entity_ids),
+                "new_claims": ingest.new_claims,
+                "duration_ms": duration_ms,
+            })
+            last_record = record
+            last_ingest = ingest
+            last_pivot = pivot
+            last_status = ledger_status
+
+        refreshed = store.get_investigation(target_id)
+        assert refreshed is not None
+        graph_after = GraphView(store, target_id, refreshed.seed_entity_ids)
+        elapsed_after = self._elapsed_seconds(refreshed)
+        ranking_after = self._rank_pivots(
+            store, refreshed, graph_after, available_tool_ids=available
+        )
+        decision_after = evaluate_stop(
+            investigation=refreshed,
+            elapsed_seconds=elapsed_after,
+            pivot_generated=ranking_after.generated,
+            pivot_above_threshold=ranking_after.above_threshold,
+        )
+        reflection = None
+        if refreshed.config.reflection_enabled and last_pivot is not None:
+            try:
+                reflection = build_reflection_packet(
+                    investigation=refreshed,
+                    graph=graph_after,
+                    executed={
+                        "pivot_id": last_pivot.pivot_id,
+                        "tool": last_pivot.tool_id,
+                        "status": last_status.value if last_status else "ERROR",
+                        "wave_size": len(executed_summaries),
+                    },
+                    ingest=last_ingest,
+                    open_hypotheses=store.list_hypotheses(
+                        target_id, statuses=[HypothesisStatus.OPEN]
+                    ),
+                    next_pivots=ranking_after.selected,
+                    new_entity_ids=last_ingest.new_entity_ids,
+                    target_entity_id=last_pivot.entity_id,
+                )
+            except Exception:  # noqa: BLE001
+                reflection = None
+        if refreshed.config.ai_reflection_auto and refreshed.config.reflection_enabled:
+            await self._maybe_run_ai_reflection(store, target_id)
+
+        if decision_after.should_stop:
+            finalized = self._finalize(store, refreshed, decision_after)
+            finalized.record = last_record
+            finalized.pivot = last_pivot
+            finalized.ledger_status = last_status
+            finalized.reflection = reflection
+            payload = finalized.as_dict()
+            payload["status"] = "stopped"
+            payload["executed"] = executed_summaries
+            payload["wave_count"] = len(executed_summaries)
+            return payload
+
+        return {
+            "target_id": target_id,
+            "status": "active",
+            "stopped": False,
+            "stop_reason": "continue",
+            "stop_detail": decision_after.detail,
+            "iteration": refreshed.iteration_count,
+            "wave_count": len(executed_summaries),
+            "executed": executed_summaries,
+            "action": last_pivot.model_dump(mode="json") if last_pivot else None,
+            "record": last_record.model_dump(mode="json") if last_record else None,
+            "next_pivots": [p.model_dump(mode="json") for p in ranking_after.selected],
+            "reflection": reflection.model_dump(mode="json") if reflection else None,
+            "ledger_status": last_status.value if last_status else None,
+            "graph_summary": graph_after.summary(),
+            "stats": store.stats(target_id),
+            "objectives": [o.model_dump(mode="json") for o in refreshed.objectives],
+        }
 
     # ── helpers: planning / execution / persistence ────────────────
 
@@ -1367,6 +1839,7 @@ def build_config(raw_input: str,
         "min_pivot_threshold", "top_k_pivots", "max_concurrent_tools",
         "max_hypotheses_per_entity", "max_entities", "allow_hypothesis_expansion",
         "collect_raw_artifacts", "reflection_enabled",
+        "parallel_pivots", "ai_reflection_auto", "ai_vision_enabled",
     }
     for key in list(overrides):
         if key in allowed_keys:

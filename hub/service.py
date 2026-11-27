@@ -17,6 +17,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hub.erkg.analytics import analyze_graph, build_timeline, diff_investigations
 from hub.erkg.graph import GraphView
 from hub.erkg.store import ERKGStore
 from hub.investigation.engine import EngineError, InvestigationEngine, build_config
@@ -64,7 +65,10 @@ class InvestigationService:
                     include_report: bool = False,
                     report_format: str = "md",
                     out_path: Optional[str] = None,
-                    structured_seeds: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                    structured_seeds: Optional[dict[str, Any]] = None,
+                    parallel_pivots: Optional[int] = None,
+                    ai_reflection_auto: Optional[bool] = None,
+                    ai_vision_enabled: Optional[bool] = None) -> dict[str, Any]:
         overrides: dict[str, Any] = {}
         for key, value in {
             "max_iterations": max_iterations,
@@ -73,6 +77,9 @@ class InvestigationService:
             "min_pivot_threshold": min_pivot_threshold,
             "max_concurrent_tools": max_concurrent_tools,
             "reflection_enabled": reflection,
+            "parallel_pivots": parallel_pivots,
+            "ai_reflection_auto": ai_reflection_auto,
+            "ai_vision_enabled": ai_vision_enabled,
         }.items():
             if value is not None:
                 overrides[key] = value
@@ -117,6 +124,14 @@ class InvestigationService:
         result = {"status": "stopped" if outcome.stopped else "active"}
         result.update(outcome.as_dict())
         return result
+
+    def step_batch(self, target_id: str, *, max_pivots: int = 3) -> dict[str, Any]:
+        """Execute a bounded parallel wave of non-conflicting pivots."""
+        engine = self.engine()
+        try:
+            return asyncio.run(engine.step_batch(target_id, max_pivots=max_pivots))
+        except EngineError as exc:
+            return {"status": "error", "errors": [str(exc)]}
 
     # ── legacy create (init without running) ───────────────────────
 
@@ -353,6 +368,98 @@ class InvestigationService:
             finally:
                 store.close()
         return {"status": "ok", "count": len(items), "investigations": items}
+
+    # ── 6. analytics / timeline / diff / AI ───────────────────────
+
+    def analytics(self, target_id: str, *, source_id: Optional[str] = None,
+                  dest_id: Optional[str] = None) -> dict[str, Any]:
+        """Compute centrality, clusters, bridges, hash correlations and shortest path."""
+        try:
+            store = self._open_store(target_id)
+        except EngineError as exc:
+            return {"status": "error", "errors": [str(exc)]}
+        try:
+            investigation = store.get_investigation(target_id)
+            if investigation is None:
+                return {"status": "error", "errors": [f"investigation not found: {target_id}"]}
+            graph_view = GraphView(store, target_id, investigation.seed_entity_ids)
+            result = analyze_graph(graph_view, source_id=source_id, dest_id=dest_id)
+            return {"status": "ok", **result}
+        finally:
+            store.close()
+
+    def timeline(self, target_id: str) -> dict[str, Any]:
+        """Build chronological event timeline for an investigation."""
+        try:
+            store = self._open_store(target_id)
+        except EngineError as exc:
+            return {"status": "error", "errors": [str(exc)]}
+        try:
+            if store.get_investigation(target_id) is None:
+                return {"status": "error", "errors": [f"investigation not found: {target_id}"]}
+            events = build_timeline(store, target_id)
+            return {
+                "status": "ok",
+                "target_id": target_id,
+                "count": len(events),
+                "events": events,
+            }
+        finally:
+            store.close()
+
+    def diff(self, target_id_a: str, target_id_b: str) -> dict[str, Any]:
+        """Compare two investigations (entities, status changes, contradictions)."""
+        try:
+            store_a = self._open_store(target_id_a)
+        except EngineError as exc:
+            return {"status": "error", "errors": [str(exc)]}
+        try:
+            store_b = self._open_store(target_id_b)
+        except EngineError as exc:
+            store_a.close()
+            return {"status": "error", "errors": [str(exc)]}
+        try:
+            if store_a.get_investigation(target_id_a) is None:
+                return {"status": "error", "errors": [f"investigation not found: {target_id_a}"]}
+            if store_b.get_investigation(target_id_b) is None:
+                return {"status": "error", "errors": [f"investigation not found: {target_id_b}"]}
+            payload = diff_investigations(store_a, target_id_a, store_b, target_id_b)
+            return {"status": "ok", **payload}
+        finally:
+            store_b.close()
+            store_a.close()
+
+    def ai_status(self, *, probe_local: bool = False) -> dict[str, Any]:
+        """Return masked AI configuration and optional local provider health."""
+        try:
+            from hub.ai import get_ai_status
+
+            payload = get_ai_status(probe_local=probe_local)
+            if isinstance(payload, dict) and "status" not in payload:
+                payload = {"status": "ok", **payload}
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "unavailable", "errors": [f"{type(exc).__name__}: {exc}"]}
+
+    def ai_reflect(self, target_id: str, *, provider: Optional[str] = None) -> dict[str, Any]:
+        """Run quarantined AI reflection on an investigation and persist insight."""
+        try:
+            store = self._open_store(target_id)
+        except EngineError as exc:
+            return {"status": "error", "errors": [str(exc)]}
+        try:
+            if store.get_investigation(target_id) is None:
+                return {"status": "error", "errors": [f"investigation not found: {target_id}"]}
+            try:
+                from hub.ai import run_case_reflection
+            except Exception as exc:  # noqa: BLE001
+                return {"status": "unavailable", "errors": [f"{type(exc).__name__}: {exc}"]}
+            result = asyncio.run(
+                run_case_reflection(store, target_id, provider_override=provider)
+            )
+            return result if isinstance(result, dict) else {"status": "ok", "result": result}
+        finally:
+            store.close()
 
 
 # ════════════════════════════════════════════════════════════════════════

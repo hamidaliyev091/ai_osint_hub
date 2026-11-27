@@ -14,15 +14,15 @@ Autonomous OSINT investigation engine (v2). Python 3.10+, pydantic v2, SQLite,
 ```bash
 python -m pytest -q --tb=short                       # full deterministic suite
 python -m pytest tests/test_engine.py -q             # one area
-python -m hub.cli tools                              # capability health
-python -m hub.cli doctor                             # per-tool smoke check (28/28 expected)
+python -m hub.cli tools                              # capability health (32 tools)
+python -m hub.cli doctor                             # per-tool smoke check (32/32 expected)
 python -m hub.cli doctor --provision                 # install missing tools, then re-check
 python -m hub.cli investigate "example.com" --max-iterations 3 --report md
 python -m hub.cli investigate "Linus Torvalds, goes by torvalds, kernel.org" --report md
 python -m hub.cli serve --host 127.0.0.1 --port 8000   # FastAPI Web Workbench + SSE
 python -m hub.cli report <target_id> --format html --out dossier.html
 AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_live_smoke.py -q       # network smoke
-AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_toolchain_live.py -q   # 28/28 + live tools
+AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_toolchain_live.py -q   # 32/32 + live tools
 AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_native_collectors_live.py -q  # Phase-7 live
 ```
 
@@ -54,9 +54,9 @@ repo. Tests use `tmp_path`/`AI_OSINT_HUB_HOME` fixtures.
    hardcode `shutil.which` for tool discovery. Resolution order is managed launcher
    descriptors → `~/.ai_osint_hub/bin` → repo `.venv*` script dirs → host PATH →
    WSL2 bridge (`wsl.exe --exec`) → managed python wrapper. `python -m hub.cli
-   doctor` must stay at 28/28 AVAILABLE with real smoke checks on the reference host.
+   doctor` must stay at 32/32 AVAILABLE with real smoke checks on the reference host.
    API-key collectors additionally require credentials; missing keys mark auth
-   status but never hide the tool from the 28-tool matrix.
+   status but never hide the tool from the 32-tool matrix.
 8. **User clues are provenance-bearing seeds; speculative leads are hypotheses.**
    Multi-clue intake (`hub/intake.py`) must keep `USER_PROVIDED_SEED` provenance in
    entity metadata/attributes and seed claims, link every clue to the primary
@@ -135,6 +135,22 @@ repo. Tests use `tmp_path`/`AI_OSINT_HUB_HOME` fixtures.
   Starlette may emit an httpx `TestClient` deprecation warning — harmless.
 * HTML dossier support lives in `hub/reporting.py::render_html` (standalone,
   print CSS, all untrusted OSINT escaped); CLI/MCP/Web all accept `format=html`.
+* **Phase 18 AI, Vision, Analytics & Gruvbox invariants:** `hub/ai/` defaults to
+  `enabled=False` (zero-LLM deterministic core untouched); all AI/VLM outputs
+  carry `AI_INFERRED` provenance (`direct=False`, confidence ≤ 0.35 reflection /
+  ≤ 0.45 VLM) and never inflate to `CONFIRMED`. Config lives at
+  `$AI_OSINT_HUB_HOME/ai_config.json` (0600, masked previews, keys registered
+  with `redaction.py`; never read `~/.dsh/.credentials.yaml`, `~/.claude/`, or
+  `~/.codex/`). Visual/OCR/EXIF text passes `quarantine.sanitize_visual_text` +
+  `<untrusted_visual_data>`. New passive collectors (`crtsh_lookup`,
+  `asn_bgp_lookup`, `favicon_hash`, `media_forensics`) enforce `fetch_safe` /
+  `assert_safe_host` SSRF guards and bring the registry to **32 tools**.
+  `hub/erkg/analytics.py` provides pure-Python centrality, communities, bridges,
+  `shortest_path`, perceptual-hash clustering, `build_timeline`, and
+  `diff_investigations`. `hub/web.py` + `hub/static/vendor/cytoscape.min.js` +
+  `hub/reporting.py` + `hub/mcp_server.py` (`ui://ai-osint-hub/workbench.html`)
+  default to Gruvbox Material Light (`#fbf1c7`/`#3c3836`/`#af3a03`) with zero
+  `innerHTML` and zero `backdrop-filter`.
 * **Phase 17 self-test invariants:** USERNAME values must never contain `@`,
   spaces, `/`, URLs or generic slugs (`search-by-username`, `about`, `user(s)`,
   `profil`); the resolver/ingestor enforce this (ingestor reclassifies an
@@ -260,15 +276,16 @@ repo. Tests use `tmp_path`/`AI_OSINT_HUB_HOME` fixtures.
 
 ```
 hub/models.py                    models/enums (single source of truth)
-hub/erkg/{resolution,confidence,store,graph,ingestion}.py
+hub/erkg/{resolution,confidence,store,graph,analytics,ingestion}.py
+hub/ai/{__init__,models,config,providers,embeddings,reflection_runner}.py
 hub/tools/{base,capabilities,locator,runtime}.py + parsers/ + builtin/
-hub/toolchain/{doctor,provision}.py + wrappers/   # 28/28 toolchain provisioning
+hub/toolchain/{doctor,provision}.py + wrappers/   # 32/32 toolchain provisioning
 hub/security/{policy,quarantine,redaction}.py
 hub/credentials.py               API-key vault, auth status, theHarvester YAML sync
 hub/investigation/{hypotheses,pivot,stopping,reflection,engine}.py
-hub/reporting.py                 dossier (md+json+print-ready html)
+hub/reporting.py                 dossier (md+json+Gruvbox print-ready html)
 hub/intake.py                    multi-clue seeds, USER_PROVIDED_SEED, permutations
-hub/web.py                       FastAPI workbench (REST + SSE + embedded SPA)
+hub/web.py + hub/static/         FastAPI Gruvbox workbench + vendored Cytoscape.js
 hub/service.py                   shared operations (CLI+MCP parity)
 hub/cli.py, hub/mcp_server.py, hub/orchestrate.py (legacy shim)
 tests/                           pytest suite, fixtures, mock_tools.py, support.py

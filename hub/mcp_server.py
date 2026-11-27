@@ -197,7 +197,7 @@ def tools(refresh: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 def doctor(provision: bool = False) -> dict[str, Any]:
-    """Verify that all 28 OSINT tools are installed and executable.
+    """Verify that all 32 OSINT tools are installed and executable.
 
     Resolution uses managed bin dirs (``~/.ai_osint_hub/bin`` and the repo
     ``.venv``/``.venv314`` script dirs), host PATH, and a WSL2 bridge. Each tool
@@ -235,6 +235,436 @@ def report(target_id: str, format: str = "md") -> dict[str, Any]:
         Report content (content/report_md or dossier) plus filesystem path if written.
     """
     return _service.report(target_id, fmt=format)
+
+
+@mcp.tool()
+def analytics(target_id: str, source_id: Optional[str] = None,
+              dest_id: Optional[str] = None) -> dict[str, Any]:
+    """Compute graph centrality, communities, bridges, hash clusters & shortest path.
+
+    Args:
+        target_id: Investigation id.
+        source_id: Optional starting entity id for shortest-path evidence chain.
+        dest_id: Optional target entity id for shortest-path evidence chain.
+
+    Returns:
+        Analytics payload with degree/betweenness centrality, communities,
+        bridge_entities, perceptual_hash_clusters and optional shortest_path.
+    """
+    return _service.analytics(target_id, source_id=source_id, dest_id=dest_id)
+
+
+@mcp.tool()
+def timeline(target_id: str) -> dict[str, Any]:
+    """Return a chronological event timeline for an investigation.
+
+    Args:
+        target_id: Investigation id.
+
+    Returns:
+        Sorted timeline of seed intake, artifacts, ledger runs, entity
+        discoveries, contradictions and AI insights.
+    """
+    return _service.timeline(target_id)
+
+
+@mcp.tool()
+def diff_cases(target_id_a: str, target_id_b: str) -> dict[str, Any]:
+    """Compare two investigations (added/removed entities, status changes, contradictions).
+
+    Args:
+        target_id_a: Baseline investigation id.
+        target_id_b: Comparison investigation id.
+
+    Returns:
+        Structured diff with added_entities, removed_entities, status_changes,
+        new_contradictions and summary counts.
+    """
+    return _service.diff(target_id_a, target_id_b)
+
+
+@mcp.tool()
+def ai_reflect(target_id: str, provider: Optional[str] = None) -> dict[str, Any]:
+    """Run quarantined AI reflection on an investigation and persist AI_INFERRED insights.
+
+    Args:
+        target_id: Investigation id.
+        provider: Optional provider override (ollama, lmstudio, gemini, deepseek, openai_compat).
+
+    Returns:
+        Reflection result (or clean disabled/unavailable status when offline).
+    """
+    return _service.ai_reflect(target_id, provider=provider)
+
+
+WORKBENCH_UI_URI = "ui://ai-osint-hub/workbench.html"
+_WORKBENCH_TOOL_META = {
+    "ui": {"resourceUri": WORKBENCH_UI_URI},
+    "com.google.antigravity/ui": {
+        "entrypoints": [
+            {"type": "aux_pane", "title": "AI OSINT Hub"},
+            {"type": "global", "title": "AI OSINT Hub"},
+        ]
+    },
+}
+
+_MCP_WORKBENCH_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI OSINT Hub — Intelligence Workbench</title>
+<style>
+:root {
+  --bg-canvas: #fbf1c7;
+  --bg-card: #f9f5d7;
+  --bg-inset: #f2e5bc;
+  --ink-primary: #3c3836;
+  --ink-strong: #282828;
+  --ink-muted: #665c54;
+  --border: #d5c4a1;
+  --accent: #af3a03;
+  --green: #427b58;
+  --ochre: #b57614;
+  --crimson: #9d0006;
+  --slate: #076678;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg-canvas);
+  color: var(--ink-primary);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  line-height: 1.45;
+}
+code, pre, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+h1 { margin: 0; font-size: 16px; color: var(--ink-strong); }
+.subtitle { font-size: 12px; color: var(--ink-muted); }
+.controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input, select {
+  background: var(--bg-card);
+  color: var(--ink-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+button {
+  background: var(--accent);
+  color: #fbf1c7;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.secondary {
+  background: var(--bg-card);
+  color: var(--ink-primary);
+  border-color: var(--border);
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 16px;
+}
+.card h2 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-muted);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+.kpi-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.kpi {
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  min-width: 90px;
+}
+.kpi-val { font-size: 18px; font-weight: 700; color: var(--ink-strong); }
+.kpi-lbl { font-size: 11px; color: var(--ink-muted); }
+ul.list { list-style: none; padding: 0; margin: 0; max-height: 280px; overflow-y: auto; }
+ul.list li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+ul.list li:last-child { border-bottom: none; }
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-inset);
+}
+.badge.CONFIRMED, .badge.CORROBORATED { color: var(--green); border-color: var(--green); }
+.badge.SINGLE_SOURCE_LEAD, .badge.HYPOTHESIS { color: var(--ochre); border-color: var(--ochre); }
+.badge.CONTRADICTED, .badge.COLLECTION_FAILURE { color: var(--crimson); border-color: var(--crimson); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>AI OSINT Hub — ERKG Workbench</h1>
+    <div class="subtitle" id="status-line">Gruvbox Material Light · Waiting for MCP host data</div>
+  </div>
+  <div class="controls">
+    <input id="case-input" type="text" placeholder="Case ID or target seed">
+    <button id="btn-load" type="button">Load Case</button>
+    <button id="btn-investigate" class="secondary" type="button">Investigate</button>
+  </div>
+</header>
+
+<div class="grid">
+  <section class="card">
+    <h2>Case Overview &amp; KPIs</h2>
+    <div class="kpi-row" id="kpis"></div>
+  </section>
+  <section class="card">
+    <h2>Central &amp; Bridge Entities</h2>
+    <ul class="list" id="central-list"></ul>
+  </section>
+  <section class="card">
+    <h2>Recent Timeline Events</h2>
+    <ul class="list" id="timeline-list"></ul>
+  </section>
+  <section class="card">
+    <h2>Cases</h2>
+    <ul class="list" id="cases-list"></ul>
+  </section>
+</div>
+
+<script>
+(function () {
+  var rpcId = 1;
+  var pending = {};
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function clearEl(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function rpcRequest(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = rpcId++;
+      pending[id] = { resolve: resolve, reject: reject };
+      window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params || {} }, "*");
+    });
+  }
+
+  function callServerTool(name, args) {
+    return rpcRequest("tools/call", { name: name, arguments: args || {} });
+  }
+
+  function renderPayload(data) {
+    if (!data || typeof data !== "object") return;
+    var statusEl = document.getElementById("status-line");
+    statusEl.textContent = data.target_id
+      ? ("Case " + data.target_id + " · " + (data.status || "ok"))
+      : ("Cases loaded: " + ((data.investigations && data.investigations.length) || 0));
+
+    var kpis = document.getElementById("kpis");
+    clearEl(kpis);
+    var stats = data.stats || (data.analytics && data.analytics.summary) || {};
+    var kpiItems = [
+      ["Entities", stats.entities || stats.nodes || 0],
+      ["Claims", stats.claims || stats.edges || 0],
+      ["Artifacts", stats.artifacts || 0],
+      ["Communities", (data.analytics && data.analytics.summary && data.analytics.summary.communities) || 0],
+      ["Tools", (data.tools_summary && data.tools_summary.available) || 0]
+    ];
+    kpiItems.forEach(function (pair) {
+      var box = el("div", "kpi");
+      box.appendChild(el("div", "kpi-val mono", pair[1]));
+      box.appendChild(el("div", "kpi-lbl", pair[0]));
+      kpis.appendChild(box);
+    });
+
+    var central = document.getElementById("central-list");
+    clearEl(central);
+    var topNodes = (data.analytics && data.analytics.top_central_entities) || [];
+    if (!topNodes.length) {
+      central.appendChild(el("li", "", "No graph centrality metrics yet."));
+    } else {
+      topNodes.slice(0, 10).forEach(function (item) {
+        var li = el("li");
+        li.appendChild(el("span", "badge", item.type || "entity"));
+        li.appendChild(document.createTextNode(" " + (item.value || item.entity_id) + " "));
+        li.appendChild(el("span", "mono", "deg=" + (item.degree || 0) + " betw=" + Number(item.betweenness_centrality || 0).toFixed(3)));
+        central.appendChild(li);
+      });
+    }
+
+    var timeline = document.getElementById("timeline-list");
+    clearEl(timeline);
+    var events = (data.timeline && data.timeline.events) || [];
+    if (!events.length) {
+      timeline.appendChild(el("li", "", "No timeline events recorded."));
+    } else {
+      events.slice(-12).reverse().forEach(function (ev) {
+        var li = el("li");
+        li.appendChild(el("span", "mono", "[" + (ev.timestamp_utc || "") + "] "));
+        li.appendChild(el("strong", "", ev.title || ev.event_type || "event"));
+        if (ev.detail) li.appendChild(document.createTextNode(" — " + ev.detail));
+        timeline.appendChild(li);
+      });
+    }
+
+    var casesList = document.getElementById("cases-list");
+    clearEl(casesList);
+    var cases = data.investigations || [];
+    if (!cases.length) {
+      casesList.appendChild(el("li", "", "No stored cases."));
+    } else {
+      cases.slice(0, 12).forEach(function (c) {
+        var li = el("li");
+        var btn = el("button", "secondary mono", c.target_id);
+        btn.type = "button";
+        btn.addEventListener("click", function () {
+          document.getElementById("case-input").value = c.target_id;
+          callServerTool("open_workbench_view", { target_id: c.target_id }).then(function (res) {
+            if (res && res.structuredContent) renderPayload(res.structuredContent);
+          }).catch(function () {});
+        });
+        li.appendChild(btn);
+        li.appendChild(document.createTextNode(" " + (c.status || "") + " (" + (c.raw_input || "") + ")"));
+        casesList.appendChild(li);
+      });
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    var msg = event.data;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.id && pending[msg.id]) {
+      var entry = pending[msg.id];
+      delete pending[msg.id];
+      if (msg.error) entry.reject(msg.error);
+      else entry.resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result" && msg.params) {
+      var sc = msg.params.structuredContent || msg.params;
+      renderPayload(sc);
+    }
+  });
+
+  document.getElementById("btn-load").addEventListener("click", function () {
+    var val = document.getElementById("case-input").value.trim();
+    callServerTool("open_workbench_view", { target_id: val }).then(function (res) {
+      if (res && res.structuredContent) renderPayload(res.structuredContent);
+    }).catch(function () {});
+  });
+
+  document.getElementById("btn-investigate").addEventListener("click", function () {
+    var val = document.getElementById("case-input").value.trim();
+    if (!val) return;
+    callServerTool("investigate", { raw_input: val, max_iterations: 4, max_tool_calls: 6 }).then(function (res) {
+      var sc = (res && res.structuredContent) || {};
+      if (sc.target_id) {
+        return callServerTool("open_workbench_view", { target_id: sc.target_id });
+      }
+      return res;
+    }).then(function (res2) {
+      if (res2 && res2.structuredContent) renderPayload(res2.structuredContent);
+    }).catch(function () {});
+  });
+
+  rpcRequest("ui/initialize", {
+    protocolVersion: "2025-06-18",
+    appInfo: { name: "AI OSINT Hub Workbench", version: "2.0.0" },
+    appCapabilities: {}
+  }).then(function () {
+    window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
+  }).catch(function () {});
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@mcp.resource(
+    WORKBENCH_UI_URI,
+    name="AI OSINT Hub Workbench",
+    mime_type="text/html;profile=mcp-app",
+    meta={"ui": {"prefersBorder": False}},
+)
+def workbench_ui() -> str:
+    """Self-contained Gruvbox Material Light MCP App workbench HTML."""
+    return _MCP_WORKBENCH_HTML
+
+
+@mcp.tool(title="AI OSINT Hub", meta=_WORKBENCH_TOOL_META)
+def open_workbench_view(target_id: str = "") -> dict[str, Any]:
+    """Open the interactive AI OSINT Hub Workbench MCP App view.
+
+    All arguments are optional so entrypoint launches with ``{}`` succeed.
+
+    Args:
+        target_id: Optional investigation id to load into the workbench.
+
+    Returns:
+        Structured workbench payload (case analytics, timeline, stats, cases).
+    """
+    cases = _service.list_investigations()
+    tools_info = _service.tools(refresh=False)
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "investigations": cases.get("investigations", []),
+        "tools_summary": {
+            "total": tools_info.get("total", 0),
+            "available": tools_info.get("available", 0),
+        },
+    }
+    tid = (target_id or "").strip()
+    if tid:
+        st = _service.status(tid)
+        if st.get("status") == "error":
+            payload["status"] = "error"
+            payload["errors"] = st.get("errors", [])
+            return payload
+        payload["target_id"] = tid
+        payload["investigation"] = st.get("investigation")
+        payload["stats"] = st.get("stats")
+        payload["graph_summary"] = st.get("graph_summary")
+        payload["analytics"] = _service.analytics(tid)
+        payload["timeline"] = _service.timeline(tid)
+    return payload
 
 
 def main() -> None:

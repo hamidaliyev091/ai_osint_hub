@@ -1,8 +1,11 @@
 # Runtime dependencies
 pydantic>=2.5
 httpx>=0.28
-mcp>=1.0
+mcp>=1.0,<2
 pyyaml>=6.0
+
+# Optional media forensics (EXIF/pHash/dHash)
+# Pillow>=10.0
 
 # Development / verification
 # pytest>=8.0

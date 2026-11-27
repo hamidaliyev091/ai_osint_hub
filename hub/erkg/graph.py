@@ -214,5 +214,32 @@ class GraphView:
     def satisfied_claims(self) -> list[Claim]:
         return [c for c in self.claims if c.status in SATISFIED_STATUSES]
 
+    # ── analytics helpers ──────────────────────────────────────────
+
+    def degree_map(self) -> dict[str, int]:
+        """Undirected neighbor count for every entity in the graph."""
+        return {eid: len(self._adjacency.get(eid, set())) for eid in self.entities}
+
+    def edge_claims_between(self, node_a: str, node_b: str) -> list[Claim]:
+        """Return all edge claims linking ``node_a`` and ``node_b`` in either direction."""
+        return [
+            c for c in self._edges
+            if (c.subject_id == node_a and c.object_id == node_b)
+            or (c.subject_id == node_b and c.object_id == node_a)
+        ]
+
+    def shortest_path(self, source_id: str, dest_id: str) -> dict[str, Any]:
+        """Shortest undirected evidence chain between ``source_id`` and ``dest_id``."""
+        from hub.erkg.analytics import shortest_path as _shortest_path
+
+        return _shortest_path(self, source_id, dest_id)
+
+    def analytics(self, source_id: Optional[str] = None,
+                  dest_id: Optional[str] = None) -> dict[str, Any]:
+        """Compute centrality, communities, bridges, hash clusters and optional path."""
+        from hub.erkg.analytics import analyze_graph
+
+        return analyze_graph(self, source_id=source_id, dest_id=dest_id)
+
 
 __all__ = ["GraphView", "EntityType"]

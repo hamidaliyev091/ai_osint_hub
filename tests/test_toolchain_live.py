@@ -45,9 +45,9 @@ def _run_tool(tool_id: str, params: dict, *, scope: ScopeConfig | None = None,
 def test_doctor_reports_all_17_tools_available():
     locator.reset_cache()
     result = run_doctor(provision=False, force=True)
-    assert result["total"] == 28, result
-    assert result["available"] == 28, result["missing"]
-    assert result["healthy"] == 28, result["smoke_failed"]
+    assert result["total"] == 32, result
+    assert result["available"] == 32, result["missing"]
+    assert result["healthy"] == 32, result["smoke_failed"]
 
 
 @pytest.mark.parametrize("tool_id,params,scope", [

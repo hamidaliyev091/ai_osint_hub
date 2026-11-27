@@ -22,6 +22,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 SCHEMA_VERSION = "2.0.0"
 
+# Provenance labels for AI-assisted and media-forensics workflows.
+PROVENANCE_AI_INFERRED = "AI_INFERRED"
+PROVENANCE_VLM_EXTRACTED = "VLM_EXTRACTED"
+PROVENANCE_MEDIA_FORENSICS = "MEDIA_FORENSICS"
+
 
 # ════════════════════════════════════════════════════════════════════════
 # Enums
@@ -146,6 +151,8 @@ FUNCTIONAL_PREDICATE_PREFIX = "HAS_ATTRIBUTE:"
 NON_FUNCTIONAL_ATTRIBUTE_KEYS = frozenset({
     "role", "clue_field", "clue_source", "provenance", "seed_wave",
     "derived_from_email",
+    "epistemic_provenance", "ai_provider", "ai_model",
+    "phash", "dhash", "mmh3", "sha256",
 })
 
 
@@ -228,6 +235,8 @@ class SourceKind(str, Enum):
     SEED = "seed"            # raw user supplied intelligence
     TOOL = "tool"            # deterministic parser output from a tool run
     PLANNER = "planner"      # generated hypothesis (no artifact output)
+    AI_REFLECTION = "ai_reflection"
+    VLM = "vlm"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -567,6 +576,9 @@ class InvestigationConfig(BaseModel):
     allow_hypothesis_expansion: bool = True
     collect_raw_artifacts: bool = True
     reflection_enabled: bool = True
+    parallel_pivots: int = Field(default=1, ge=1, le=8)
+    ai_reflection_auto: bool = False
+    ai_vision_enabled: bool = False
 
 
 class InvestigationState(BaseModel):
@@ -848,6 +860,9 @@ def compute_objective_status(statuses: list[EpistemicStatus]) -> EpistemicStatus
 
 __all__ = [
     "SCHEMA_VERSION",
+    "PROVENANCE_AI_INFERRED",
+    "PROVENANCE_VLM_EXTRACTED",
+    "PROVENANCE_MEDIA_FORENSICS",
     "EntityType",
     "EpistemicStatus",
     "EdgeType",

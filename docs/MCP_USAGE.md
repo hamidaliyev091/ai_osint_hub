@@ -48,13 +48,24 @@ theHarvester).
 | `graph` | `target_id`, `view` (`summary`, `entities`, `claims`, `contradictions`, `hypotheses`, `ledger`, `provenance`, `json`) | requested ERKG view |
 | `tools` | `refresh=False` | capability rows + live health + markdown table |
 | `doctor` | `provision=False` | per-tool resolution, location and **real `--version`/`--help` smoke result**; `provision=True` installs missing tools into managed bin dirs / venvs / WSL |
-| `report` | `target_id`, `format` (`md`/`json`/`html`) | dossier content + path (HTML is standalone print-ready) |
+| `report` | `target_id`, `format` (`md`/`json`/`html`) | dossier content + path (HTML is standalone Gruvbox print-ready) |
+| `analytics` | `target_id`, `source_id?`, `dest_id?` | degree & Brandes betweenness centrality, communities, bridges, perceptual-hash clusters, optional `shortest_path` |
+| `timeline` | `target_id` | chronological event list (intake, artifacts, ledger, entities, contradictions, AI insights) |
+| `diff_cases` | `target_id_a`, `target_id_b` | added/removed entities, status changes, new/resolved contradictions |
+| `ai_reflect` | `target_id`, `provider?` | quarantined AI reflection (persists `AI_INFERRED` insights when AI is enabled) |
+| `open_workbench_view` | `target_id=""` (all optional) | Antigravity MCP App UI (`ui://ai-osint-hub/workbench.html`, `aux_pane`/`global` entrypoints) |
+
+## MCP App UI Resource (`ui://ai-osint-hub/workbench.html`)
+
+- **Resource URI:** `ui://ai-osint-hub/workbench.html` (`mime_type="text/html;profile=mcp-app"`, `_meta={"ui": {"prefersBorder": False}}`).
+- **Entrypoints:** `open_workbench_view` declares SEP-1865 `_meta.ui.resourceUri` and `com.google.antigravity/ui.entrypoints` (`aux_pane` and `global`), with optional `target_id=""` so `{}` entrypoint launches work cleanly.
+- **Theme & Safety:** Self-contained Gruvbox Material Light (`#fbf1c7`/`#3c3836`/`#af3a03`) HTML/CSS/JS using DOM `createElement`/`textContent` only (zero `innerHTML`).
 
 ## Example session
 
 ```
 Client: tools()
-Server: {"available": 28, "total": 28, "missing_tools": [], "auth_ready": 28, ...}
+Server: {"available": 32, "total": 32, "missing_tools": [], "auth_ready": 30, ...}
 
 Client: investigate(raw_input="example.com", max_iterations=3, max_tool_calls=4)
 Server: {
@@ -87,7 +98,7 @@ Server: {"report_md": "...evidence-cited dossier...", "path": null}
 ## Toolchain provisioning
 
 The assistant should call `doctor(provision=True)` once on a fresh host (or via
-`python -m hub.cli doctor --provision`) and then require `available == total == 28`
+`python -m hub.cli doctor --provision`) and then require `available == total == 32`
 (API-key providers show their auth status; unconfigured ones are skipped by pivots
 but do not break the tool matrix).
 before running investigations. Tool resolution order is managed
@@ -168,11 +179,16 @@ LOCATION` clues are initialized into iteration 0 with `USER_PROVIDED_SEED`
 provenance and linked to the primary subject; bounded username/email
 `HYPOTHESIS` entities (confidence ≤ 0.35) are generated for passive pivots.
 
-## Web Workbench (Phase 9)
+## Web Workbench & Phase 18 routes
 
 `python -m hub.cli serve --host 127.0.0.1 --port 8000` starts the FastAPI
-workbench (embedded dark-mode SPA + REST + SSE). API routes:
-`GET /`, `GET /api/tools`, `POST /api/doctor`, `POST|GET /api/investigations`,
+Gruvbox Material Light workbench (vendored Cytoscape.js at `/static/vendor/cytoscape.min.js`
++ synchronized `<svg id="graph">`, REST + SSE). API routes:
+`GET /`, `GET /static/...`, `GET /api/tools`, `POST /api/doctor`,
+`GET|POST /api/credentials`, `POST|GET /api/investigations`,
 `GET /api/investigations/{id}`, `GET /api/investigations/{id}/stream`,
-`POST /api/investigations/{id}/step`,
-`GET /api/investigations/{id}/report?format=md|json|html`.
+`POST /api/investigations/{id}/step`, `POST /api/investigations/{id}/step-batch`,
+`GET /api/investigations/{id}/analytics`, `GET /api/investigations/{id}/timeline`,
+`GET /api/investigations/{id}/diff/{other_id}`, `GET /api/ai/status`,
+`POST /api/ai/config`, `POST /api/investigations/{id}/reflect`,
+`POST /api/media/analyze`, `GET /api/investigations/{id}/report?format=md|json|html`.

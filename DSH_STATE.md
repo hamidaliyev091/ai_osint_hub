@@ -1031,7 +1031,51 @@ Phase 16: full-handle maigret + photon static-asset/page caps + empty-attribute
           guard + resolved-IP Shodan/Censys pivots & 24h cooldown (676 tests green)
 Phase 17: @-free usernames + email-derived seed handles + GitHub email→user/repo
           pivot + Ahmia exact-match + AZ E.164 phones (688 tests green)
+Phase 18: Hybrid AI + Vision Forensics + Graph Analytics/Timeline/Diff/Waves +
+          32/32 tools + Gruvbox Material Light Cytoscape Workbench + MCP App UI
+          (723 passed, 18 skipped)
 ```
+
+## Phase 18 — Hybrid AI, Vision Forensics, Graph Analytics & Gruvbox Workbench (2026-11-27)
+
+### Delivered
+
+- **Shared Contracts & AI Insights Store (`hub/models.py`, `hub/erkg/store.py`):**
+  kept `EpistemicStatus` strictly 6 values; added `PROVENANCE_AI_INFERRED`,
+  `PROVENANCE_VLM_EXTRACTED`, `PROVENANCE_MEDIA_FORENSICS`, `SourceKind.AI_REFLECTION`/`VLM`,
+  non-functional hash/AI attribute keys, `InvestigationConfig` options (`parallel_pivots=1`,
+  `ai_reflection_auto=False`, `ai_vision_enabled=False`), and `ai_insights` SQLite table
+  (`add_ai_insight`, `list_ai_insights`).
+- **Hybrid Offline + Online AI Layer (`hub/ai/`, `hub/security/quarantine.py`):**
+  `AIConfig` (`enabled=False` default) persisted at `$AI_OSINT_HUB_HOME/ai_config.json` (0600,
+  masked previews, keys registered with `hub.security.redaction`; isolated from `~/.dsh`,
+  `~/.claude`, `~/.codex`). Pure-`httpx` support for Ollama (8 GB VRAM defaults: `gemma4`,
+  `qwen2.5vl:7b`, `embeddinggemma`, `num_ctx=8192`), LM Studio, Gemini, DeepSeek, and
+  OpenAI-compatible providers, offline char n-gram TF-IDF + Jaro-Winkler embeddings, and
+  quarantined `run_case_reflection` (`AI_INFERRED`, `direct=False`, confidence ≤ 0.35).
+  Added `VISUAL_SECURITY_SYSTEM_PROMPT`, `sanitize_visual_text`, `wrap_visual_untrusted`,
+  and `detect_visual_injection`.
+- **Graph Analytics, Parallel Pivots & 32-Tool Registry (`hub/erkg/analytics.py`,
+  `hub/erkg/graph.py`, `hub/investigation/engine.py`, `hub/tools/`):** pure-Python
+  degree & Brandes betweenness centrality, connected components, label-propagation
+  communities, Tarjan bridges, `shortest_path` evidence chains, perceptual-hash clustering
+  (Hamming ≤ 6 / exact `mmh3`), `build_timeline`, `diff_investigations`, bounded parallel
+  waves (`step_batch` / `parallel_pivots`), and 4 new passive tools (`crtsh_lookup`,
+  `asn_bgp_lookup`, `favicon_hash`, `media_forensics`) → **32/32 AVAILABLE**.
+- **Enterprise Matte Workbench, Editorial HTML Dossier & MCP App (`hub/web.py`,
+  `hub/static/vendor/cytoscape.min.js`, `hub/reporting.py`, `hub/service.py`, `hub/cli.py`,
+  `hub/mcp_server.py`):** Gruvbox Material Light (`#fbf1c7`/`#f9f5d7`/`#3c3836`/`#af3a03`)
+  3-pane Cytoscape.js 3.35.0 + synchronized SVG workbench, zero `innerHTML`/glassmorphism,
+  REST endpoints (`/analytics`, `/timeline`, `/diff`, `/step-batch`, `/api/ai/*`, `/reflect`,
+  `/api/media/analyze`), CLI (`analytics`, `timeline`, `diff`, `ai status|reflect`), MCP
+  tools + `ui://ai-osint-hub/workbench.html` (`aux_pane`/`global` entrypoints), and
+  Gruvbox editorial HTML dossiers with CSP headers.
+
+### Verification evidence
+
+- Independent Security Audit: **0 Critical / 0 High / 0 Medium** defects across all `hub/` changes.
+- `python -m hub.cli tools` → **`32/32 AVAILABLE · auth-ready 30/32`**.
+- `python -m pytest -q --tb=short` → **`723 passed, 18 skipped`** (0 failures; +35 new offline tests across `test_ai_layer.py`, `test_vision_media.py`, `test_graph_analytics_collectors.py`, and `test_workbench_gruvbox_security.py`; 18 skipped are opt-in `AI_OSINT_HUB_LIVE=1` live tests).
 
 ## Blockers
 None.

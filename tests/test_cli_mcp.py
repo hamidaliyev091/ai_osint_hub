@@ -40,7 +40,7 @@ class TestCli:
         assert process.returncode == 0, process.stderr
         payload = json.loads(process.stdout)
         assert payload["status"] == "ok"
-        assert payload["total"] == 28
+        assert payload["total"] == 32
         assert "dns_lookup" in payload["available_tools"]
         assert payload["mcp_tool_definitions"] == payload["total"]
 
@@ -148,8 +148,8 @@ class TestCli:
         process = run_cli(["doctor", "--json"], hub_home=hub_home, timeout=300)
         assert process.returncode in (0, 1)  # 1 only if host toolchain incomplete
         payload = json.loads(process.stdout)
-        assert payload["total"] == 28
-        assert "tools" in payload and len(payload["tools"]) == 28
+        assert payload["total"] == 32
+        assert "tools" in payload and len(payload["tools"]) == 32
         assert all("smoke_ok" in row for row in payload["tools"])
 
     def test_human_output_tools(self, hub_home):
