@@ -112,7 +112,7 @@ class TestCrossPlatformLocatorAndPackaging:
         monkeypatch.setenv(locator.MANAGED_VENV_ENV, str(tmp_path / "repo" / ".venv" / "Scripts"))
         monkeypatch.setenv(locator.WSL_ENV, "0")
         monkeypatch.setattr(locator, "repo_root", lambda: tmp_path / "repo")
-        monkeypatch.setattr(locator.os, "name", "nt")
+        monkeypatch.setattr(locator, "_is_windows", lambda: True)
         monkeypatch.setattr(locator, "_probe_dll_init_failed", lambda p: p == exe_path)
         locator.reset_cache()
 
@@ -134,7 +134,7 @@ class TestCrossPlatformLocatorAndPackaging:
         monkeypatch.setenv(locator.MANAGED_VENV_ENV, str(tmp_path / "empty_venv"))
         monkeypatch.delenv(locator.WSL_ENV, raising=False)
         monkeypatch.setattr(locator, "repo_root", lambda: tmp_path / "empty_repo")
-        monkeypatch.setattr(locator.os, "name", "nt")
+        monkeypatch.setattr(locator, "_is_windows", lambda: True)
 
         def fake_which(name: str):
             if name == "nmap":

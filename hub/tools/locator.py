@@ -103,6 +103,11 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _is_windows() -> bool:
+    """Indirection helper so tests can simulate Windows without mutating os.name."""
+    return os.name == "nt"
+
+
 def home_bin() -> Path:
     override = os.environ.get(MANAGED_BIN_ENV)
     if override:
@@ -115,14 +120,14 @@ def managed_venv_bin() -> Path:
     if override:
         return Path(override).expanduser().resolve()
     venv = repo_root() / ".venv"
-    return (venv / ("Scripts" if os.name == "nt" else "bin")).resolve()
+    return (venv / ("Scripts" if _is_windows() else "bin")).resolve()
 
 
 def managed_venv_bin_dirs() -> list[Path]:
     """All managed venv script dirs (primary .venv then extra .venv314 etc.)."""
     directories: list[Path] = [managed_venv_bin()]
     for candidate in sorted(repo_root().glob(".venv*")):
-        bin_dir = candidate / ("Scripts" if os.name == "nt" else "bin")
+        bin_dir = candidate / ("Scripts" if _is_windows() else "bin")
         if candidate.is_dir() and bin_dir not in directories:
             directories.append(bin_dir.resolve())
     return directories
@@ -134,7 +139,7 @@ def managed_bin_dirs() -> list[Path]:
     seen: set[str] = set()
     ordered: list[Path] = []
     for directory in directories:
-        key = str(directory).lower() if os.name == "nt" else str(directory)
+        key = str(directory).lower() if _is_windows() else str(directory)
         if key not in seen:
             seen.add(key)
             ordered.append(directory)
@@ -349,7 +354,7 @@ _WSL_CACHE: dict[str, tuple[float, Optional[str]]] = {}
 
 
 def _wsl_exe() -> Optional[str]:
-    if os.name != "nt" or os.environ.get(WSL_ENV, "").strip() == "0":
+    if not _is_windows() or os.environ.get(WSL_ENV, "").strip() == "0":
         return None
     return shutil.which("wsl.exe") or shutil.which("wsl")
 
@@ -501,13 +506,13 @@ def _resolve_wsl(tool_id: str, binary: str) -> Optional[ResolvedTool]:
 # ════════════════════════════════════════════════════════════════════════
 
 def _creation_flags() -> dict[str, Any]:
-    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+    if _is_windows() and hasattr(subprocess, "CREATE_NO_WINDOW"):
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
     return {}
 
 
 def _windows_executable_names(binary: str) -> list[str]:
-    if os.name != "nt":
+    if not _is_windows():
         return [binary]
     suffixes = [""] if Path(binary).suffix else [".exe", ".com", ".cmd", ".bat"]
     return [binary + suffix for suffix in suffixes]
@@ -625,7 +630,7 @@ def _find_in_managed(binary: str) -> Optional[ResolvedTool]:
                 # (created by --provision) takes priority over this path.
                 continue
             if (
-                os.name == "nt"
+                _is_windows()
                 and source == "managed-venv"
                 and candidate.suffix.lower() == ".exe"
                 and _probe_dll_init_failed(candidate)
@@ -644,7 +649,7 @@ def _find_in_managed(binary: str) -> Optional[ResolvedTool]:
 def extra_host_bin_dirs(platform_name: Optional[str] = None) -> list[Path]:
     """Extra non-default PATH directories checked on macOS and Linux."""
     plat = (platform_name or sys.platform).lower()
-    if plat.startswith("win") or (platform_name is None and os.name == "nt"):
+    if plat.startswith("win") or (platform_name is None and _is_windows()):
         return []
     if plat == "darwin":
         return [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
@@ -848,7 +853,7 @@ def _resolve_uncached(tool_id: str, binary: str, *, allow_wrappers: bool,
     managed = _find_in_managed(binary)
     if managed is not None:
         if (
-            os.name == "nt"
+            _is_windows()
             and binary.strip().lower() in {"nmap", "nmap.exe"}
             and managed.binary_path
             and not _probe_windows_nmap(managed.binary_path)
@@ -867,7 +872,7 @@ def _resolve_uncached(tool_id: str, binary: str, *, allow_wrappers: bool,
     host = _resolve_host_path(tool_id, binary)
     if host is not None:
         if (
-            os.name == "nt"
+            _is_windows()
             and binary.strip().lower() in {"nmap", "nmap.exe"}
             and host.available
             and host.binary_path
@@ -925,7 +930,7 @@ def enrich_child_env(environment: dict[str, str],
     managed = [str(directory) for directory in managed_bin_dirs() if directory.exists()]
     current_path = enriched.get("PATH") or os.environ.get("PATH", "")
     parts = managed + ([current_path] if current_path else [])
-    if os.name == "nt":
+    if _is_windows():
         # WSL.exe needs SystemRoot; scrub_environment already allows it.
         enriched["PATH"] = os.pathsep.join(parts)
     else:

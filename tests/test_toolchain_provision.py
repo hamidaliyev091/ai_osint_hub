@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tarfile
 from pathlib import Path
 
@@ -133,8 +134,13 @@ class TestWslInstaller:
 
 class TestPhoneinfogaDownload:
     def test_downloads_and_extracts_release(self, isolated_layout, monkeypatch):
-        asset_name = "phoneinfoga_Windows_x86_64.tar.gz" if os.name == "nt" \
-            else "phoneinfoga_Linux_x86_64.tar.gz"
+        arch = "arm64" if provision._is_arm() else "x86_64"
+        if os.name == "nt":
+            asset_name = f"phoneinfoga_Windows_{arch}.tar.gz"
+        elif sys.platform == "darwin":
+            asset_name = f"phoneinfoga_Darwin_{arch}.tar.gz"
+        else:
+            asset_name = f"phoneinfoga_Linux_{arch}.tar.gz"
         archive_bytes = io.BytesIO()
         binary_name = "phoneinfoga.exe" if os.name == "nt" else "phoneinfoga"
         with tarfile.open(fileobj=archive_bytes, mode="w:gz") as tar:
