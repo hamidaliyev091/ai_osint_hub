@@ -15,7 +15,7 @@ ai-osint-hub mcp-config --client cursor
 ai-osint-hub mcp-config --client vscode
 ```
 
-### Antigravity (`~/.gemini/antigravity/mcp_config.json`)
+### Antigravity (`~/.gemini/config/mcp_config.json`)
 
 ```json
 {
@@ -38,8 +38,8 @@ ai-osint-hub mcp-config --client vscode
 {
   "mcpServers": {
     "ai-osint-hub": {
-      "command": "ai-osint-hub",
-      "args": [],
+      "command": "python",
+      "args": ["-m", "hub.mcp_server"],
       "env": {
         "AI_OSINT_HUB_HOME": "/absolute/path/to/state"
       }

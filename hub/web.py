@@ -1476,7 +1476,7 @@ def _fallback_mcp_config(client: str = "antigravity") -> dict[str, Any]:
     """Generate a ready-to-paste MCP client configuration snippet."""
     key = (client or "antigravity").strip().lower()
     paths = {
-        "antigravity": "~/.gemini/antigravity/mcp_config.json",
+        "antigravity": "~/.gemini/config/mcp_config.json",
         "claude": "~/Library/Application Support/Claude/claude_desktop_config.json (macOS) | %APPDATA%\\Claude\\claude_desktop_config.json (Windows)",
         "cursor": "~/.cursor/mcp.json",
         "vscode": ".vscode/mcp.json",
@@ -1486,7 +1486,10 @@ def _fallback_mcp_config(client: str = "antigravity") -> dict[str, Any]:
             f"Unsupported MCP client {client!r}. Expected one of: {', '.join(sorted(paths))}"
         )
     root_key = "servers" if key == "vscode" else "mcpServers"
-    server_entry: dict[str, Any] = {"command": "ai-osint-hub", "args": ["mcp"]}
+    server_entry: dict[str, Any] = {
+        "command": sys.executable or "python",
+        "args": ["-m", "hub.mcp_server"],
+    }
     if key == "vscode":
         server_entry = {"type": "stdio", **server_entry}
     snippet = {root_key: {"ai-osint-hub": server_entry}}

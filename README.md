@@ -2,6 +2,8 @@
 
 **Autonomous, evidence-cited OSINT investigation** — from a target seed to a provenance-backed intelligence dossier. Not a bag of tool wrappers: the system's value is how it **thinks, remembers, correlates, and pivots**.
 
+![AI OSINT Hub Workbench — Gruvbox Material Light Cytoscape ERKG & Artifact Inspector](docs/assets/workbench-graph.png)
+
 ---
 
 ## Quickstart (Choose Your Path)
@@ -151,6 +153,12 @@ Or click **10-Second MCP Setup** inside the Web Workbench. See [docs/MCP_USAGE.m
 - **Ctrl/Cmd+K Command Palette** to jump to entities, switch tabs, run pivots, toggle theme, or load the demo case.
 - **Rendered | Raw** DOM-built Markdown dossier viewer (`http:`/`https:`/`mailto:` links only) + print-ready PDF CSS.
 - **Scope & Authorization Modal** before enabling `Allow Active Recon`.
+
+### Workbench Preview
+
+| Rendered Evidence-Cited Dossier | Hardware-Adaptive AI & Vision Lab |
+|---|---|
+| ![Rendered Evidence-Cited Intelligence Dossier](docs/assets/workbench-dossier.png) | ![Hardware-Adaptive AI & Vision Lab](docs/assets/workbench-ai-lab.png) |
 
 ---
 

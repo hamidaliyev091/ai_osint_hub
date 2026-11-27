@@ -531,7 +531,7 @@ class InvestigationService:
         python_cmd = sys.executable or "python"
 
         hints = {
-            "antigravity": "~/.gemini/antigravity/mcp_config.json",
+            "antigravity": "~/.gemini/config/mcp_config.json",
             "claude": "%APPDATA%\\Claude\\claude_desktop_config.json (Windows) | ~/Library/Application Support/Claude/claude_desktop_config.json (macOS)",
             "cursor": "~/.cursor/mcp.json (or .cursor/mcp.json)",
             "vscode": ".vscode/mcp.json",
