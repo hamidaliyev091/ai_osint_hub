@@ -550,6 +550,202 @@ class ERKGStore:
         self._write("UPDATE entities SET metadata_json=? WHERE entity_id=?",
                     (canonical_json(merged), entity_id))
 
+    def merge_entities(
+        self,
+        investigation_id: str,
+        keep_entity_id: str,
+        drop_entity_id: str,
+        *,
+        timestamp: Optional[str] = None,
+    ) -> Optional[Entity]:
+        """Merge ``drop_entity_id`` into ``keep_entity_id`` transactionally."""
+        if not keep_entity_id or not drop_entity_id or keep_entity_id == drop_entity_id:
+            return self.get_entity(keep_entity_id)
+        with self.transaction():
+            keep = self.get_entity(keep_entity_id)
+            drop = self.get_entity(drop_entity_id)
+            if (
+                keep is None
+                or drop is None
+                or keep.investigation_id != investigation_id
+                or drop.investigation_id != investigation_id
+            ):
+                return keep
+
+            from hub.erkg.resolution import alias_keys_for
+
+            raw_values = list(keep.raw_values)
+            for rv in list(drop.raw_values) + [drop.display_value, drop.canonical_value]:
+                if rv and rv not in raw_values:
+                    raw_values.append(rv)
+
+            aliases = list(keep.aliases)
+            for al in list(drop.aliases) + [drop.display_value, drop.canonical_value] + list(drop.raw_values):
+                if al and al not in aliases:
+                    aliases.append(al)
+
+            merged_meta = dict(drop.metadata or {})
+            for key, value in (keep.metadata or {}).items():
+                if value not in (None, "") or key not in merged_meta:
+                    merged_meta[key] = value
+
+            first_seen = min(keep.first_seen, drop.first_seen)
+            last_seen = max(keep.last_seen, drop.last_seen, timestamp or "")
+            self._write(
+                """UPDATE entities
+                   SET aliases_json=?, raw_values_json=?, metadata_json=?,
+                       first_seen=?, last_seen=?
+                   WHERE entity_id=?""",
+                (
+                    canonical_json(aliases),
+                    canonical_json(raw_values),
+                    canonical_json(merged_meta),
+                    first_seen,
+                    last_seen,
+                    keep_entity_id,
+                ),
+            )
+
+            # Migrate alias index entries to keep_entity_id and register drop's names.
+            self._write(
+                """UPDATE OR IGNORE entity_aliases SET entity_id=?
+                   WHERE investigation_id=? AND entity_id=?""",
+                (keep_entity_id, investigation_id, drop_entity_id),
+            )
+            self._write(
+                "DELETE FROM entity_aliases WHERE investigation_id=? AND entity_id=?",
+                (investigation_id, drop_entity_id),
+            )
+            extra_alias_keys = alias_keys_for(
+                keep.type,
+                drop.display_value,
+                drop.canonical_value,
+                [drop.canonical_value, *drop.aliases],
+            )
+            self._insert_aliases(investigation_id, keep_entity_id, extra_alias_keys)
+
+            # Migrate claims referencing drop_entity_id (subject or object).
+            claim_rows = self._query_all(
+                """SELECT * FROM claims
+                   WHERE investigation_id=? AND (subject_id=? OR object_id=?)""",
+                (investigation_id, drop_entity_id, drop_entity_id),
+            )
+            recompute_ids: list[str] = []
+            for row in claim_rows:
+                cid = row["claim_id"]
+                new_subj = keep_entity_id if row["subject_id"] == drop_entity_id else row["subject_id"]
+                new_obj = keep_entity_id if row["object_id"] == drop_entity_id else row["object_id"]
+                if new_obj is not None and new_subj == new_obj:
+                    self._write("DELETE FROM claim_artifacts WHERE claim_id=?", (cid,))
+                    self._write("DELETE FROM contradictions WHERE claim_a=? OR claim_b=?", (cid, cid))
+                    self._write("DELETE FROM claims WHERE claim_id=?", (cid,))
+                    continue
+
+                if (
+                    row["subject_id"] == drop_entity_id
+                    and row["predicate"] == "IDENTIFIED_AS"
+                    and row["object_literal"] is not None
+                ):
+                    existing_ident = self._query_one(
+                        """SELECT claim_id FROM claims
+                           WHERE investigation_id=? AND subject_id=?
+                             AND predicate='IDENTIFIED_AS' AND object_literal IS NOT NULL
+                           LIMIT 1""",
+                        (investigation_id, keep_entity_id),
+                    )
+                    if existing_ident is not None:
+                        target_cid = existing_ident["claim_id"]
+                        self._write(
+                            """INSERT OR IGNORE INTO claim_artifacts
+                               (claim_id, artifact_id, source_tool, snippet, direct)
+                               SELECT ?, artifact_id, source_tool, snippet, direct
+                               FROM claim_artifacts WHERE claim_id=?""",
+                            (target_cid, cid),
+                        )
+                        self._write("DELETE FROM claim_artifacts WHERE claim_id=?", (cid,))
+                        self._write("DELETE FROM contradictions WHERE claim_a=? OR claim_b=?", (cid, cid))
+                        self._write("DELETE FROM claims WHERE claim_id=?", (cid,))
+                        recompute_ids.append(target_cid)
+                        continue
+
+                existing = self._find_claim_by_object(
+                    investigation_id, new_subj, row["predicate"], new_obj, row["object_literal"]
+                )
+                if existing is not None and existing["claim_id"] != cid:
+                    target_cid = existing["claim_id"]
+                    self._write(
+                        """INSERT OR IGNORE INTO claim_artifacts
+                           (claim_id, artifact_id, source_tool, snippet, direct)
+                           SELECT ?, artifact_id, source_tool, snippet, direct
+                           FROM claim_artifacts WHERE claim_id=?""",
+                        (target_cid, cid),
+                    )
+                    self._write("DELETE FROM claim_artifacts WHERE claim_id=?", (cid,))
+                    self._write("DELETE FROM contradictions WHERE claim_a=? OR claim_b=?", (cid, cid))
+                    self._write("DELETE FROM claims WHERE claim_id=?", (cid,))
+                    recompute_ids.append(target_cid)
+                else:
+                    self._write(
+                        "UPDATE claims SET subject_id=?, object_id=?, updated_at=? WHERE claim_id=?",
+                        (new_subj, new_obj, timestamp or utc_now(), cid),
+                    )
+
+            for rcid in sorted(set(recompute_ids)):
+                self._recompute_claim(rcid)
+
+            self._write(
+                """UPDATE OR IGNORE contradictions SET subject_id=?
+                   WHERE investigation_id=? AND subject_id=?""",
+                (keep_entity_id, investigation_id, drop_entity_id),
+            )
+            self._write(
+                "DELETE FROM contradictions WHERE investigation_id=? AND subject_id=?",
+                (investigation_id, drop_entity_id),
+            )
+
+            self._write(
+                """UPDATE OR IGNORE execution_ledger SET entity_id=?
+                   WHERE investigation_id=? AND entity_id=?""",
+                (keep_entity_id, investigation_id, drop_entity_id),
+            )
+            self._write(
+                "DELETE FROM execution_ledger WHERE investigation_id=? AND entity_id=?",
+                (investigation_id, drop_entity_id),
+            )
+
+            self._write(
+                "UPDATE hypotheses SET target_entity_id=? WHERE investigation_id=? AND target_entity_id=?",
+                (keep_entity_id, investigation_id, drop_entity_id),
+            )
+
+            inv = self.get_investigation(investigation_id)
+            if inv is not None:
+                new_seeds: list[str] = []
+                for sid in inv.seed_entity_ids:
+                    mapped = keep_entity_id if sid == drop_entity_id else sid
+                    if mapped not in new_seeds:
+                        new_seeds.append(mapped)
+                new_objs: list[Objective] = []
+                seen_obj_eids: set[str] = set()
+                for obj in inv.objectives:
+                    mapped_eid = keep_entity_id if obj.entity_id == drop_entity_id else obj.entity_id
+                    if mapped_eid in seen_obj_eids:
+                        continue
+                    seen_obj_eids.add(mapped_eid)
+                    new_objs.append(
+                        obj.model_copy(update={"entity_id": mapped_eid})
+                        if mapped_eid != obj.entity_id else obj
+                    )
+                self.update_investigation(
+                    investigation_id,
+                    seed_entity_ids_json=new_seeds,
+                    objectives_json=[o.model_dump(mode="json") for o in new_objs],
+                    updated_at=timestamp or utc_now(),
+                )
+
+            self._write("DELETE FROM entities WHERE entity_id=?", (drop_entity_id,))
+            return self.get_entity(keep_entity_id)
+
     def touch_entity(self, entity_id: str, *, raw_value: str,
                      aliases: Iterable[str], alias_keys: Iterable[str],
                      timestamp: str,

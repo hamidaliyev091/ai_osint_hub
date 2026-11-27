@@ -23,6 +23,11 @@ from hub.cooking import (
     extract_urls,
     parse_raw_input,
 )
+from hub.erkg.resolution import (
+    PROVIDER_INFRASTRUCTURE_DOMAINS,
+    is_noreply_email,
+    is_provider_infrastructure_domain,
+)
 from hub.models import EntityType
 from hub.tools.base import EntityCandidate, infer_value_type
 
@@ -40,7 +45,7 @@ _AZ_MOBILE_PREFIXES = frozenset({"050", "051", "055", "070", "077", "099", "010"
 _AZ_LOCATION_MARKERS = frozenset({
     "az", "baku", "bakı", "azerbaijan", "azərbaycan", "azerbaidjan",
 })
-_FREEMAIL_DOMAINS = {
+_FREEMAIL_DOMAINS = set(PROVIDER_INFRASTRUCTURE_DOMAINS) | {
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
     "yahoo.com", "ymail.com", "proton.me", "protonmail.com", "icloud.com",
     "me.com", "mac.com", "mail.com", "aol.com", "gmx.com", "gmx.net",
@@ -470,9 +475,9 @@ def _surname_tokens_from_emails(emails: Iterable[str],
 
 
 def _email_derived_username(email: str) -> str:
-    """Return a safe personal local-part username, or '' for role mailboxes."""
+    """Return a safe personal local-part username, or '' for role/noreply mailboxes."""
     text = str(email or "").strip().lower()
-    if "@" not in text:
+    if "@" not in text or is_noreply_email(text):
         return ""
     local = text.split("@", 1)[0].split("+", 1)[0]
     if local.endswith(".std"):
@@ -577,18 +582,31 @@ class MultiClueIntake:
             add(EntityType.USERNAME, username.lstrip("@"), source="structured",
                 field_name="usernames", confidence=0.90)
         for email in fields.emails:
-            add(EntityType.EMAIL, email.lower(), source="structured",
-                field_name="emails", confidence=0.95)
+            email_val = email.lower()
+            email_meta = (
+                {"is_noreply": True, "provider_infrastructure": True}
+                if is_noreply_email(email_val) else {}
+            )
+            add(EntityType.EMAIL, email_val, source="structured",
+                field_name="emails", confidence=0.95, metadata=email_meta)
         for domain in fields.domains:
             cleaned = _clean_domain(domain)
             if cleaned:
+                dom_meta = (
+                    {"provider_infrastructure": True}
+                    if is_provider_infrastructure_domain(cleaned) else {}
+                )
                 add(EntityType.DOMAIN, cleaned, source="structured",
-                    field_name="domains", confidence=0.90)
+                    field_name="domains", confidence=0.90, metadata=dom_meta)
         for subdomain in fields.subdomains:
             cleaned = _clean_domain(subdomain)
             if cleaned:
+                sub_meta = (
+                    {"provider_infrastructure": True}
+                    if is_provider_infrastructure_domain(cleaned) else {}
+                )
                 add(EntityType.SUBDOMAIN, cleaned, source="structured",
-                    field_name="subdomains", confidence=0.90)
+                    field_name="subdomains", confidence=0.90, metadata=sub_meta)
         for phone in fields.phones:
             cleaned = _clean_phone(phone,
                                    az_context=_has_az_context(fields.locations, text))
@@ -622,8 +640,13 @@ class MultiClueIntake:
                          for email in parsed.get("emails", []) if "@" in email}
 
         for email in parsed.get("emails", [])[: self.limits[EntityType.EMAIL]]:
-            add(EntityType.EMAIL, email.lower(), source="free_text",
-                field_name="emails", confidence=0.85)
+            email_val = email.lower()
+            email_meta = (
+                {"is_noreply": True, "provider_infrastructure": True}
+                if is_noreply_email(email_val) else {}
+            )
+            add(EntityType.EMAIL, email_val, source="free_text",
+                field_name="emails", confidence=0.85, metadata=email_meta)
         for phone in parsed.get("phones", [])[: self.limits[EntityType.PHONE]]:
             cleaned_phone = _clean_phone(phone, az_context=az_context)
             if cleaned_phone:
@@ -657,10 +680,11 @@ class MultiClueIntake:
         email_values = [clue.value for clue in clues
                         if clue.entity_type == EntityType.EMAIL]
         for email_value in email_values:
-            if "@" not in email_value:
+            if "@" not in email_value or is_noreply_email(email_value):
                 continue
             mail_domain = _clean_domain(email_value.split("@", 1)[1])
-            if not mail_domain or mail_domain in _FREEMAIL_DOMAINS:
+            if (not mail_domain or mail_domain in _FREEMAIL_DOMAINS
+                    or is_provider_infrastructure_domain(mail_domain)):
                 continue
             add(EntityType.DOMAIN, mail_domain, source="email_derived",
                 field_name="domains", confidence=0.80,

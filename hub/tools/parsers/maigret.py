@@ -39,7 +39,7 @@ _GENERIC_PATH_SEGMENTS = {
     "channel", "user", "users", "profile", "profiles", "status", "settings",
     "watch", "help", "u", "in", "c", "v", "p", "www", "api", "terms",
     "privacy", "policy", "contact", "faq", "logout", "register", "feed",
-    "share", "intent",
+    "share", "intent", "members", "member", "account", "accounts",
 }
 
 
@@ -87,6 +87,9 @@ def _profile_matches_target(url: str, username: str, target: str) -> bool:
         # a social profile.
         return False
     if segments:
+        final_seg = segments[-1].strip("@").lower()
+        if final_seg in _GENERIC_PATH_SEGMENTS:
+            return False
         non_generic = [segment for segment in segments
                        if segment.strip("@").lower() not in _GENERIC_PATH_SEGMENTS]
         if not non_generic:
@@ -94,9 +97,8 @@ def _profile_matches_target(url: str, username: str, target: str) -> bool:
         if not target:
             return True
         # The URL path is authoritative; a payload's sidebar/owner username is
-        # ignored unless the URL itself belongs to the queried target.
-        return any(_handle_matches_target(segment, target)
-                   for segment in non_generic)
+        # ignored unless the final path segment belongs to the queried target.
+        return _handle_matches_target(final_seg, target)
     if not target:
         return bool((username or "").strip())
     return _handle_matches_target(username, target)

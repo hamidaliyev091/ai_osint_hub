@@ -75,6 +75,8 @@ class ToolCheck:
     auth_status: str = "NOT_REQUIRED"
     auth_detail: str = ""
     install_hint: str = ""
+    policy_blocked: bool = False
+    ui_status: str = "ready"
 
     @property
     def auth_ready(self) -> bool:
@@ -95,6 +97,8 @@ class ToolCheck:
             "auth_detail": self.auth_detail,
             "auth_ready": self.auth_ready,
             "install_hint": self.install_hint,
+            "policy_blocked": self.policy_blocked,
+            "ui_status": self.ui_status,
             "ok": bool(self.available and self.smoke_ok),
         }
 
@@ -145,11 +149,24 @@ def smoke_tool(resolved: locator.ResolvedTool, tool_id: str, *,
     return bool(ok), process.returncode, output
 
 
+def _ui_status(available: bool, auth_status: str, policy_blocked: bool) -> str:
+    if policy_blocked:
+        return "blocked"
+    if not available:
+        return "missing"
+    if auth_status in {"MISSING_KEY", "PARTIAL"}:
+        return "needs_key"
+    return "ready"
+
+
 def check_tool(tool_id: str, *, force: bool = True, smoke: bool = True) -> ToolCheck:
+    from hub.models import ExecutionMode
+
     capability = capabilities.get_tool(tool_id)
     if capability is None:
         return ToolCheck(tool_id=tool_id, available=False, detail="unknown tool",
-                         install_hint=install_hint(tool_id))
+                         install_hint=install_hint(tool_id), ui_status="missing")
+    policy_blocked = capability.execution_mode == ExecutionMode.INTRUSIVE_BLOCKED
     auth_status, auth_detail = capabilities.capability_auth(capability)
     if tool_id.lower() in _BUILTIN_TOOLS or capability.invocation.kind == "builtin":
         status = capabilities.health_check(tool_id, force=force)
@@ -166,6 +183,8 @@ def check_tool(tool_id: str, *, force: bool = True, smoke: bool = True) -> ToolC
             auth_status=auth_status,
             auth_detail=auth_detail,
             install_hint="" if avail else install_hint(tool_id),
+            policy_blocked=policy_blocked,
+            ui_status=_ui_status(avail, auth_status, policy_blocked),
         )
     binary = capability.invocation.binary or tool_id
     resolved = locator.resolve_tool(tool_id, binary, force=force)
@@ -187,6 +206,8 @@ def check_tool(tool_id: str, *, force: bool = True, smoke: bool = True) -> ToolC
         auth_status=auth_status,
         auth_detail=auth_detail,
         install_hint="" if resolved.available else install_hint(tool_id),
+        policy_blocked=policy_blocked,
+        ui_status=_ui_status(resolved.available, auth_status, policy_blocked),
     )
 
 

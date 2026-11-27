@@ -292,12 +292,24 @@ def ai_reflect(target_id: str, provider: Optional[str] = None) -> dict[str, Any]
 
     Args:
         target_id: Investigation id.
-        provider: Optional provider override (ollama, lmstudio, gemini, deepseek, openai_compat).
+        provider: Optional provider override (local_embedded, ollama, lmstudio, gemini, deepseek, openai_compat).
 
     Returns:
         Reflection result (or clean disabled/unavailable status when offline).
     """
     return _service.ai_reflect(target_id, provider=provider)
+
+
+@mcp.tool(meta=_APP_CALLABLE_META)
+def overview(target_id: str) -> dict[str, Any]:
+    """Return a structured case overview (subject, accounts, emails, phones, domains, repos, alerts)."""
+    return _service.overview(target_id)
+
+
+@mcp.tool(meta=_APP_CALLABLE_META)
+def visuals(target_id: str) -> dict[str, Any]:
+    """List harvested/uploaded visual assets, EXIF metadata, and pHash/dHash similarity clusters."""
+    return _service.visuals(target_id)
 
 
 WORKBENCH_UI_URI = "ui://ai-osint-hub/workbench.html"
@@ -642,7 +654,7 @@ ul.list li:last-child { border-bottom: none; }
 
   rpcRequest("ui/initialize", {
     protocolVersion: "2025-06-18",
-    appInfo: { name: "AI OSINT Hub Workbench", version: "2.0.0" },
+    appInfo: { name: "AI OSINT Hub Workbench", version: "2.1.0" },
     appCapabilities: {}
   }).then(function () {
     window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*");
@@ -700,6 +712,8 @@ def open_workbench_view(target_id: str = "") -> dict[str, Any]:
         payload["graph_summary"] = st.get("graph_summary")
         payload["analytics"] = _service.analytics(tid)
         payload["timeline"] = _service.timeline(tid)
+        payload["overview"] = _service.overview(tid)
+        payload["visuals"] = _service.visuals(tid)
     return payload
 
 

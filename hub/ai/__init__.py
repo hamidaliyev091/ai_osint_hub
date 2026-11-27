@@ -15,7 +15,13 @@ from hub.ai.config import (
     save_ai_config,
     update_ai_config,
 )
-from hub.ai.embeddings import correlate_texts, deterministic_text_similarity, embed_texts
+from hub.ai.embeddings import (
+    correlate_texts,
+    deterministic_text_similarity,
+    embed_image_bytes,
+    embed_texts,
+    fastembed_availability,
+)
 from hub.ai.models import (
     AI_PRESETS_CATALOG,
     AIConfig,
@@ -89,6 +95,8 @@ __all__ = [
     "run_case_reflection",
     "analyze_media_url",
     "embed_texts",
+    "embed_image_bytes",
+    "fastembed_availability",
     "correlate_texts",
     "deterministic_text_similarity",
 ]

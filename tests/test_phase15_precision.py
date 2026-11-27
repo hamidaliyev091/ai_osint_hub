@@ -155,7 +155,8 @@ class TestRoleSemantics:
         assert is_functional_predicate("HAS_ATTRIBUTE:clue_field") is False
         assert is_functional_predicate("HAS_ATTRIBUTE:provenance") is False
         assert is_functional_predicate("HAS_ATTRIBUTE:registered") is True
-        assert is_functional_predicate("HAS_EMAIL") is True
+        assert is_functional_predicate("HAS_EMAIL") is False
+        assert is_functional_predicate("HAS_PHONE") is True
 
     def test_mail_domain_and_registrable_parent_do_not_contradict(
             self, store_factory):

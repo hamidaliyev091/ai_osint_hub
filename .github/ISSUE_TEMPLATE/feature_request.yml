@@ -1,0 +1,28 @@
+name: Feature or Collector Request
+description: Propose a new passive collector, ERKG improvement, or Workbench capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Investigation problem solved
+      description: What analyst workflow or intelligence accuracy gap does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed design & invariants
+      description: Explain CLI/MCP/Web parity, deterministic zero-LLM core impact, and SSRF/quarantine/policy boundaries.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety-checks
+    attributes:
+      label: Safety & Non-Intrusiveness Check
+      options:
+        - label: Passive/public source or gated behind `allow_active_recon=True` / `INTRUSIVE_BLOCKED`
+          required: true
+        - label: Compatible with `shell=False` and `assert_safe_host` / `fetch_safe`
+          required: true

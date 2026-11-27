@@ -19,7 +19,7 @@ GET  /api/investigations/{id}/report      md | json | html evidence-cited dossie
 
 Security: external OSINT strings returned by this API are sanitized
 (:func:`hub.security.quarantine.sanitize_untrusted`) and the browser only ever
-inserts them with ``textContent`` — never ``innerHTML``.
+inserts them with ``textContent`` — never raw HTML injection.
 """
 
 from __future__ import annotations
@@ -27,17 +27,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
+import html
 import inspect
+import io
 import json
 import re
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import quote
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -54,7 +59,26 @@ from hub.security.quarantine import sanitize_untrusted
 from hub.service import InvestigationService
 
 APP_TITLE = "AI OSINT Hub Intelligence Workbench"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
+
+MAX_VISUAL_UPLOAD_BYTES = 5 * 1024 * 1024
+_SAFE_TARGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SAFE_MEDIA_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+_ALLOWED_MEDIA_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+}
+_PIL_FORMAT_TO_EXT: dict[str, str] = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "WEBP": ".webp",
+    "GIF": ".gif",
+    "ICO": ".ico",
+}
 
 STREAM_POLL_INTERVAL_SEC = 0.4
 #: SSE comment heartbeat — 2 s keeps proxies/browsers from buffering/aborting.
@@ -136,6 +160,7 @@ class AIConfigRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     enabled: Optional[bool] = None
+    mode: Optional[str] = None
     preset: Optional[str] = None
     provider: Optional[str] = None
     model: Optional[str] = None
@@ -422,6 +447,453 @@ def _fallback_diff(service: InvestigationService, id_a: str, id_b: str) -> dict[
 
 def _error_payload(message: str) -> dict[str, Any]:
     return {"status": "error", "errors": [message]}
+
+
+def _enrich_tool_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Ensure every tool row exposes ``policy_blocked`` and ``ui_status`` cleanly."""
+    enriched: list[dict[str, Any]] = []
+    counts = {"ready": 0, "blocked": 0, "needs_key": 0, "missing": 0}
+    for row in rows or []:
+        item = dict(row)
+        mode_val = str(item.get("mode") or "").strip().lower()
+        policy_blocked = bool(item.get("policy_blocked")) or mode_val == "intrusive_blocked"
+        item["policy_blocked"] = policy_blocked
+        ui_status = str(item.get("ui_status") or "").strip().lower()
+        if not ui_status:
+            if policy_blocked:
+                ui_status = "blocked"
+            elif not item.get("available"):
+                ui_status = "missing"
+            elif str(item.get("auth_status") or "") in {"MISSING_KEY", "PARTIAL"}:
+                ui_status = "needs_key"
+            else:
+                ui_status = "ready"
+        item["ui_status"] = ui_status
+        counts[ui_status] = counts.get(ui_status, 0) + 1
+        enriched.append(item)
+    return enriched, counts
+
+
+def _infer_ai_mode(payload: dict[str, Any]) -> str:
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode in {"off", "local_embedded", "ollama", "cloud"}:
+        return mode
+    enabled = bool(payload.get("enabled"))
+    provider = str(payload.get("provider") or "disabled").strip().lower()
+    if not enabled or provider == "disabled":
+        return "off"
+    if provider == "local_embedded":
+        return "local_embedded"
+    if provider in {"ollama", "lmstudio"}:
+        return "ollama"
+    return "cloud"
+
+
+def _resolve_case_dir(service: InvestigationService, target_id: str) -> Path:
+    tid = str(target_id or "").strip()
+    if not tid or not _SAFE_TARGET_ID_RE.match(tid) or ".." in tid:
+        raise HTTPException(status_code=400, detail="invalid target_id")
+    state_root = Path(service.engine().state_root()).resolve()
+    case_dir = (state_root / tid).resolve()
+    if not case_dir.is_relative_to(state_root):
+        raise HTTPException(status_code=400, detail="invalid target_id")
+    return case_dir
+
+
+def _validate_media_filename(filename: str) -> tuple[str, str]:
+    name = str(filename or "").strip()
+    if (
+        not name
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or "\x00" in name
+        or not _SAFE_MEDIA_FILENAME_RE.match(name)
+    ):
+        raise HTTPException(status_code=400, detail="invalid media filename")
+    ext = Path(name).suffix.lower()
+    media_type = _ALLOWED_MEDIA_MIME.get(ext)
+    if not media_type:
+        raise HTTPException(status_code=400, detail="unsupported media file type")
+    return name, media_type
+
+
+def _resolve_media_file(service: InvestigationService, target_id: str, filename: str) -> tuple[Path, str]:
+    name, media_type = _validate_media_filename(filename)
+    case_dir = _resolve_case_dir(service, target_id)
+    for folder_name in ("media", "raw"):
+        folder = (case_dir / folder_name).resolve()
+        candidate = (folder / name).resolve()
+        if candidate.is_relative_to(folder) and candidate.is_file():
+            return candidate, media_type
+    raise HTTPException(status_code=404, detail=f"media file not found: {name}")
+
+
+def _inspect_image_bytes(raw_bytes: bytes) -> dict[str, Any]:
+    """Validate image bytes with Pillow and extract dimensions, EXIF, and hashes."""
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="empty image file")
+    if len(raw_bytes) > MAX_VISUAL_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="image exceeds 5 MB limit")
+    from hub.tools.visual_harvester import validate_image_bytes
+
+    ok, reason, _, _ = validate_image_bytes(raw_bytes)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason or "invalid image data")
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Pillow unavailable: {exc}")
+
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as probe:
+            probe.verify()
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            fmt = str(img.format or "").upper()
+            ext = _PIL_FORMAT_TO_EXT.get(fmt)
+            if not ext:
+                raise HTTPException(status_code=400, detail=f"unsupported image format: {fmt or 'unknown'}")
+            width, height = img.size
+            if width <= 0 or height <= 0 or width > 16384 or height > 16384:
+                raise HTTPException(status_code=400, detail="invalid image dimensions")
+
+            phash = ""
+            dhash = ""
+            try:
+                from hub.tools.builtin.media_forensics import compute_dhash, compute_phash
+
+                phash = compute_phash(img) or ""
+                dhash = compute_dhash(img) or ""
+            except Exception:  # noqa: BLE001
+                pass
+
+            exif_map: dict[str, str] = {}
+            try:
+                exif_obj = img.getexif()
+                tag_names = {
+                    0x010F: "Make",
+                    0x0110: "Model",
+                    0x0131: "Software",
+                    0x013B: "Artist",
+                    0x9003: "DateTimeOriginal",
+                    0x8298: "Copyright",
+                }
+                for tag_id, label in tag_names.items():
+                    val = exif_obj.get(tag_id)
+                    if val is not None and str(val).strip():
+                        exif_map[label] = _text(str(val), 180)
+            except Exception:  # noqa: BLE001
+                pass
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid image payload: {type(exc).__name__}")
+
+    return {
+        "format": fmt,
+        "ext": ext,
+        "media_type": _ALLOWED_MEDIA_MIME[ext],
+        "width": width,
+        "height": height,
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "size_bytes": len(raw_bytes),
+        "phash": phash,
+        "dhash": dhash,
+        "exif": exif_map,
+    }
+
+
+def _fallback_visuals(service: InvestigationService, target_id: str) -> dict[str, Any]:
+    """Deterministic media gallery + pHash similarity fallback when service.visuals is absent."""
+    case_dir = _resolve_case_dir(service, target_id)
+    payload = build_investigation_payload(service, target_id)
+    items: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+
+    # Collect ERKG attributes attached to URL / media entities
+    entity_attrs: dict[str, dict[str, Any]] = {}
+    for claim in payload.get("claims") or []:
+        pred = str(claim.get("predicate") or "")
+        if pred.startswith("HAS_ATTRIBUTE:") and claim.get("object_literal") is not None:
+            key = pred.split(":", 1)[1].strip().lower()
+            entity_attrs.setdefault(claim["subject_id"], {})[key] = claim["object_literal"]
+
+    media_entity_by_file: dict[str, dict[str, Any]] = {}
+    for ent in payload.get("entities") or []:
+        attrs = entity_attrs.get(ent["entity_id"], {})
+        local_file = str(attrs.get("local_file") or "")
+        if local_file:
+            media_entity_by_file[Path(local_file).name] = {"entity": ent, "attrs": attrs}
+
+    def _scan_dir(folder: Path, source_kind: str) -> None:
+        if not folder.is_dir():
+            return
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.name in seen_files:
+                continue
+            ext = path.suffix.lower()
+            if ext not in _ALLOWED_MEDIA_MIME:
+                continue
+            try:
+                raw = path.read_bytes()
+                if len(raw) > MAX_VISUAL_UPLOAD_BYTES * 2:
+                    continue
+                info = _inspect_image_bytes(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            seen_files.add(path.name)
+            linked = media_entity_by_file.get(path.name) or {}
+            attrs = linked.get("attrs") or {}
+            ent = linked.get("entity") or {}
+            exif = dict(info.get("exif") or {})
+            if attrs.get("exif_software") and "Software" not in exif:
+                exif["Software"] = _text(attrs["exif_software"], 180)
+            if attrs.get("exif_artist") and "Artist" not in exif:
+                exif["Artist"] = _text(attrs["exif_artist"], 180)
+            platform = "uploaded" if path.name.startswith("upload_") else (
+                "github" if "github" in path.name else (
+                    "gravatar" if "gravatar" in path.name else (
+                        "web" if "favicon" in path.name else source_kind
+                    )
+                )
+            )
+            items.append({
+                "id": f"vis_{info['sha256'][:12]}",
+                "filename": path.name,
+                "media_url": f"/api/investigations/{quote(target_id)}/media/{quote(path.name)}",
+                "source_url": _text(ent.get("value") or "", 400),
+                "entity_id": ent.get("entity_id"),
+                "platform": platform,
+                "source_label": platform,
+                "format": info["format"],
+                "width": info["width"],
+                "height": info["height"],
+                "size_bytes": info["size_bytes"],
+                "sha256": info["sha256"],
+                "phash": str(attrs.get("phash") or info["phash"] or ""),
+                "dhash": str(attrs.get("dhash") or info["dhash"] or ""),
+                "exif": exif,
+                "gps": None,
+                "matches": [],
+            })
+
+    _scan_dir(case_dir / "media", "harvested")
+    _scan_dir(case_dir / "raw", "artifact")
+
+    # Compute pHash / dHash pairwise similarity
+    clusters: list[dict[str, Any]] = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            a, b = items[i], items[j]
+            best_sim = None
+            kind_hit = ""
+            for hkind in ("phash", "dhash"):
+                ha, hb = a.get(hkind) or "", b.get(hkind) or ""
+                if len(ha) == 16 and len(hb) == 16:
+                    try:
+                        dist = (int(ha, 16) ^ int(hb, 16)).bit_count()
+                    except ValueError:
+                        continue
+                    if dist <= 6:
+                        sim = round((1.0 - (dist / 64.0)) * 100.0, 1)
+                        if best_sim is None or sim > best_sim:
+                            best_sim = sim
+                            kind_hit = hkind
+            if best_sim is not None:
+                a["matches"].append({
+                    "filename": b["filename"],
+                    "platform": b["platform"],
+                    "similarity_pct": best_sim,
+                    "hash_kind": kind_hit,
+                })
+                b["matches"].append({
+                    "filename": a["filename"],
+                    "platform": a["platform"],
+                    "similarity_pct": best_sim,
+                    "hash_kind": kind_hit,
+                })
+                clusters.append({
+                    "cluster_id": f"sim_{i}_{j}",
+                    "items": [a["filename"], b["filename"]],
+                    "similarity_pct": best_sim,
+                    "hash_kind": kind_hit,
+                })
+
+    return {
+        "status": "ok",
+        "target_id": target_id,
+        "count": len(items),
+        "items": items,
+        "clusters": clusters,
+    }
+
+
+def _fallback_upload_visual(
+    service: InvestigationService,
+    target_id: str,
+    filename: str,
+    raw_bytes: bytes,
+    source_label: str = "uploaded",
+) -> dict[str, Any]:
+    case_dir = _resolve_case_dir(service, target_id)
+    info = _inspect_image_bytes(raw_bytes)
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(filename or "image").stem).strip("_-") or "image"
+    safe_name = f"upload_{stem[:40]}_{info['sha256'][:10]}{info['ext']}"
+    media_dir = case_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    dest = (media_dir / safe_name).resolve()
+    if not dest.is_relative_to(media_dir.resolve()):
+        raise HTTPException(status_code=400, detail="invalid upload path")
+    dest.write_bytes(raw_bytes)
+    item = {
+        "id": f"vis_{info['sha256'][:12]}",
+        "filename": safe_name,
+        "media_url": f"/api/investigations/{quote(target_id)}/media/{quote(safe_name)}",
+        "platform": _text(source_label or "uploaded", 60),
+        "source_label": _text(source_label or "uploaded", 60),
+        "format": info["format"],
+        "width": info["width"],
+        "height": info["height"],
+        "size_bytes": info["size_bytes"],
+        "sha256": info["sha256"],
+        "phash": info["phash"],
+        "dhash": info["dhash"],
+        "exif": info["exif"],
+        "gps": None,
+        "matches": [],
+    }
+    return {"status": "ok", "target_id": target_id, "item": item}
+
+
+def _fallback_overview(service: InvestigationService, target_id: str) -> dict[str, Any]:
+    """Deterministic case overview fallback when service.overview is absent."""
+    payload = build_investigation_payload(service, target_id)
+    visuals = _fallback_visuals(service, target_id)
+    entities = payload.get("entities") or []
+    claims = payload.get("claims") or []
+    graph_nodes = (payload.get("graph") or {}).get("nodes") or []
+    node_meta = {n["id"]: n for n in graph_nodes}
+
+    subject_ent = None
+    for ent in entities:
+        if ent.get("type") == "person":
+            subject_ent = ent
+            break
+    if subject_ent is None and entities:
+        subject_ent = entities[0]
+
+    # Collect attributes on subject
+    subject_attrs: dict[str, str] = {}
+    if subject_ent:
+        sid = subject_ent["entity_id"]
+        for cl in claims:
+            if cl.get("subject_id") == sid and str(cl.get("predicate") or "").startswith("HAS_ATTRIBUTE:"):
+                k = cl["predicate"].split(":", 1)[1]
+                subject_attrs[k] = _text(cl.get("object_literal"), 200)
+
+    avatar_url = ""
+    if visuals.get("items"):
+        avatar_url = visuals["items"][0].get("media_url") or ""
+
+    accounts: list[dict[str, Any]] = []
+    emails: list[dict[str, Any]] = []
+    phones: list[dict[str, Any]] = []
+    domains: list[dict[str, Any]] = []
+    repos: list[dict[str, Any]] = []
+    ips: list[dict[str, Any]] = []
+    orgs: list[dict[str, Any]] = []
+    locations: list[dict[str, Any]] = []
+
+    for ent in entities:
+        n = node_meta.get(ent["entity_id"], {})
+        entry = {
+            "entity_id": ent["entity_id"],
+            "type": ent["type"],
+            "value": ent["value"],
+            "display_value": ent.get("display_value") or ent["value"],
+            "status": n.get("status", "SINGLE_SOURCE_LEAD"),
+            "confidence": n.get("confidence", 0.0),
+            "evidence_count": n.get("evidence_count", 0),
+        }
+        etype = ent.get("type")
+        if etype in {"social_profile", "service", "username"}:
+            val = str(ent.get("value") or "")
+            platform = etype
+            if "github.com" in val.lower():
+                platform = "github"
+            elif "gitlab.com" in val.lower():
+                platform = "gitlab"
+            elif val.startswith("http"):
+                platform = val.split("/")[2].replace("www.", "") if len(val.split("/")) > 2 else "web"
+            entry["platform"] = platform
+            if val.startswith("http://") or val.startswith("https://"):
+                entry["url"] = val
+            accounts.append(entry)
+        elif etype == "email":
+            emails.append(entry)
+        elif etype == "phone":
+            phones.append(entry)
+        elif etype in {"domain", "subdomain"}:
+            domains.append(entry)
+        elif etype == "repository":
+            val = str(ent.get("value") or "")
+            entry["url"] = val if val.startswith("http") else f"https://{val}"
+            repos.append(entry)
+        elif etype in {"ip", "asn"}:
+            ips.append(entry)
+        elif etype == "organization":
+            orgs.append(entry)
+        elif etype == "location":
+            locations.append(entry)
+
+    alerts: list[dict[str, Any]] = []
+    for con in payload.get("contradictions") or []:
+        alerts.append({
+            "kind": "contradiction",
+            "severity": "high",
+            "title": f"Contradiction on {con.get('predicate')}",
+            "detail": f"{con.get('subject')} ({'resolved' if con.get('resolved') else 'unresolved'})",
+        })
+    for hyp in payload.get("hypotheses") or []:
+        if str(hyp.get("status") or "").lower() in {"open", "inconclusive"}:
+            alerts.append({
+                "kind": "hypothesis",
+                "severity": "info",
+                "title": str(hyp.get("type") or "Hypothesis"),
+                "detail": str(hyp.get("question") or ""),
+            })
+
+    insights = payload.get("ai_insights") or []
+    ai_summary = insights[-1] if insights else None
+    subj_node = node_meta.get(subject_ent["entity_id"], {}) if subject_ent else {}
+    inv = payload.get("investigation") or {}
+    return {
+        "status": "ok",
+        "target_id": target_id,
+        "investigation_status": inv.get("status"),
+        "raw_input": inv.get("raw_input", ""),
+        "subject": {
+            "entity_id": subject_ent["entity_id"] if subject_ent else None,
+            "name": (subject_ent.get("display_value") or subject_ent.get("value")) if subject_ent else target_id,
+            "type": subject_ent.get("type") if subject_ent else "unknown",
+            "status": subj_node.get("status", "SINGLE_SOURCE_LEAD"),
+            "confidence": subj_node.get("confidence", 0.0),
+            "avatar_url": avatar_url,
+            "attributes": subject_attrs,
+            "locations": [loc["value"] for loc in locations],
+            "organizations": [org["value"] for org in orgs],
+        },
+        "accounts": accounts,
+        "emails": emails,
+        "phones": phones,
+        "domains": domains,
+        "repos": repos,
+        "ips": ips,
+        "alerts": alerts,
+        "ai_summary": ai_summary,
+        "visuals_preview": visuals.get("items", [])[:6],
+        "counts": payload.get("stats") or {},
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -862,11 +1334,16 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - health checks must not 500 the UI
             return JSONResponse(_error_payload(
                 f"tools check failed: {type(exc).__name__}: {exc}"), status_code=500)
+        enriched_rows, ui_counts = _enrich_tool_rows(result.get("tools", []))
         return JSONResponse(jsonable_encoder({
             "status": "ok",
-            "tools": result.get("tools", []),
+            "tools": enriched_rows,
             "available": result.get("available", 0),
             "total": result.get("total", 0),
+            "ready": ui_counts["ready"],
+            "blocked": ui_counts["blocked"],
+            "needs_key": ui_counts["needs_key"],
+            "missing": ui_counts["missing"],
             "checked_at": result.get("checked_at"),
         }))
 
@@ -1182,6 +1659,7 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
             return JSONResponse({
                 "status": "unavailable",
                 "enabled": False,
+                "mode": "off",
                 "provider": "disabled",
                 "available": False,
                 "providers": {},
@@ -1189,6 +1667,8 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
         try:
             result = await _call_maybe_async(
                 ai_layer.get_ai_status, probe_local=probe_local)
+            if isinstance(result, dict) and "mode" not in result:
+                result["mode"] = _infer_ai_mode(result)
         except Exception as exc:  # noqa: BLE001
             return JSONResponse(
                 _error_payload(f"ai status failed: {type(exc).__name__}: {exc}"),
@@ -1203,6 +1683,35 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
                 {"status": "unavailable", "errors": ["AI subsystem not available"]},
                 status_code=503)
         data = payload.model_dump(exclude_none=True)
+        mode_val = str(data.get("mode") or "").strip().lower()
+        if mode_val == "off":
+            data["enabled"] = False
+            data.setdefault("provider", "disabled")
+            data.setdefault("preset", "disabled")
+        elif mode_val == "local_embedded":
+            data["enabled"] = True
+            if not data.get("provider") or data.get("provider") == "disabled":
+                has_le = any(
+                    getattr(m, "value", "") == "local_embedded"
+                    for m in getattr(getattr(ai_layer, "AIProviderKind", object), "__members__", {}).values()
+                )
+                if has_le:
+                    data["provider"] = "local_embedded"
+                else:
+                    return JSONResponse(
+                        _error_payload("local_embedded provider requires fastembed backend"),
+                        status_code=400,
+                    )
+        elif mode_val == "ollama":
+            data["enabled"] = True
+            if not data.get("provider") or data.get("provider") in {"disabled", "local_embedded"}:
+                data["provider"] = "ollama"
+        elif mode_val == "cloud":
+            data["enabled"] = True
+            if data.get("provider") not in {"gemini", "deepseek", "openai_compat"}:
+                data["provider"] = "deepseek" if data.get("deepseek_api_key") else (
+                    "openai_compat" if data.get("openai_api_key") else "gemini"
+                )
         prov = str(data.get("provider") or "").strip().lower()
         if data.get("model"):
             model_field = {
@@ -1236,6 +1745,8 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
                 data[key_field] = data.pop("api_key")
         try:
             result = await _call_maybe_async(ai_layer.update_ai_config, data)
+            if isinstance(result, dict) and "mode" not in result:
+                result["mode"] = _infer_ai_mode(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -1304,6 +1815,120 @@ def create_app(service: Optional[InvestigationService] = None) -> FastAPI:
                 _error_payload(f"media analysis failed: {type(exc).__name__}: {exc}"),
                 status_code=500)
         return JSONResponse(jsonable_encoder(_value(result, 2000)))
+
+    # ── Overview, Visuals & Safe Case Media ────────────────────────
+
+    @app.get("/api/investigations/{target_id}/overview")
+    async def get_investigation_overview(target_id: str) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        try:
+            if hasattr(svc, "overview"):
+                result = await _call_maybe_async(svc.overview, target_id)
+            else:
+                result = _fallback_overview(svc, target_id)
+        except LookupError:
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"overview failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1500)))
+
+    @app.get("/api/investigations/{target_id}/visuals")
+    async def get_investigation_visuals(target_id: str) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        try:
+            if hasattr(svc, "visuals"):
+                result = await _call_maybe_async(svc.visuals, target_id)
+            else:
+                result = _fallback_visuals(svc, target_id)
+        except LookupError:
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"visuals failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", []))
+            if "not found" in message.lower():
+                raise HTTPException(status_code=404, detail=message)
+            return JSONResponse(jsonable_encoder(result), status_code=400)
+        return JSONResponse(jsonable_encoder(_value(result, 1500)))
+
+    @app.post("/api/investigations/{target_id}/visuals/upload")
+    async def post_upload_visual(
+        target_id: str,
+        file: UploadFile = File(...),
+        source_label: str = Form("uploaded"),
+    ) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        raw_bytes = await file.read(MAX_VISUAL_UPLOAD_BYTES + 1)
+        if len(raw_bytes) > MAX_VISUAL_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="uploaded image exceeds 5 MB limit")
+        content_type = (file.content_type or "").lower()
+        if content_type and not (
+            content_type.startswith("image/") and "svg" not in content_type
+        ):
+            raise HTTPException(status_code=400, detail=f"unsupported image content-type: {content_type}")
+        _inspect_image_bytes(raw_bytes)
+        orig_name = Path(file.filename or "upload.png").name
+        clean_label = _text(source_label or "uploaded", 60) or "uploaded"
+        try:
+            if hasattr(svc, "upload_visual"):
+                result = await asyncio.to_thread(
+                    _call,
+                    svc.upload_visual,
+                    target_id,
+                    orig_name,
+                    raw_bytes,
+                    source_label=clean_label,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+            else:
+                result = _fallback_upload_visual(
+                    svc, target_id, orig_name, raw_bytes, source_label=clean_label
+                )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                _error_payload(f"visual upload failed: {type(exc).__name__}: {exc}"),
+                status_code=500)
+        if isinstance(result, dict) and result.get("status") == "error":
+            message = "; ".join(str(err) for err in result.get("errors", [])) or "upload rejected"
+            raise HTTPException(status_code=400, detail=message)
+        return JSONResponse(jsonable_encoder(_value(result, 1500)))
+
+    @app.get("/api/investigations/{target_id}/media/{filename}")
+    def get_investigation_media(target_id: str, filename: str) -> Any:
+        if not _investigation_exists(svc, target_id):
+            raise HTTPException(status_code=404,
+                                detail=f"investigation not found: {target_id}")
+        resolved, media_type = _resolve_media_file(svc, target_id, filename)
+        return FileResponse(
+            path=str(resolved),
+            media_type=media_type,
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, max-age=300",
+            },
+        )
 
     # ── Demo Case / Portable Bundles / MCP Setup ───────────────────
 
@@ -1546,7 +2171,7 @@ def _ensure_html_document(content: str) -> str:
         "<style>body{background:#fbf1c7;color:#3c3836;font:14px/1.55 sans-serif;"
         "padding:32px}pre{white-space:pre-wrap;word-break:break-word;"
         "background:#f2e5bc;border:1px solid #d5c4a1;padding:16px;border-radius:6px}</style>"
-        f"</head><body><pre>{_text(text, 200_000)}</pre></body></html>"
+        f"</head><body><pre>{html.escape(_text(text, 200_000))}</pre></body></html>"
     )
 
 
@@ -1555,48 +2180,147 @@ def _ensure_html_document(content: str) -> str:
 # ════════════════════════════════════════════════════════════════════════
 
 WORKBENCH_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="clean-light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <title>AI OSINT Hub Intelligence Workbench</title>
 <!-- offline; replaces https://cdn.tailwindcss.com -->
 <style>
-:root {
+:root,
+[data-theme="clean-light"] {
+  color-scheme: light;
+  --bg: #f8fafc;
+  --panel: #ffffff;
+  --panel2: #f1f5f9;
+  --line: #e2e8f0;
+  --line-strong: #cbd5e1;
+  --text: #0f172a;
+  --text-body: #334155;
+  --muted: #64748b;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-ink: #ffffff;
+  --accent-soft: #eff6ff;
+  --secondary-accent: #0f766e;
+  --green: #15803d;
+  --green-bg: #dcfce7;
+  --green-bd: #86efac;
+  --olive: #4d7c0f;
+  --olive-bg: #ecfccb;
+  --olive-bd: #bef264;
+  --ochre: #b45309;
+  --ochre-bg: #fef3c7;
+  --ochre-bd: #fcd34d;
+  --crimson: #b91c1c;
+  --crimson-bg: #fee2e2;
+  --crimson-bd: #fca5a5;
+  --slate: #0f766e;
+  --slate-bg: #ccfbf1;
+  --slate-bd: #99f6e4;
+  --cy-edge: #94a3b8;
+  --cy-label-bg: #ffffff;
+}
+[data-theme="warm-paper"] {
   color-scheme: light;
   --bg: #fbf1c7;
   --panel: #f9f5d7;
   --panel2: #f2e5bc;
   --line: #d5c4a1;
+  --line-strong: #bdae93;
   --text: #282828;
   --text-body: #3c3836;
   --muted: #665c54;
   --accent: #af3a03;
-  --accent-hover: #b5381e;
+  --accent-hover: #932f02;
+  --accent-ink: #fbf1c7;
+  --accent-soft: #f6ead0;
+  --secondary-accent: #076678;
   --green: #427b58;
+  --green-bg: #e8eed8;
+  --green-bd: #8ea67c;
   --olive: #79740e;
+  --olive-bg: #e8eed8;
+  --olive-bd: #a39e4b;
   --ochre: #b57614;
+  --ochre-bg: #f6ead0;
+  --ochre-bd: #d7a64f;
   --crimson: #9d0006;
+  --crimson-bg: #f6e0dc;
+  --crimson-bd: #c96e6b;
   --slate: #076678;
+  --slate-bg: #e2ecef;
+  --slate-bd: #7ca5ae;
+  --cy-edge: #bdae93;
+  --cy-label-bg: #fbf1c7;
 }
-[data-theme="dark"] {
+[data-theme="midnight-slate"] {
   color-scheme: dark;
   --dark-legacy-bg: #0b1020;
+  --bg: #0b1120;
+  --panel: #111827;
+  --panel2: #1e293b;
+  --line: #293548;
+  --line-strong: #334155;
+  --text: #f1f5f9;
+  --text-body: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-ink: #ffffff;
+  --accent-soft: #172554;
+  --secondary-accent: #14b8a6;
+  --green: #4ade80;
+  --green-bg: #0f291e;
+  --green-bd: #166534;
+  --olive: #a3e635;
+  --olive-bg: #1e2912;
+  --olive-bd: #4d7c0f;
+  --ochre: #fbbf24;
+  --ochre-bg: #2b2110;
+  --ochre-bd: #b45309;
+  --crimson: #f87171;
+  --crimson-bg: #311518;
+  --crimson-bd: #991b1b;
+  --slate: #2dd4bf;
+  --slate-bg: #112a2b;
+  --slate-bd: #0f766e;
+  --cy-edge: #475569;
+  --cy-label-bg: #111827;
+}
+[data-theme="gruvbox-dark"] {
+  color-scheme: dark;
   --bg: #1d2021;
   --panel: #282828;
   --panel2: #32302f;
   --line: #504945;
+  --line-strong: #665c54;
   --text: #fbf1c7;
   --text-body: #ebdbb2;
   --muted: #a89984;
   --accent: #fe8019;
   --accent-hover: #d65d0e;
+  --accent-ink: #1d2021;
+  --accent-soft: #3c2614;
+  --secondary-accent: #83a598;
   --green: #8ec07c;
+  --green-bg: #1d2c21;
+  --green-bd: #427b58;
   --olive: #b8bb26;
+  --olive-bg: #262919;
+  --olive-bd: #79740e;
   --ochre: #fabd2f;
+  --ochre-bg: #332612;
+  --ochre-bd: #b57614;
   --crimson: #fb4934;
+  --crimson-bg: #361717;
+  --crimson-bd: #9d0006;
   --slate: #83a598;
+  --slate-bg: #17272c;
+  --slate-bd: #076678;
+  --cy-edge: #665c54;
+  --cy-label-bg: #282828;
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -1616,43 +2340,62 @@ header {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 16px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--line);
-  background: var(--panel2);
+  background: var(--panel);
   flex-wrap: wrap;
 }
+.brand-wrap { display: inline-flex; align-items: center; gap: 6px; }
 header h1 {
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 700;
   margin: 0;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
   color: var(--text);
+  white-space: nowrap;
+}
+.ver-pill {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--line);
 }
 header .pill {
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: 999px;
   border: 1px solid var(--line);
-  background: var(--panel);
+  background: var(--panel2);
   color: var(--slate);
 }
-header .muted { color: var(--muted); font-size: 12px; }
+header .muted { color: var(--muted); font-size: 11.5px; }
+.header-group { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#theme-select {
+  width: auto;
+  min-width: 122px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  background: var(--panel2);
+}
 main {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 344px minmax(0, 1fr) 360px;
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: 272px minmax(0, 1fr) 336px;
+  gap: 14px;
+  padding: 14px;
   max-width: 3440px;
   width: 100%;
   margin: 0 auto;
 }
-#workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 360px; }
-#workbench.rail-right-collapsed main { grid-template-columns: 344px minmax(0, 1fr) 0px; }
+#workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 336px; }
+#workbench.rail-right-collapsed main { grid-template-columns: 272px minmax(0, 1fr) 0px; }
 #workbench.rail-left-collapsed.rail-right-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 0px; }
 #workbench.rail-left-collapsed .intake-panel,
 #workbench.rail-right-collapsed .inspector-panel {
@@ -1663,14 +2406,14 @@ main {
 }
 @media (max-width: 1360px) {
   main {
-    grid-template-columns: 300px minmax(0, 1fr) 316px;
-    gap: 12px;
-    padding: 12px;
+    grid-template-columns: 240px minmax(0, 1fr) 304px;
+    gap: 10px;
+    padding: 10px;
   }
-  #workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 316px; }
-  #workbench.rail-right-collapsed main { grid-template-columns: 300px minmax(0, 1fr) 0px; }
+  #workbench.rail-left-collapsed main { grid-template-columns: 0px minmax(0, 1fr) 304px; }
+  #workbench.rail-right-collapsed main { grid-template-columns: 240px minmax(0, 1fr) 0px; }
 }
-@media (max-width: 1080px) {
+@media (max-width: 1040px) {
   main,
   #workbench.rail-left-collapsed main,
   #workbench.rail-right-collapsed main,
@@ -1686,7 +2429,7 @@ main {
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -1694,7 +2437,7 @@ main {
 }
 .panel > h2 {
   margin: 0;
-  padding: 8px 16px;
+  padding: 9px 14px;
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -1703,7 +2446,7 @@ main {
   background: var(--panel2);
   border-bottom: 1px solid var(--line);
 }
-.panel-body { padding: 16px; overflow: auto; min-height: 0; }
+.panel-body { padding: 14px; overflow: auto; min-height: 0; }
 label {
   display: block;
   font-size: 11px;
@@ -1718,8 +2461,8 @@ input, textarea, select {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: 6px;
+  padding: 6px 9px;
   font: inherit;
   font-size: 13px;
 }
@@ -1728,26 +2471,41 @@ input:focus, textarea:focus, select:focus {
   outline-offset: -1px;
   border-color: var(--accent);
 }
-textarea { min-height: 80px; resize: vertical; }
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill {
+  -webkit-text-fill-color: var(--text) !important;
+  -webkit-box-shadow: 0 0 0 1000px var(--bg) inset !important;
+  box-shadow: 0 0 0 1000px var(--bg) inset !important;
+  caret-color: var(--text) !important;
+  transition: background-color 9999s ease-out 0s;
+}
+textarea { min-height: 76px; resize: vertical; }
 button {
   background: var(--accent);
-  color: #fbf1c7;
+  color: var(--accent-ink);
   border: 1px solid var(--accent);
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 6px 12px;
   font: inherit;
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
+  white-space: nowrap;
 }
 button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.secondary {
   background: var(--panel2);
-  border-color: var(--line);
+  border-color: var(--line-strong);
   color: var(--text);
 }
 button.secondary:hover { background: var(--bg); border-color: var(--muted); }
-button.compact { padding: 4px 8px; font-size: 11.5px; }
+button.compact { padding: 4px 9px; font-size: 11.5px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .spacer { flex: 1; }
@@ -1755,26 +2513,220 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
 .tabs {
   display: flex;
   gap: 4px;
-  padding: 8px 16px;
+  padding: 6px 12px;
   background: var(--panel2);
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
 }
 .tab {
   background: transparent;
-  border-color: transparent;
+  border: 1px solid transparent;
   color: var(--muted);
   padding: 6px 12px;
-  border-radius: 4px;
+  border-radius: 6px;
+  font-size: 12.5px;
 }
+.tab:hover { color: var(--text); background: var(--bg); }
 .tab.active {
   background: var(--panel);
-  color: var(--text);
+  color: var(--accent);
   border-color: var(--line);
-  border-bottom: 2px solid var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 .tab-panel { display: none; flex: 1; min-height: 0; }
 .tab-panel.active { display: flex; flex-direction: column; }
+
+/* Cases rail & compact widgets */
+.case-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow: auto;
+  margin-top: 8px;
+}
+.case-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--text-body);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-weight: 500;
+  white-space: normal;
+}
+.case-item:hover { border-color: var(--line-strong); background: var(--panel2); }
+.case-item.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.case-item-title { font-size: 12px; font-weight: 700; color: var(--text); word-break: break-all; }
+.case-item-sub { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tools-mini-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-top: 8px;
+}
+.tool-stat-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  font-size: 11px;
+  background: var(--bg);
+  color: var(--text-body);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.tool-stat-btn:hover { border-color: var(--accent); background: var(--panel2); }
+.tool-stat-btn.blocked { border-color: var(--crimson-bd); color: var(--crimson); background: var(--crimson-bg); }
+.tool-stat-btn.needs-key { border-color: var(--ochre-bd); color: var(--ochre); background: var(--ochre-bg); }
+
+/* Overview screen */
+.overview-stack { display: flex; flex-direction: column; gap: 16px; max-width: 1240px; width: 100%; margin: 0 auto; }
+.overview-stack[hidden] { display: none !important; }
+.hero-card {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.avatar-box {
+  width: 72px;
+  height: 72px;
+  border-radius: 12px;
+  border: 2px solid var(--line-strong);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.avatar-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hero-meta { flex: 1; min-width: 220px; }
+.hero-name { font-size: 18px; font-weight: 700; color: var(--text); margin: 0 0 4px; }
+.kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+.kpi-tile {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.kpi-tile b { display: block; font-size: 19px; color: var(--text); line-height: 1.2; }
+.kpi-tile span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.ov-section h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+}
+.entity-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  cursor: pointer;
+}
+.entity-card:hover { border-color: var(--accent); }
+.entity-card a { color: var(--accent); text-decoration: none; font-size: 12px; word-break: break-all; }
+.entity-card a:hover { text-decoration: underline; }
+.alert-card {
+  background: var(--crimson-bg);
+  border: 1px solid var(--crimson-bd);
+  border-left: 4px solid var(--crimson);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.alert-card.info {
+  background: var(--panel2);
+  border-color: var(--line);
+  border-left-color: var(--slate);
+}
+.ai-brief-card {
+  background: var(--panel);
+  border: 1px solid var(--slate-bd);
+  border-left: 4px solid var(--slate);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+/* Visuals & Photos gallery */
+.visuals-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+.visual-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+}
+.visual-card:hover { border-color: var(--accent); }
+.visual-thumb {
+  width: 100%;
+  height: 164px;
+  background: var(--panel2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid var(--line);
+  overflow: hidden;
+}
+.visual-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.visual-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.sim-pill {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--green-bg);
+  color: var(--green);
+  border: 1px solid var(--green-bd);
+}
+.exif-pill {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  background: var(--panel2);
+  color: var(--text-body);
+  border: 1px solid var(--line);
+}
+
+/* Graph */
 #graph-wrap {
   position: relative;
   flex: 1;
@@ -1788,7 +2740,7 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   min-height: 344px;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
 }
 #graph {
   width: 100%;
@@ -1797,7 +2749,7 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   display: block;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
 }
 .graph-hidden {
   position: absolute !important;
@@ -1807,7 +2759,7 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   pointer-events: none;
 }
 #graph text { font-size: 11px; fill: var(--text-body); pointer-events: none; }
-#graph .edge-line { stroke: var(--line); stroke-width: 1.5; cursor: pointer; }
+#graph .edge-line { stroke: var(--line-strong); stroke-width: 1.5; cursor: pointer; }
 #graph .edge-line:hover { stroke: var(--accent); stroke-width: 2.4; }
 #graph .edge-line.path-highlight { stroke: var(--accent); stroke-width: 3.2; }
 #graph .edge-label { font-size: 9.5px; fill: var(--muted); }
@@ -1844,12 +2796,12 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   margin: 4px 0;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 6px;
   font-size: 12px;
 }
 .badge {
   display: inline-block;
-  padding: 2px 8px;
+  padding: 2px 7px;
   border-radius: 4px;
   font-size: 10.5px;
   font-weight: 700;
@@ -1860,18 +2812,13 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }
-.badge.CONFIRMED { background: #e8eed8; color: var(--green); border-color: #8ea67c; }
-.badge.CORROBORATED { background: #e8eed8; color: var(--olive); border-color: #a39e4b; }
-.badge.SINGLE_SOURCE_LEAD { background: #f6ead0; color: var(--ochre); border-color: #d7a64f; }
+.badge.CONFIRMED { background: var(--green-bg); color: var(--green); border-color: var(--green-bd); }
+.badge.CORROBORATED { background: var(--olive-bg); color: var(--olive); border-color: var(--olive-bd); }
+.badge.SINGLE_SOURCE_LEAD { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre-bd); }
 .badge.HYPOTHESIS { background: var(--panel2); color: var(--muted); border-color: var(--line); }
-.badge.CONTRADICTED { background: #f6e0dc; color: var(--crimson); border-color: #c96e6b; }
-.badge.COLLECTION_FAILURE { background: #f2e2dc; color: var(--crimson); border-color: var(--line); }
-.badge.AI_INFERRED { background: #e2ecef; color: var(--slate); border-color: #7ca5ae; }
-[data-theme="dark"] .badge.CONFIRMED { background: #1d2c21; border-color: #427b58; }
-[data-theme="dark"] .badge.CORROBORATED { background: #262919; border-color: #79740e; }
-[data-theme="dark"] .badge.SINGLE_SOURCE_LEAD { background: #332612; border-color: #b57614; }
-[data-theme="dark"] .badge.CONTRADICTED { background: #361717; border-color: #9d0006; }
-[data-theme="dark"] .badge.AI_INFERRED { background: #17272c; border-color: #076678; }
+.badge.CONTRADICTED { background: var(--crimson-bg); color: var(--crimson); border-color: var(--crimson-bd); }
+.badge.COLLECTION_FAILURE, .badge.BLOCKED { background: var(--crimson-bg); color: var(--crimson); border-color: var(--crimson-bd); }
+.badge.AI_INFERRED { background: var(--slate-bg); color: var(--slate); border-color: var(--slate-bd); }
 #inspector dl { margin: 8px 0 0; }
 #inspector dt {
   font-size: 10.5px;
@@ -1885,7 +2832,7 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
 #artifact-snippet {
   background: var(--panel2);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 8px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1901,14 +2848,15 @@ button.compact { padding: 4px 8px; font-size: 11.5px; }
   margin: 4px 0;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 6px;
 }
 #ui-message { min-height: 16px; color: var(--crimson); font-size: 12px; margin: 8px 0 0; }
 .dl-row {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 8px 16px;
+  align-items: center;
+  padding: 8px 14px;
   background: var(--panel2);
   border-bottom: 1px solid var(--line);
 }
@@ -1918,16 +2866,16 @@ a.dl-link {
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   background: var(--panel);
-  border-radius: 4px;
-  padding: 6px 12px;
+  border-radius: 6px;
+  padding: 5px 11px;
 }
 a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(40, 40, 40, 0.55);
+  background: rgba(15, 23, 42, 0.55);
   z-index: 60;
   display: flex;
   align-items: center;
@@ -1942,11 +2890,12 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   background: var(--panel);
   border: 1px solid var(--line);
   border-top: 3px solid var(--accent);
-  border-radius: 8px;
-  padding: 24px;
+  border-radius: 10px;
+  padding: 20px 22px;
 }
+.modal-card.wide { width: min(740px, 96vw); }
 .modal-card h2 { margin: 0 0 8px; font-size: 16px; color: var(--text); }
-.modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+.modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
 .modal-grid .full { grid-column: 1 / -1; }
 .cred-row {
   display: flex;
@@ -1965,26 +2914,26 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   font-weight: 700;
   letter-spacing: 0.03em;
 }
-.cred-badge.ok { color: var(--green); border-color: var(--green); background: #e8eed8; }
-.cred-badge.miss { color: var(--ochre); border-color: var(--ochre); background: #f6ead0; }
-.cred-badge.info { color: var(--slate); border-color: var(--slate); background: #e2ecef; }
+.cred-badge.ok { color: var(--green); border-color: var(--green-bd); background: var(--green-bg); }
+.cred-badge.miss { color: var(--ochre); border-color: var(--ochre-bd); background: var(--ochre-bg); }
+.cred-badge.info { color: var(--slate); border-color: var(--slate-bd); background: var(--slate-bg); }
 #graph-toolbar {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 8px 16px;
+  padding: 8px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--panel2);
 }
 #graph-toolbar button { padding: 4px 8px; font-size: 11.5px; }
-#node-search { flex: 1 1 150px; min-width: 120px; margin: 0; padding: 4px 8px; font-size: 12px; }
+#node-search { flex: 1 1 140px; min-width: 110px; margin: 0; padding: 4px 8px; font-size: 12px; }
 #cluster-filter { width: auto; min-width: 110px; margin: 0; padding: 4px 8px; font-size: 11.5px; }
 #type-filters {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
-  padding: 8px 16px;
+  gap: 5px;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
@@ -2003,24 +2952,30 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 .filter-pill {
   border: 1px solid var(--line);
   background: var(--panel2);
-  color: var(--text-body);
-  border-radius: 4px;
-  padding: 2px 8px;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 2px 9px;
   font-size: 11px;
+  font-weight: 500;
   cursor: pointer;
 }
-.filter-pill.active { border-color: var(--accent); color: #fbf1c7; background: var(--accent); }
-.filter-pill .count { opacity: 0.8; margin-left: 4px; }
+.filter-pill.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.filter-pill .count { opacity: 0.78; margin-left: 4px; }
 .node-dim { opacity: 0.18; }
 .node-match .node-circle { stroke: var(--accent); stroke-width: 4; }
 #ui-message.error { color: var(--crimson); font-weight: 600; }
-.pill.completed { color: var(--green); border-color: var(--green); background: #e8eed8; }
+.pill.completed { color: var(--green); border-color: var(--green-bd); background: var(--green-bg); }
 .rail-card {
-  margin-top: 16px;
-  padding: 8px 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
 }
 .rail-card summary {
   cursor: pointer;
@@ -2035,24 +2990,24 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  padding: 6px 0;
   border-bottom: 1px solid var(--line);
-  font-size: 11.5px;
+  font-size: 12px;
 }
 .tool-row:last-child { border-bottom: none; }
 .ai-box {
   background: var(--bg);
   border: 1px solid var(--line);
   border-left: 3px solid var(--slate);
-  border-radius: 6px;
-  padding: 16px;
-  margin-bottom: 16px;
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 14px;
 }
 .quarantine-alert {
-  background: #f6e0dc;
-  border: 1px solid var(--crimson);
+  background: var(--crimson-bg);
+  border: 1px solid var(--crimson-bd);
   color: var(--crimson);
-  border-radius: 4px;
+  border-radius: 6px;
   padding: 8px;
   margin-top: 8px;
   font-size: 12px;
@@ -2076,20 +3031,16 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   background: var(--panel);
   border: 1px solid var(--line);
   border-top: 4px solid var(--accent);
-  border-radius: 8px;
-  padding: 24px;
+  border-radius: 10px;
+  padding: 22px;
 }
-.first-run-card h3 {
-  margin: 0 0 8px;
-  font-size: 17px;
-  color: var(--text);
-}
+.first-run-card h3 { margin: 0 0 8px; font-size: 17px; color: var(--text); }
 .checklist-card {
-  margin-top: 16px;
-  padding: 12px 16px;
+  margin-top: 14px;
+  padding: 12px 14px;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
 }
 .checklist-card[hidden] { display: none !important; }
 .checklist-item {
@@ -2101,18 +3052,13 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   color: var(--text-body);
 }
 .checklist-item.done { color: var(--green); }
-.preset-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 8px;
-}
+.preset-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .preset-pill {
   border: 1px solid var(--line);
   background: var(--panel2);
   color: var(--text-body);
-  border-radius: 4px;
-  padding: 4px 8px;
+  border-radius: 6px;
+  padding: 4px 9px;
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
@@ -2120,12 +3066,12 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 .preset-pill.active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #fbf1c7;
+  color: var(--accent-ink);
 }
 .seg-toggle {
   display: inline-flex;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 6px;
   overflow: hidden;
   background: var(--bg);
 }
@@ -2137,10 +3083,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   padding: 4px 10px;
   font-size: 11.5px;
 }
-.seg-toggle button.active {
-  background: var(--accent);
-  color: #fbf1c7;
-}
+.seg-toggle button.active { background: var(--accent); color: var(--accent-ink); }
 .dossier-rendered {
   max-width: 75ch;
   margin: 0 auto;
@@ -2160,7 +3103,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
   background: var(--panel2);
   border-left: 3px solid var(--accent);
   color: var(--text-body);
-  border-radius: 0 4px 4px 0;
+  border-radius: 0 6px 6px 0;
 }
 .dossier-rendered ul, .dossier-rendered ol { margin: 8px 0; padding-left: 22px; }
 .dossier-rendered li { margin: 4px 0; }
@@ -2269,180 +3212,244 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 <body>
 <div id="workbench">
   <header>
-    <button id="toggle-left-rail" class="secondary compact" type="button" title="Toggle Left Rail">Rail</button>
-    <h1>AI OSINT Hub Intelligence Workbench</h1>
+    <button id="toggle-left-rail" class="secondary compact" type="button" title="Toggle Left Rail">Cases</button>
+    <span class="brand-wrap">
+      <h1>AI OSINT Hub</h1>
+      <span class="ver-pill mono">v2.1</span>
+    </span>
     <span id="status-pill" class="pill" aria-live="polite">idle</span>
-    <span id="target-label" class="muted"></span>
-    <span class="spacer"></span>
+    <span id="target-label" class="muted">no active case</span>
     <span id="stats-line" class="muted"></span>
-    <button id="open-cmd-palette" class="secondary compact" type="button" title="Command Palette (Ctrl+K / Cmd+K)">Cmd+K</button>
-    <button id="open-mcp-modal" class="secondary compact" type="button" aria-haspopup="dialog" aria-controls="mcp-setup-modal">MCP Setup</button>
-    <button id="toggle-theme" class="secondary compact" type="button" title="Toggle Light/Dark theme">Theme</button>
-    <button id="open-api-keys" class="secondary compact" type="button"
-            aria-haspopup="dialog" aria-controls="api-keys-modal">API Keys</button>
-    <button id="toggle-right-rail" class="secondary compact" type="button" title="Toggle Inspector">Inspector</button>
+    <span class="spacer"></span>
+    <span class="header-group">
+      <button id="open-new-investigation" class="compact" type="button">+ New Investigation</button>
+      <button id="btn-load-demo" class="secondary compact" type="button">Load Demo</button>
+      <button id="run-pivot" class="secondary compact" type="button">Run Next Pivot</button>
+      <button id="run-batch-pivots" class="secondary compact" type="button">Step Batch (3x)</button>
+    </span>
+    <span class="header-group">
+      <select id="theme-select" aria-label="Color theme" title="Switch workbench theme">
+        <option value="clean-light">Clean Light</option>
+        <option value="warm-paper">Warm Paper</option>
+        <option value="midnight-slate">Midnight Slate</option>
+        <option value="gruvbox-dark">Gruvbox Dark</option>
+      </select>
+      <button id="open-tools-modal" class="secondary compact" type="button" aria-haspopup="dialog" aria-controls="tools-modal">Tools</button>
+      <button id="open-api-keys" class="secondary compact" type="button" aria-haspopup="dialog" aria-controls="api-keys-modal">API Keys</button>
+      <button id="open-mcp-modal" class="secondary compact" type="button" aria-haspopup="dialog" aria-controls="mcp-setup-modal">MCP</button>
+      <button id="open-cmd-palette" class="secondary compact" type="button" title="Command Palette (Ctrl+K / Cmd+K)">Cmd+K</button>
+      <button id="toggle-right-rail" class="secondary compact" type="button" title="Toggle Inspector">Inspector</button>
+    </span>
   </header>
+
   <main>
-    <section class="panel intake-panel" aria-label="Intake and Case Rail">
-      <h2>Case &amp; Intake</h2>
+    <section class="panel intake-panel" aria-label="Cases, Tools &amp; AI">
+      <h2>Cases &amp; Environment</h2>
       <div class="panel-body">
-        <div class="rail-card" style="margin-top:0;margin-bottom:16px">
+        <div class="row">
+          <input id="case-filter" type="search" placeholder="Filter cases…" aria-label="Filter cases" style="flex:1">
+          <button id="refresh-cases-btn" class="secondary compact" type="button">Refresh</button>
+        </div>
+        <div id="case-list" class="case-list" aria-label="Investigations list">
+          <div class="muted" style="font-size:12px;padding:6px 2px">No cases loaded yet.</div>
+        </div>
+        <select id="case-select" aria-label="Select investigation" hidden>
+          <option value="">— current / new —</option>
+        </select>
+
+        <div class="rail-card">
           <div class="row">
-            <label for="case-select" style="margin:0;flex:1">Active Investigation</label>
-            <button id="refresh-cases-btn" class="secondary compact" type="button">Refresh</button>
-          </div>
-          <select id="case-select" aria-label="Select investigation" style="margin-top:4px">
-            <option value="">— current / new —</option>
-          </select>
-          <div class="row" style="margin-top:8px">
-            <select id="diff-target-select" aria-label="Compare against case" style="flex:1">
-              <option value="">Diff against case…</option>
-            </select>
-            <button id="run-diff-btn" class="secondary compact" type="button">Diff</button>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <button id="export-bundle-btn" class="secondary compact" type="button" title="Export portable .osintcase.zip">Export .osintcase.zip</button>
-            <label class="graph-toggle" style="font-size:11px">
-              <input id="export-redact-pii" type="checkbox"> Redact PII
-            </label>
-          </div>
-          <div class="row" style="margin-top:6px">
-            <button id="import-bundle-btn" class="secondary compact" type="button" title="Import .osintcase.zip bundle">Import .osintcase.zip</button>
-            <label class="graph-toggle" style="font-size:11px">
-              <input id="import-overwrite-bundle" type="checkbox"> Overwrite
-            </label>
-            <input id="bundle-file-input" type="file" accept=".zip,.osintcase.zip" hidden>
-          </div>
-        </div>
-
-        <div id="intake-presets" class="preset-bar" role="group" aria-label="Guided intake presets">
-          <button type="button" class="preset-pill active" data-preset="person">Person / Handle</button>
-          <button type="button" class="preset-pill" data-preset="domain">Domain / Org</button>
-          <button type="button" class="preset-pill" data-preset="media">Image / Media Forensics</button>
-          <button type="button" class="preset-pill" data-preset="custom">Custom Clue</button>
-        </div>
-        <p id="intake-preset-hint" class="muted" style="font-size:11.5px;margin:0 0 8px">
-          Preset: Person / Handle — provide a name, handle, or email to trace cross-platform identity.
-        </p>
-
-        <form id="intake" autocomplete="off">
-          <label for="in-raw">Free-form intelligence</label>
-          <textarea id="in-raw" placeholder="Paste OSINT notes, names, handles, emails, domains, phones, URLs, IPs…"></textarea>
-          <label for="in-name">Full name</label>
-          <input id="in-name" type="text" placeholder="Target display name">
-          <div class="grid2">
-            <div><label for="in-usernames">Usernames</label><input id="in-usernames" type="text" placeholder="comma or space separated"></div>
-            <div><label for="in-emails">Emails</label><input id="in-emails" type="text" placeholder="comma separated"></div>
-            <div><label for="in-domains">Domains</label><input id="in-domains" type="text" placeholder="comma separated"></div>
-            <div><label for="in-phones">Phones</label><input id="in-phones" type="text" placeholder="comma separated"></div>
-            <div><label for="in-org">Organization</label><input id="in-org" type="text" placeholder="name or comma-separated list"></div>
-            <div><label for="in-location">Location</label><input id="in-location" type="text" placeholder="comma separated"></div>
-            <div><label for="in-urls">URLs</label><input id="in-urls" type="text" placeholder="comma separated"></div>
-            <div><label for="in-ips">IPs</label><input id="in-ips" type="text" placeholder="comma separated"></div>
-          </div>
-          <label for="in-allow-domains">Scope allow-domains (comma separated, optional)</label>
-          <input id="in-allow-domains" type="text" placeholder="optional scope boundary">
-          <div class="row" style="margin-top:8px">
-            <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
-              <input id="in-active" type="checkbox" style="width:auto;margin-right:6px"> Allow active recon
-            </label>
-            <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
-              <input id="in-wait" type="checkbox" style="width:auto;margin-right:6px"> Wait for completion
-            </label>
-          </div>
-          <details style="margin-top:8px">
-            <summary class="muted" style="cursor:pointer;font-size:12px">Budgets &amp; thresholds</summary>
-            <div class="grid2" style="margin-top:8px">
-              <div><label for="in-max-iterations">Max iterations</label><input id="in-max-iterations" type="number" value="16" min="1" max="500"></div>
-              <div><label for="in-max-tool-calls">Max tool calls</label><input id="in-max-tool-calls" type="number" value="20" min="1" max="1000"></div>
-              <div><label for="in-timeout">Wall clock (s)</label><input id="in-timeout" type="number" value="600" min="5"></div>
-              <div><label for="in-threshold">Min pivot score</label><input id="in-threshold" type="number" value="0.12" min="0" max="1" step="0.01"></div>
-            </div>
-          </details>
-          <div class="row" style="margin-top:16px">
-            <button id="run-investigation" type="submit">Start Investigation</button>
-            <button id="run-pivot" class="secondary" type="button">Run Next Pivot</button>
-            <button id="run-batch-pivots" class="secondary compact" type="button">Step Batch (3x)</button>
-            <button id="clear-form" class="secondary compact" type="button">Clear Form</button>
-          </div>
-          <p id="ui-message" role="alert"></p>
-        </form>
-
-        <details id="tools-health-drawer" class="rail-card">
-          <summary>32-Tool Health &amp; Scope Policy</summary>
-          <div class="row" style="margin-top:8px">
-            <span id="tools-summary-badge" class="badge">checking…</span>
+            <strong style="font-size:11.5px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text)">Tools &amp; Policy</strong>
             <span class="spacer"></span>
+            <span id="tools-summary-badge" class="badge">checking…</span>
+          </div>
+          <div id="tools-mini-counts" class="tools-mini-grid">
+            <button type="button" class="tool-stat-btn" data-open-tools="ready"><span>Ready</span><strong class="mono" id="tools-count-ready">0</strong></button>
+            <button type="button" class="tool-stat-btn blocked" data-open-tools="blocked"><span>Blocked</span><strong class="mono" id="tools-count-blocked">0</strong></button>
+            <button type="button" class="tool-stat-btn needs-key" data-open-tools="needs_key"><span>Needs Key</span><strong class="mono" id="tools-count-keys">0</strong></button>
+            <button type="button" class="tool-stat-btn" data-open-tools="missing"><span>Missing</span><strong class="mono" id="tools-count-missing">0</strong></button>
+          </div>
+          <div id="scope-policy-summary" class="muted mono" style="font-size:10.5px;margin-top:8px">Default: passive-only, SSRF-guarded</div>
+          <div class="row" style="margin-top:8px">
+            <button id="open-tools-drawer-btn" class="secondary compact" type="button">View Tools</button>
             <button id="refresh-tools-btn" class="secondary compact" type="button">Refresh</button>
             <button id="run-doctor-btn" class="secondary compact" type="button">Doctor</button>
           </div>
-          <div id="scope-policy-summary" class="muted mono" style="font-size:11px;margin-top:8px">Default: passive-only, SSRF-guarded</div>
-          <div id="tools-health-list" style="margin-top:8px;max-height:220px;overflow:auto"></div>
-        </details>
+        </div>
 
-        <details id="ai-config-drawer" class="rail-card">
-          <summary>AI &amp; Vision Config</summary>
+        <div class="rail-card">
+          <div class="row">
+            <strong style="font-size:11.5px;text-transform:uppercase;letter-spacing:0.05em;color:var(--text)">AI Assistant</strong>
+            <span class="spacer"></span>
+            <span id="ai-status-badge" class="badge AI_INFERRED">off</span>
+          </div>
+          <label for="ai-mode-select">AI Mode</label>
+          <select id="ai-mode-select" aria-label="AI Mode">
+            <option value="off">Off (Deterministic Only)</option>
+            <option value="local_embedded">Built-in Local AI (fastembed)</option>
+            <option value="ollama">Ollama (Local LLM / VLM)</option>
+            <option value="cloud">Cloud API (Gemini / DeepSeek / OpenAI)</option>
+          </select>
+          <div class="row" style="margin-top:8px">
+            <button id="run-reflect-quick" class="secondary compact" type="button">Run Reflection</button>
+            <span id="ai-config-message" class="muted" style="font-size:11px"></span>
+          </div>
+
+          <details id="ai-config-drawer" style="margin-top:8px">
+            <summary style="font-size:11px;color:var(--muted)">Advanced AI Settings</summary>
+            <div style="margin-top:8px">
+              <div class="row">
+                <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
+                  <input id="ai-enabled" type="checkbox" style="width:auto;margin-right:6px"> Enable AI Reflection / VLM
+                </label>
+              </div>
+              <label for="ai-preset">Hardware Profile</label>
+              <select id="ai-preset">
+                <option value="disabled">disabled (zero-LLM core)</option>
+                <option value="cpu_light">cpu_light (CPU-only compact)</option>
+                <option value="vram_8gb">vram_8gb (8 GB VRAM + 32 GB RAM)</option>
+                <option value="vram_16gb_plus">vram_16gb_plus (16 GB+ VRAM)</option>
+                <option value="cloud_byok">cloud_byok (Cloud API BYOK)</option>
+              </select>
+              <label for="ai-provider">Provider</label>
+              <select id="ai-provider">
+                <option value="disabled">disabled</option>
+                <option value="local_embedded">local_embedded</option>
+                <option value="ollama">ollama (local)</option>
+                <option value="lmstudio">lmstudio (local)</option>
+                <option value="gemini">gemini</option>
+                <option value="deepseek">deepseek</option>
+                <option value="openai_compat">openai_compat</option>
+              </select>
+              <div class="grid2">
+                <div><label for="ai-model">Text Model</label><input id="ai-model" type="text" placeholder="gemma4"></div>
+                <div><label for="ai-vision-model">Vision Model</label><input id="ai-vision-model" type="text" placeholder="qwen2.5vl:7b"></div>
+                <div><label for="ai-num-ctx">Context (num_ctx)</label><input id="ai-num-ctx" type="number" value="8192" min="512" max="131072"></div>
+                <div><label for="ai-keep-alive">Keep Alive</label><input id="ai-keep-alive" type="text" value="2m" placeholder="90s"></div>
+              </div>
+              <label for="ai-base-url">Base URL (optional)</label>
+              <input id="ai-base-url" type="text" placeholder="http://127.0.0.1:11434">
+              <label for="ai-api-key">Provider API Key (write-only)</label>
+              <input id="ai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="optional cloud key">
+              <div class="row" style="margin-top:8px">
+                <button id="save-ai-config" class="compact" type="button">Save AI Config</button>
+                <button id="refresh-ai-status" class="secondary compact" type="button">Probe</button>
+              </div>
+              <div id="ai-models-status" class="muted mono" style="font-size:11px;margin-top:8px"></div>
+              <div id="ai-pull-commands" style="margin-top:6px"></div>
+            </div>
+          </details>
+        </div>
+
+        <details class="rail-card">
+          <summary>Bundles &amp; Case Diff</summary>
           <div style="margin-top:8px">
             <div class="row">
-              <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
-                <input id="ai-enabled" type="checkbox" style="width:auto;margin-right:6px"> Enable AI Reflection / VLM
-              </label>
-              <span class="spacer"></span>
-              <span id="ai-status-badge" class="badge AI_INFERRED">disabled</span>
+              <select id="diff-target-select" aria-label="Compare against case" style="flex:1">
+                <option value="">Diff against case…</option>
+              </select>
+              <button id="run-diff-btn" class="secondary compact" type="button">Diff</button>
             </div>
-            <label for="ai-preset">Hardware Profile</label>
-            <select id="ai-preset">
-              <option value="disabled">disabled (zero-LLM core)</option>
-              <option value="cpu_light">cpu_light (CPU-only compact)</option>
-              <option value="vram_8gb">vram_8gb (8 GB VRAM + 32 GB RAM)</option>
-              <option value="vram_16gb_plus">vram_16gb_plus (16 GB+ VRAM)</option>
-              <option value="cloud_byok">cloud_byok (Cloud API BYOK)</option>
-            </select>
-            <label for="ai-provider">Provider</label>
-            <select id="ai-provider">
-              <option value="disabled">disabled</option>
-              <option value="ollama">ollama (local)</option>
-              <option value="lmstudio">lmstudio (local)</option>
-              <option value="gemini">gemini</option>
-              <option value="deepseek">deepseek</option>
-              <option value="openai_compat">openai_compat</option>
-            </select>
-            <div class="grid2">
-              <div><label for="ai-model">Text Model</label><input id="ai-model" type="text" placeholder="gemma4"></div>
-              <div><label for="ai-vision-model">Vision Model</label><input id="ai-vision-model" type="text" placeholder="qwen2.5vl:7b"></div>
-              <div><label for="ai-num-ctx">Context (num_ctx)</label><input id="ai-num-ctx" type="number" value="8192" min="512" max="131072"></div>
-              <div><label for="ai-keep-alive">Keep Alive</label><input id="ai-keep-alive" type="text" value="2m" placeholder="90s"></div>
-            </div>
-            <label for="ai-base-url">Base URL (optional)</label>
-            <input id="ai-base-url" type="text" placeholder="http://127.0.0.1:11434">
-            <label for="ai-api-key">Provider API Key (write-only)</label>
-            <input id="ai-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="optional cloud key">
             <div class="row" style="margin-top:8px">
-              <button id="save-ai-config" class="compact" type="button">Save AI Config</button>
-              <button id="refresh-ai-status" class="secondary compact" type="button">Probe</button>
+              <button id="export-bundle-btn" class="secondary compact" type="button" title="Export portable .osintcase.zip">Export .osintcase.zip</button>
+              <label class="graph-toggle" style="font-size:11px">
+                <input id="export-redact-pii" type="checkbox"> Redact PII
+              </label>
             </div>
-            <p id="ai-config-message" class="muted" style="font-size:11.5px;margin:8px 0 0"></p>
+            <div class="row" style="margin-top:6px">
+              <button id="import-bundle-btn" class="secondary compact" type="button" title="Import .osintcase.zip bundle">Import .osintcase.zip</button>
+              <label class="graph-toggle" style="font-size:11px">
+                <input id="import-overwrite-bundle" type="checkbox"> Overwrite
+              </label>
+              <input id="bundle-file-input" type="file" accept=".zip,.osintcase.zip" hidden>
+            </div>
           </div>
         </details>
       </div>
     </section>
 
-    <section class="panel visualization-panel" aria-label="Visualization">
+    <section class="panel visualization-panel" aria-label="Investigation Workspace">
       <nav class="tabs" role="tablist">
-        <button class="tab active" type="button" data-tab="graph">Graph</button>
+        <button class="tab active" type="button" data-tab="overview">Overview</button>
+        <button class="tab" type="button" data-tab="visuals">Visuals &amp; Photos</button>
+        <button class="tab" type="button" data-tab="graph">Graph</button>
         <button class="tab" type="button" data-tab="timeline">Timeline</button>
-        <button class="tab" type="button" data-tab="telemetry">Telemetry &amp; Pivots</button>
-        <button class="tab" type="button" data-tab="ai">AI &amp; Vision Lab</button>
         <button class="tab" type="button" data-tab="dossier">Dossier</button>
+        <button class="tab" type="button" data-tab="telemetry">Logs &amp; Telemetry</button>
       </nav>
-      <div id="tab-graph" class="tab-panel active">
+
+      <div id="tab-overview" class="tab-panel active">
+        <div class="panel-body">
+          <div id="overview-empty" class="overview-stack">
+            <div class="first-run-card" style="width:min(760px,100%);margin:12px auto">
+              <div class="row">
+                <span class="badge AI_INFERRED">V2.1 WORKBENCH</span>
+                <span class="muted mono" style="font-size:11px">Deterministic ERKG · Zero-LLM Default · SSRF-Guarded</span>
+              </div>
+              <h3 style="margin-top:10px">Start an Investigation or Explore the Synthetic Demo</h3>
+              <p class="muted" style="margin:0 0 14px;font-size:13px">
+                Every finding cites its immutable SHA-256 evidence artifact, detects contradictions automatically, harvests &amp; correlates visual avatars with perceptual hashes, and isolates untrusted external strings.
+              </p>
+              <div class="row">
+                <button id="btn-empty-new-inv" type="button">+ New Investigation</button>
+                <button class="secondary js-load-demo" type="button">Load Interactive Demo Case</button>
+                <button id="btn-import-bundle-empty" class="secondary" type="button">Import .osintcase.zip</button>
+                <button id="btn-open-mcp-empty" class="secondary" type="button">10-Second MCP Setup</button>
+              </div>
+              <div id="quickstart-checklist" class="checklist-card">
+                <div class="row" style="margin-bottom:6px">
+                  <strong style="font-size:12px;color:var(--text)">Quick-Start Checklist</strong>
+                  <span class="spacer"></span>
+                  <button id="dismiss-quickstart" class="secondary compact" type="button">Dismiss</button>
+                </div>
+                <div class="checklist-item" data-step="1"><span class="mono">[ ]</span> 1. Load Interactive Demo Case or launch a new investigation</div>
+                <div class="checklist-item" data-step="2"><span class="mono">[ ]</span> 2. Inspect entities, accounts, or perceptual-hash avatar matches</div>
+                <div class="checklist-item" data-step="3"><span class="mono">[ ]</span> 3. Press Ctrl/Cmd+K to jump between entities, pivots, and contradictions</div>
+                <div class="checklist-item" data-step="4"><span class="mono">[ ]</span> 4. Export an evidence-cited Dossier (Markdown/HTML/PDF) or .osintcase.zip</div>
+              </div>
+            </div>
+          </div>
+          <div id="overview-content" class="overview-stack" hidden></div>
+        </div>
+      </div>
+
+      <div id="tab-visuals" class="tab-panel">
+        <div class="dl-row">
+          <form id="visual-upload-form" class="row" style="flex:1">
+            <input id="visual-upload-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon" style="width:auto;max-width:250px;padding:3px 6px;font-size:12px">
+            <input id="visual-upload-label" type="text" placeholder="Source label (e.g. suspect_badge)" style="width:auto;min-width:170px;padding:4px 8px;font-size:12px">
+            <button id="visual-upload-btn" class="compact" type="submit">Upload Image for Forensics</button>
+            <span id="visual-upload-status" class="muted" style="font-size:11.5px"></span>
+          </form>
+        </div>
+        <div class="panel-body">
+          <div id="visuals-clusters" style="margin-bottom:12px"></div>
+          <div id="visuals-grid" class="visuals-grid">
+            <p class="muted">Select or start an investigation to inspect harvested &amp; uploaded images.</p>
+          </div>
+          <details class="rail-card" style="margin-top:18px">
+            <summary>Analyze Remote Image URL (SSRF-Guarded)</summary>
+            <div style="margin-top:10px">
+              <div class="row">
+                <input id="media-url-input" type="url" placeholder="https://..." style="flex:1">
+                <label class="graph-toggle">
+                  <input id="media-use-vlm" type="checkbox"> Use VLM
+                </label>
+                <button id="analyze-media-btn" class="compact" type="button">Analyze Media</button>
+              </div>
+              <pre id="media-results" class="dossier-pre" style="min-height:110px;margin-top:8px">No remote media analyzed yet.</pre>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div id="tab-graph" class="tab-panel">
         <div id="graph-toolbar" aria-label="Graph controls">
           <button id="zoom-in" type="button" class="secondary" title="Zoom in">Zoom +</button>
           <button id="zoom-out" type="button" class="secondary" title="Zoom out">Zoom −</button>
           <button id="zoom-reset" type="button" class="secondary" title="Reset view">Reset</button>
           <button id="toggle-graph-engine" type="button" class="secondary" title="Switch Cytoscape / SVG renderer">View: Auto</button>
-          <input id="node-search" type="search" placeholder="Search nodes…"
-                 aria-label="Search graph nodes">
+          <input id="node-search" type="search" placeholder="Search nodes…" aria-label="Search graph nodes">
           <select id="cluster-filter" aria-label="Filter by graph cluster">
             <option value="">All clusters</option>
           </select>
@@ -2460,29 +3467,13 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         <div id="graph-wrap">
           <div id="first-run-panel" class="first-run-overlay">
             <div class="first-run-card">
-              <div class="row">
-                <span class="badge AI_INFERRED">V2 WORKBENCH</span>
-                <span class="muted mono" style="font-size:11px">Deterministic ERKG · Zero-LLM Default</span>
-              </div>
-              <h3 style="margin-top:8px">Start Your Investigation or Load the Synthetic Demo</h3>
+              <h3>No Graph Data Yet</h3>
               <p class="muted" style="margin:0 0 12px;font-size:12.5px">
-                Every finding cites its immutable SHA-256 evidence artifact, detects contradictions automatically, and isolates untrusted external strings.
+                Load the synthetic Aurora Meridian demo case or launch a new investigation to explore the entity-resolved knowledge graph.
               </p>
               <div class="row">
-                <button id="btn-load-demo" type="button">Load Interactive Demo Case</button>
-                <button id="btn-import-bundle-empty" class="secondary" type="button">Import .osintcase.zip</button>
-                <button id="btn-open-mcp-empty" class="secondary" type="button">10-Second MCP Setup</button>
-              </div>
-              <div id="quickstart-checklist" class="checklist-card">
-                <div class="row" style="margin-bottom:6px">
-                  <strong style="font-size:12px;color:var(--text)">Quick-Start Checklist</strong>
-                  <span class="spacer"></span>
-                  <button id="dismiss-quickstart" class="secondary compact" type="button">Dismiss</button>
-                </div>
-                <div class="checklist-item" data-step="1"><span class="mono">[ ]</span> 1. Load Interactive Demo Case or launch a new investigation</div>
-                <div class="checklist-item" data-step="2"><span class="mono">[ ]</span> 2. Select any node in the graph to inspect its SHA-256 evidence artifact</div>
-                <div class="checklist-item" data-step="3"><span class="mono">[ ]</span> 3. Press Ctrl/Cmd+K to jump between entities, pivots, and contradictions</div>
-                <div class="checklist-item" data-step="4"><span class="mono">[ ]</span> 4. Export an evidence-cited Dossier (Markdown/HTML/PDF) or .osintcase.zip</div>
+                <button class="js-load-demo" type="button">Load Interactive Demo Case</button>
+                <button id="btn-graph-new-inv" class="secondary" type="button">+ New Investigation</button>
               </div>
             </div>
           </div>
@@ -2511,71 +3502,12 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         </div>
       </div>
 
-      <div id="tab-telemetry" class="tab-panel">
-        <div class="panel-body" id="telemetry">
-          <p class="muted">Start an investigation to see ledger, hypotheses, pivots, analytics and contradictions.</p>
-        </div>
-      </div>
-
-      <div id="tab-ai" class="tab-panel">
-        <div class="panel-body">
-          <div id="ai-lab-profile-card" class="ai-box">
-            <div class="row">
-              <strong style="color:var(--text)">Hardware Profile &amp; Local Models</strong>
-              <span id="ai-lab-badge" class="badge AI_INFERRED">disabled</span>
-              <span class="spacer"></span>
-              <button id="ai-lab-probe-btn" class="secondary compact" type="button">Detect Local Models</button>
-            </div>
-            <p class="muted" style="font-size:12px;margin:8px 0">
-              AI is strictly opt-in (<code>disabled</code> by default). Pick a hardware profile tuned for your GPU/CPU or Cloud BYOK, and copy any missing <code>ollama pull</code> commands below.
-            </p>
-            <div class="row" style="margin-top:8px">
-              <select id="ai-lab-preset" aria-label="AI Hardware Profile" style="max-width:320px">
-                <option value="disabled">disabled — Zero-LLM Deterministic Core</option>
-                <option value="cpu_light">cpu_light — CPU Light (no GPU)</option>
-                <option value="vram_8gb">vram_8gb — 8 GB VRAM + 32 GB RAM</option>
-                <option value="vram_16gb_plus">vram_16gb_plus — 16 GB+ VRAM Workstation</option>
-                <option value="cloud_byok">cloud_byok — Cloud API BYOK</option>
-              </select>
-              <button id="ai-lab-apply-btn" class="compact" type="button">Apply Profile</button>
-            </div>
-            <div id="ai-models-status" class="muted mono" style="font-size:11.5px;margin-top:10px"></div>
-            <div id="ai-pull-commands" style="margin-top:8px"></div>
-          </div>
-          <div class="ai-box">
-            <div class="row">
-              <strong style="color:var(--text)">AI Case Reflection (Quarantined)</strong>
-              <span class="badge AI_INFERRED">AI_INFERRED</span>
-              <span class="spacer"></span>
-              <button id="run-reflect-btn" class="compact" type="button">Run Reflection</button>
-            </div>
-            <p class="muted" style="font-size:12px;margin:8px 0">
-              AI reflections operate strictly over sanitized evidence packets and never auto-promote claims to CONFIRMED.
-            </p>
-            <div id="ai-insights-list"></div>
-          </div>
-          <div class="ai-box">
-            <strong style="color:var(--text)">Vision &amp; Media Forensics Lab</strong>
-            <p class="muted" style="font-size:12px;margin:8px 0">
-              SSRF-guarded media download, SHA-256, EXIF/GPS, 64-bit dHash/pHash, OCR, visual prompt-injection detection, and optional quarantined VLM extraction.
-            </p>
-            <div class="row" style="margin-top:8px">
-              <input id="media-url-input" type="url" placeholder="https://..." style="flex:1">
-              <label class="graph-toggle">
-                <input id="media-use-vlm" type="checkbox"> Use VLM
-              </label>
-              <button id="analyze-media-btn" class="compact" type="button">Analyze Media</button>
-            </div>
-            <pre id="media-results" class="dossier-pre" style="min-height:140px;margin-top:8px">No media analyzed yet.</pre>
-          </div>
-        </div>
-      </div>
-
       <div id="tab-dossier" class="tab-panel">
         <div class="dl-row">
           <a id="download-md" class="dl-link" href="#" download>Download Markdown</a>
           <a id="download-json" class="dl-link" href="#" download>Download JSON</a>
           <a id="download-html" class="dl-link" href="#" download>Download HTML</a>
+          <button id="dossier-export-bundle" class="secondary compact" type="button">Export .osintcase.zip</button>
           <span class="spacer"></span>
           <div class="seg-toggle" role="group" aria-label="Dossier view mode">
             <button id="dossier-mode-rendered" class="active" type="button">Rendered</button>
@@ -2590,6 +3522,24 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
           <pre id="dossier-text" class="dossier-pre" hidden>No dossier yet.</pre>
         </div>
       </div>
+
+      <div id="tab-telemetry" class="tab-panel">
+        <div class="panel-body">
+          <div class="ai-box">
+            <div class="row">
+              <strong style="color:var(--text)">AI Case Reflection (Quarantined)</strong>
+              <span class="badge AI_INFERRED">AI_INFERRED</span>
+              <span id="ai-lab-badge" class="badge">off</span>
+              <span class="spacer"></span>
+              <button id="run-reflect-btn" class="compact" type="button">Run Reflection</button>
+            </div>
+            <div id="ai-insights-list" style="margin-top:8px"></div>
+          </div>
+          <div id="telemetry">
+            <p class="muted">Start an investigation to see ledger, hypotheses, pivots, analytics and contradictions.</p>
+          </div>
+        </div>
+      </div>
     </section>
 
     <aside class="panel inspector-panel" aria-label="Artifact inspector">
@@ -2597,7 +3547,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       <div class="panel-body" id="inspector">
         <div class="row">
           <span id="epistemic-badge" class="badge">—</span>
-          <span id="inspector-title" class="muted" style="font-size:12px">select a node or edge</span>
+          <span id="inspector-title" class="muted" style="font-size:12px">select a node, card, or image</span>
         </div>
         <div class="row" style="margin-top:8px">
           <button id="inspect-pivot-btn" class="compact" type="button" disabled>Pivot Entity</button>
@@ -2609,7 +3559,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
           <dt>SHA-256</dt><dd id="artifact-sha">—</dd>
           <dt>Source tool</dt><dd id="artifact-tool">—</dd>
           <dt>Confidence</dt><dd id="artifact-confidence">—</dd>
-          <dt>Evidence snippet</dt><dd><pre id="artifact-snippet">Select a graph node or edge to inspect its cited evidence artifact.</pre></dd>
+          <dt>Evidence snippet</dt><dd><pre id="artifact-snippet">Select a graph node, overview card, or visual asset to inspect its cited evidence artifact.</pre></dd>
         </dl>
         <div id="inspector-quarantine"></div>
         <div id="inspector-contradictions"></div>
@@ -2617,6 +3567,81 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       </div>
     </aside>
   </main>
+
+  <div id="new-investigation-modal" class="modal-backdrop" hidden role="dialog"
+       aria-modal="true" aria-labelledby="new-inv-title">
+    <div class="modal-card wide">
+      <div class="row" style="margin-bottom:10px">
+        <h2 id="new-inv-title" style="margin:0">New Investigation</h2>
+        <span class="spacer"></span>
+        <button id="close-new-investigation" class="secondary compact" type="button">Close</button>
+      </div>
+      <div id="intake-presets" class="preset-bar" role="group" aria-label="Guided intake presets">
+        <button type="button" class="preset-pill active" data-preset="person">Person / Handle</button>
+        <button type="button" class="preset-pill" data-preset="domain">Domain / Org</button>
+        <button type="button" class="preset-pill" data-preset="media">Image / Media</button>
+        <button type="button" class="preset-pill" data-preset="custom">Custom Clue</button>
+      </div>
+      <p id="intake-preset-hint" class="muted" style="font-size:11.5px;margin:0 0 8px">
+        Preset: Person / Handle — provide a name, handle, or email to trace cross-platform identity.
+      </p>
+      <form id="intake" autocomplete="off">
+        <label for="in-raw">Primary clue or intelligence notes</label>
+        <textarea id="in-raw" placeholder="Name, username, email, phone, domain, or free-form OSINT clues…"></textarea>
+        <div class="grid2">
+          <div><label for="in-name">Full name</label><input id="in-name" type="text" placeholder="Target display name"></div>
+          <div><label for="in-usernames">Usernames</label><input id="in-usernames" type="text" placeholder="comma or space separated"></div>
+          <div><label for="in-emails">Emails</label><input id="in-emails" type="text" placeholder="comma separated"></div>
+          <div><label for="in-domains">Domains</label><input id="in-domains" type="text" placeholder="comma separated"></div>
+          <div><label for="in-phones">Phones</label><input id="in-phones" type="text" placeholder="comma separated"></div>
+          <div><label for="in-org">Organization</label><input id="in-org" type="text" placeholder="name or list"></div>
+          <div><label for="in-location">Location</label><input id="in-location" type="text" placeholder="city, country"></div>
+          <div><label for="in-urls">URLs</label><input id="in-urls" type="text" placeholder="comma separated"></div>
+          <div><label for="in-ips">IPs</label><input id="in-ips" type="text" placeholder="comma separated"></div>
+          <div><label for="in-allow-domains">Scope allow-domains</label><input id="in-allow-domains" type="text" placeholder="optional boundary"></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
+            <input id="in-active" type="checkbox" style="width:auto;margin-right:6px"> Allow active recon
+          </label>
+          <label class="row" style="margin:0;text-transform:none;letter-spacing:0">
+            <input id="in-wait" type="checkbox" style="width:auto;margin-right:6px"> Wait for completion
+          </label>
+        </div>
+        <details style="margin-top:10px">
+          <summary class="muted" style="cursor:pointer;font-size:12px">Budgets &amp; thresholds</summary>
+          <div class="grid2" style="margin-top:8px">
+            <div><label for="in-max-iterations">Max iterations</label><input id="in-max-iterations" type="number" value="16" min="1" max="500"></div>
+            <div><label for="in-max-tool-calls">Max tool calls</label><input id="in-max-tool-calls" type="number" value="20" min="1" max="1000"></div>
+            <div><label for="in-timeout">Wall clock (s)</label><input id="in-timeout" type="number" value="600" min="5"></div>
+            <div><label for="in-threshold">Min pivot score</label><input id="in-threshold" type="number" value="0.12" min="0" max="1" step="0.01"></div>
+          </div>
+        </details>
+        <div class="row" style="margin-top:16px">
+          <button id="run-investigation" type="submit">Start Investigation</button>
+          <button id="clear-form" class="secondary compact" type="button">Clear Form</button>
+        </div>
+        <p id="ui-message" role="alert"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="tools-modal" class="modal-backdrop" hidden role="dialog"
+       aria-modal="true" aria-labelledby="tools-modal-title">
+    <div class="modal-card wide">
+      <div class="row" style="margin-bottom:8px">
+        <h2 id="tools-modal-title" style="margin:0">Tools &amp; Policy Matrix</h2>
+        <span class="spacer"></span>
+        <button id="tools-modal-keys-btn" class="secondary compact" type="button">Configure API Keys</button>
+        <button id="close-tools-modal" class="secondary compact" type="button">Close</button>
+      </div>
+      <p class="muted" style="margin:0 0 10px;font-size:12px">
+        Intrusive credential attacks (such as Hydra) are strictly policy-blocked (<code>BLOCKED</code>) and never spawn. API-backed collectors show <code>NEEDS KEY</code> until configured.
+      </p>
+      <div id="tools-health-list" style="max-height:58vh;overflow:auto"></div>
+    </div>
+  </div>
+
   <div id="api-keys-modal" class="modal-backdrop" hidden role="dialog"
        aria-modal="true" aria-labelledby="api-keys-title">
     <div class="modal-card">
@@ -2693,7 +3718,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         <span class="kbd-hint mono">↑↓ · Enter · Esc</span>
       </div>
       <input id="cmd-palette-input" type="search" autocomplete="off"
-             placeholder="Jump to entity, switch tab, load demo, export bundle, toggle theme…">
+             placeholder="Jump to entity, switch tab, load demo, export bundle, switch theme…">
       <ul id="cmd-palette-results" class="cmd-list" role="listbox"></ul>
       <div class="row" style="margin-top:12px">
         <span class="spacer"></span>
@@ -2733,7 +3758,11 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     targetId: null,
     source: null,
     payload: null,
+    overview: null,
+    visuals: null,
     analytics: null,
+    toolsData: null,
+    casesList: [],
     cy: null,
     pathSourceId: null,
     selectedNode: null,
@@ -2743,17 +3772,17 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       renderer: "auto",
       shortestPathNodes: {},
       shortestPathEdges: {},
-      showHypotheses: false,   // guessed permutations hidden by default
-      showEdgeLabels: false    // permanent edge text off by default
+      showHypotheses: false,
+      showEdgeLabels: false
     }
   };
   var TYPE_COLORS = {
-    person: "#af3a03", username: "#076678", email: "#427b58", domain: "#b57614",
-    subdomain: "#d65d0e", ip: "#458588", asn: "#689d6a", organization: "#9d0006",
-    phone: "#076678", repository: "#665c54", social_profile: "#427b58",
-    breach_record: "#9d0006", crypto_address: "#b57614", service: "#79740e",
-    credential: "#cc241d", hash: "#7c6f64", port: "#d79921", location: "#689d6a",
-    url: "#458588"
+    person: "#2563eb", username: "#0f766e", email: "#15803d", domain: "#b45309",
+    subdomain: "#d97706", ip: "#0284c7", asn: "#0d9488", organization: "#b91c1c",
+    phone: "#0f766e", repository: "#475569", social_profile: "#16a34a",
+    breach_record: "#dc2626", crypto_address: "#ca8a04", service: "#65a30d",
+    credential: "#b91c1c", hash: "#64748b", port: "#d97706", location: "#059669",
+    url: "#0284c7"
   };
   var TYPE_SHAPES = {
     person: "diamond", organization: "round-rectangle", domain: "hexagon",
@@ -2895,6 +3924,19 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     };
   }
 
+  function openNewInvestigationModal() {
+    var modal = byId("new-investigation-modal");
+    if (!modal) { return; }
+    modal.hidden = false;
+    var raw = byId("in-raw");
+    if (raw) { try { raw.focus(); } catch (err) { /* ignore */ } }
+  }
+
+  function closeNewInvestigationModal() {
+    var modal = byId("new-investigation-modal");
+    if (modal) { modal.hidden = true; }
+  }
+
   function startInvestigation(event) {
     if (event) { event.preventDefault(); }
     clearError();
@@ -2905,12 +3947,15 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       body: JSON.stringify(collectRequest())
     }).then(function (data) {
       if (!data || !data.target_id) { throw new Error("no target_id returned"); }
+      closeNewInvestigationModal();
       state.targetId = data.target_id;
+      state.selectedNode = null;
       state.pathSourceId = null;
       state.graphView.shortestPathNodes = {};
       state.graphView.shortestPathEdges = {};
       setText("target-label", data.target_id);
       setStatus(data.status === "started" ? "running" : String(data.status || ""));
+      activateTab("overview");
       if (data.status === "started") { connectStream(); }
       updateDownloads();
       refreshCases();
@@ -2976,12 +4021,13 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       renderAiInsights(payload);
       updateScopeSummary(payload);
       setText("stats-line", summarize(payload));
+      fetchOverview();
+      fetchVisuals();
       fetchAnalytics();
+      fetchDossier();
+      fetchTimeline();
       clearError();
     }).catch(function (err) {
-      // Uvicorn may briefly reject fetches while a heavy subprocess/SSE poll is
-      // running. During an active investigation, retry silently instead of
-      // painting a red banner over a healthy run.
       if (isTransientNetworkError(err)) {
         if (state.targetId) {
           window.setTimeout(function () { refreshState(); }, 1200);
@@ -2989,6 +4035,366 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         return;
       }
       showError(err);
+    });
+  }
+
+  function inspectEntityById(entityId) {
+    if (!entityId || !state.payload || !state.payload.graph) { return; }
+    var nodes = state.payload.graph.nodes || [];
+    for (var i = 0; i < nodes.length; i += 1) {
+      if (nodes[i].id === entityId) {
+        inspectEntity(nodes[i], state.payload);
+        return;
+      }
+    }
+  }
+
+  function fetchOverview() {
+    if (!state.targetId) { return Promise.resolve(); }
+    return api("/api/investigations/" + encodeURIComponent(state.targetId) + "/overview")
+      .then(function (data) {
+        state.overview = data;
+        renderOverview(data);
+      })
+      .catch(function () { /* non-blocking overview */ });
+  }
+
+  function renderOverview(ov) {
+    var emptyEl = byId("overview-empty");
+    var contentEl = byId("overview-content");
+    if (!contentEl) { return; }
+    if (!ov || !state.targetId) {
+      if (emptyEl) { emptyEl.hidden = false; }
+      contentEl.hidden = true;
+      return;
+    }
+    if (emptyEl) { emptyEl.hidden = true; }
+    contentEl.hidden = false;
+    contentEl.textContent = "";
+
+    var subj = ov.subject || {};
+    var hero = make("div", "hero-card");
+    var avatar = make("div", "avatar-box");
+    if (subj.avatar_url) {
+      var img = document.createElement("img");
+      img.setAttribute("src", subj.avatar_url);
+      img.setAttribute("alt", String(subj.name || "Subject avatar"));
+      avatar.appendChild(img);
+    } else {
+      var labelStr = String(subj.name || ov.target_id || "?");
+      avatar.textContent = labelStr.slice(0, 2).toUpperCase();
+    }
+    hero.appendChild(avatar);
+
+    var meta = make("div", "hero-meta");
+    var titleRow = make("div", "row");
+    titleRow.appendChild(make("h2", "hero-name", subj.name || ov.target_id));
+    titleRow.appendChild(make("span", "badge " + String(subj.status || ""), subj.status || "LEAD"));
+    if (subj.confidence !== undefined && subj.confidence !== null) {
+      titleRow.appendChild(make("span", "muted mono", "conf " + Number(subj.confidence || 0).toFixed(2)));
+    }
+    meta.appendChild(titleRow);
+    if (ov.raw_input) {
+      meta.appendChild(make("div", "muted", String(ov.raw_input).slice(0, 220)));
+    }
+    var tagsRow = make("div", "row");
+    tagsRow.style.marginTop = "6px";
+    (subj.organizations || []).forEach(function (org) {
+      tagsRow.appendChild(make("span", "badge", "org: " + org));
+    });
+    (subj.locations || []).forEach(function (loc) {
+      tagsRow.appendChild(make("span", "badge", "loc: " + loc));
+    });
+    var attrs = subj.attributes || {};
+    Object.keys(attrs).slice(0, 4).forEach(function (k) {
+      tagsRow.appendChild(make("span", "badge", k + ": " + attrs[k]));
+    });
+    if (tagsRow.childNodes.length) { meta.appendChild(tagsRow); }
+    hero.appendChild(meta);
+
+    var heroActions = make("div", "row");
+    var btnPivot = make("button", "compact", "Run Next Pivot");
+    btnPivot.type = "button";
+    btnPivot.addEventListener("click", runNextPivot);
+    heroActions.appendChild(btnPivot);
+    var btnGraph = make("button", "secondary compact", "Open Graph");
+    btnGraph.type = "button";
+    btnGraph.addEventListener("click", function () { activateTab("graph"); });
+    heroActions.appendChild(btnGraph);
+    var btnDos = make("button", "secondary compact", "Dossier");
+    btnDos.type = "button";
+    btnDos.addEventListener("click", function () { activateTab("dossier"); });
+    heroActions.appendChild(btnDos);
+    hero.appendChild(heroActions);
+    contentEl.appendChild(hero);
+
+    var counts = ov.counts || {};
+    var kpi = make("div", "kpi-strip");
+    [
+      ["Entities", counts.entities || 0],
+      ["Accounts", counts.accounts !== undefined ? counts.accounts : (ov.accounts || []).length],
+      ["Claims", counts.claims || 0],
+      ["Artifacts", counts.artifacts || 0],
+      ["Contradictions", counts.contradictions || 0],
+      ["Visuals", counts.visuals !== undefined ? counts.visuals : (ov.visuals_preview || []).length]
+    ].forEach(function (pair) {
+      var tile = make("div", "kpi-tile");
+      tile.appendChild(make("b", "mono", String(pair[1])));
+      tile.appendChild(make("span", "", pair[0]));
+      kpi.appendChild(tile);
+    });
+    contentEl.appendChild(kpi);
+
+    var alerts = ov.alerts || [];
+    if (alerts.length) {
+      var alertSec = make("section", "ov-section");
+      alertSec.appendChild(make("h3", "", "Key Alerts & Contradictions (" + alerts.length + ")"));
+      var alertGrid = make("div", "cards-grid");
+      alerts.slice(0, 6).forEach(function (al) {
+        var isWarn = (al.severity === "high" || al.severity === "warning");
+        var card = make("div", "alert-card" + (isWarn ? "" : " info"));
+        var top = make("div", "row");
+        top.appendChild(make("span", "badge " + (isWarn ? "CONTRADICTED" : "HYPOTHESIS"),
+          String(al.kind || "alert").toUpperCase()));
+        top.appendChild(make("strong", "", String(al.title || "")));
+        card.appendChild(top);
+        if (al.detail) {
+          var det = make("div", "muted", String(al.detail));
+          det.style.marginTop = "4px";
+          card.appendChild(det);
+        }
+        alertGrid.appendChild(card);
+      });
+      alertSec.appendChild(alertGrid);
+      contentEl.appendChild(alertSec);
+    }
+
+    if (ov.ai_summary) {
+      var aiSec = make("section", "ov-section");
+      aiSec.appendChild(make("h3", "", "AI Executive Brief"));
+      var aiCard = make("div", "ai-brief-card");
+      var aiHead = make("div", "row");
+      aiHead.appendChild(make("span", "badge AI_INFERRED", ov.ai_summary.epistemic_provenance || "AI_INFERRED"));
+      aiHead.appendChild(make("span", "mono muted",
+        (ov.ai_summary.provider || "") + "/" + (ov.ai_summary.model || "")));
+      aiCard.appendChild(aiHead);
+      var aiBody = make("p", "", ov.ai_summary.summary || "");
+      aiBody.style.margin = "8px 0 0";
+      aiCard.appendChild(aiBody);
+      aiSec.appendChild(aiCard);
+      contentEl.appendChild(aiSec);
+    }
+
+    var accounts = ov.accounts || [];
+    var accSec = make("section", "ov-section");
+    accSec.appendChild(make("h3", "", "Verified & Discovered Accounts (" + accounts.length + ")"));
+    if (!accounts.length) {
+      accSec.appendChild(make("p", "muted", "No social accounts or usernames discovered yet."));
+    } else {
+      var accGrid = make("div", "cards-grid");
+      accounts.slice(0, 24).forEach(function (acc) {
+        var card = make("div", "entity-card");
+        card.addEventListener("click", function () { inspectEntityById(acc.entity_id); });
+        var top = make("div", "row");
+        top.appendChild(make("span", "badge", String(acc.platform || acc.type || "account").toUpperCase()));
+        top.appendChild(make("span", "spacer"));
+        top.appendChild(make("span", "badge " + String(acc.status || ""), acc.status || ""));
+        card.appendChild(top);
+        card.appendChild(make("strong", "mono", acc.handle || acc.display_value || acc.value || acc.canonical_value || ""));
+        var safeUrl = acc.url ? isSafeHref(acc.url) : null;
+        if (safeUrl) {
+          var link = document.createElement("a");
+          link.setAttribute("href", safeUrl);
+          link.setAttribute("target", "_blank");
+          link.setAttribute("rel", "noopener noreferrer");
+          link.textContent = safeUrl;
+          link.addEventListener("click", function (ev) { ev.stopPropagation(); });
+          card.appendChild(link);
+        }
+        accGrid.appendChild(card);
+      });
+      accSec.appendChild(accGrid);
+    }
+    contentEl.appendChild(accSec);
+
+    function renderGroup(title, items) {
+      if (!items || !items.length) { return; }
+      var sec = make("section", "ov-section");
+      sec.appendChild(make("h3", "", title + " (" + items.length + ")"));
+      var grid = make("div", "cards-grid");
+      items.slice(0, 18).forEach(function (item) {
+        var card = make("div", "entity-card");
+        card.addEventListener("click", function () { inspectEntityById(item.entity_id); });
+        var top = make("div", "row");
+        top.appendChild(make("span", "badge", String(item.type || title).toUpperCase()));
+        top.appendChild(make("span", "spacer"));
+        top.appendChild(make("span", "badge " + String(item.status || ""), item.status || ""));
+        card.appendChild(top);
+        card.appendChild(make("div", "mono", item.full_name || item.display_value || item.value || item.canonical_value || ""));
+        if (item.language) {
+          card.appendChild(make("span", "muted", "lang: " + item.language));
+        }
+        var safeUrl = item.url ? isSafeHref(item.url) : null;
+        if (safeUrl) {
+          var a = document.createElement("a");
+          a.setAttribute("href", safeUrl);
+          a.setAttribute("target", "_blank");
+          a.setAttribute("rel", "noopener noreferrer");
+          a.textContent = safeUrl;
+          a.addEventListener("click", function (ev) { ev.stopPropagation(); });
+          card.appendChild(a);
+        }
+        grid.appendChild(card);
+      });
+      sec.appendChild(grid);
+      contentEl.appendChild(sec);
+    }
+
+    renderGroup("Emails", ov.emails);
+    renderGroup("Phones", ov.phones);
+    renderGroup("Domains & Subdomains", ov.domains);
+    renderGroup("Repositories", ov.repos);
+    renderGroup("IPs & ASNs", ov.ips);
+  }
+
+  function fetchVisuals() {
+    if (!state.targetId) { return Promise.resolve(); }
+    return api("/api/investigations/" + encodeURIComponent(state.targetId) + "/visuals")
+      .then(function (data) {
+        state.visuals = data;
+        renderVisuals(data);
+      })
+      .catch(function () { /* non-blocking visuals */ });
+  }
+
+  function renderVisuals(vis) {
+    var grid = byId("visuals-grid");
+    var clusBox = byId("visuals-clusters");
+    if (!grid) { return; }
+    grid.textContent = "";
+    if (clusBox) { clusBox.textContent = ""; }
+    var items = (vis && vis.items) || [];
+    var clusters = (vis && vis.clusters) || [];
+    if (clusBox && clusters.length) {
+      var banner = make("div", "ai-brief-card");
+      var head = make("div", "row");
+      head.appendChild(make("span", "sim-pill", clusters.length + " Perceptual Match Cluster(s)"));
+      head.appendChild(make("strong", "", "Cross-Platform Visual Correlation"));
+      banner.appendChild(head);
+      clusters.forEach(function (cl) {
+        var names = cl.labels || cl.filenames || cl.items || [];
+        var simVal = cl.max_similarity_pct !== undefined ? cl.max_similarity_pct : (cl.similarity_pct || 100);
+        var row = make("div", "mono muted",
+          names.join(" ↔ ") + " — " + String(cl.hash_kind || "pHash") + " " +
+          String(simVal) + "%");
+        row.style.marginTop = "4px";
+        row.style.fontSize = "12px";
+        banner.appendChild(row);
+      });
+      clusBox.appendChild(banner);
+    }
+    if (!items.length) {
+      grid.appendChild(make("p", "muted", "No harvested or uploaded images for this case yet."));
+      return;
+    }
+    items.forEach(function (item) {
+      var card = make("div", "visual-card");
+      card.addEventListener("click", function () {
+        if (item.entity_id) { inspectEntityById(item.entity_id); }
+        else {
+          renderInspector("media: " + (item.filename || "image"), "SINGLE_SOURCE_LEAD", {
+            raw_output_sha256: item.sha256 || "—",
+            source_tool: item.source_label || item.platform || "visual_harvester",
+            confidence: 0.65,
+            raw_evidence_snippet: JSON.stringify(item, null, 2)
+          }, [], null, state.payload);
+        }
+      });
+      var thumb = make("div", "visual-thumb");
+      if (item.media_url) {
+        var img = document.createElement("img");
+        img.setAttribute("src", item.media_url);
+        img.setAttribute("alt", String(item.filename || item.source_label || "visual asset"));
+        thumb.appendChild(img);
+      }
+      card.appendChild(thumb);
+      var body = make("div", "visual-body");
+      var top = make("div", "row");
+      top.appendChild(make("span", "badge", String(item.source_label || item.platform || "image").toUpperCase()));
+      if (item.width && item.height) {
+        top.appendChild(make("span", "exif-pill mono", item.width + "×" + item.height));
+      }
+      body.appendChild(top);
+      body.appendChild(make("strong", "mono", item.filename || ""));
+      if (item.sha256) {
+        body.appendChild(make("div", "muted mono", "sha256: " + String(item.sha256).slice(0, 16) + "…"));
+      }
+      var exif = item.exif || {};
+      var exifKeys = Object.keys(exif);
+      if (exifKeys.length || item.gps) {
+        var exRow = make("div", "row");
+        if (item.gps) {
+          exRow.appendChild(make("span", "badge CONTRADICTED", "GPS PRESENT"));
+        }
+        exifKeys.slice(0, 3).forEach(function (k) {
+          exRow.appendChild(make("span", "exif-pill", k + ": " + String(exif[k]).slice(0, 28)));
+        });
+        body.appendChild(exRow);
+      }
+      var simMatches = item.similarity_matches || item.matches || [];
+      simMatches.slice(0, 2).forEach(function (m) {
+        body.appendChild(make("span", "sim-pill",
+          "Matches " + String(m.other_label || m.other_filename || m.platform || m.filename) +
+          " — " + String(m.hash_kind || "pHash") + " " +
+          String(m.similarity_pct || 100) + "%"));
+      });
+      card.appendChild(body);
+      grid.appendChild(card);
+    });
+  }
+
+  function uploadVisualFile(event) {
+    if (event) { event.preventDefault(); }
+    if (!state.targetId) {
+      setText("visual-upload-status", "Select or load an investigation first.");
+      return;
+    }
+    var fileInput = byId("visual-upload-file");
+    if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+      setText("visual-upload-status", "Choose a PNG, JPG, WEBP, or GIF image first.");
+      return;
+    }
+    var file = fileInput.files[0];
+    if (file.size > 5 * 1024 * 1024) {
+      setText("visual-upload-status", "File exceeds 5 MB limit.");
+      return;
+    }
+    var labelEl = byId("visual-upload-label");
+    var labelVal = labelEl ? labelEl.value.trim() : "";
+    var fd = new FormData();
+    fd.append("file", file);
+    if (labelVal) { fd.append("source_label", labelVal); }
+    setText("visual-upload-status", "Uploading & extracting forensics…");
+    fetch("/api/investigations/" + encodeURIComponent(state.targetId) + "/visuals/upload", {
+      method: "POST",
+      body: fd
+    }).then(function (resp) {
+      return resp.text().then(function (txt) {
+        var data = {};
+        try { data = txt ? JSON.parse(txt) : {}; } catch (err) { data = {}; }
+        if (!resp.ok) {
+          throw new Error(data.detail || data.errors || ("HTTP " + resp.status));
+        }
+        return data;
+      });
+    }).then(function () {
+      fileInput.value = "";
+      if (labelEl) { labelEl.value = ""; }
+      setText("visual-upload-status", "Uploaded and analyzed.");
+      fetchVisuals();
+      fetchOverview();
+    }).catch(function (err) {
+      setText("visual-upload-status", "Error: " + String(err.message || err));
     });
   }
 
@@ -3065,6 +4471,21 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     });
   }
 
+  function pickPrimaryNode(nodes, payload) {
+    if (!nodes || !nodes.length) { return null; }
+    var seeds = (payload && payload.investigation && payload.investigation.seed_entity_ids) || [];
+    var i;
+    for (i = 0; i < nodes.length; i += 1) {
+      if (nodes[i].type === "person") { return nodes[i]; }
+    }
+    if (seeds.length) {
+      for (i = 0; i < nodes.length; i += 1) {
+        if (seeds.indexOf(nodes[i].id) !== -1) { return nodes[i]; }
+      }
+    }
+    return nodes[0];
+  }
+
   function layoutGraph(nodes, edges) {
     var width = 960, height = 620, cx = width / 2, cy = height / 2;
     var positions = {}, targets = {};
@@ -3103,10 +4524,6 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       return positions[edge.subject] && positions[edge.object];
     });
 
-    // Deterministic radial relaxation: every node is anchored to its assigned
-    // concentric ring (radius + angle) with a strong radial spring; repulsion
-    // and edge springs only perturb. Coordinates are NEVER rectangle-clamped,
-    // so 150+ nodes can never line the canvas walls.
     var k_radial = 0.085, k_edge = 0.018, max_step = 8;
     for (var iteration = 0; iteration < 90; iteration += 1) {
       var displacement = {};
@@ -3140,7 +4557,6 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       ids.forEach(function (id) {
         if (id === centerId) { return; }
         var target = targets[id];
-        // Strong radial spring toward the assigned ring target point.
         displacement[id].x += (target.x - positions[id].x) * k_radial;
         displacement[id].y += (target.y - positions[id].y) * k_radial;
         positions[id].x += Math.max(-max_step, Math.min(max_step, displacement[id].x));
@@ -3148,14 +4564,13 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       });
     }
 
-    // Circular, aspect-preserving fit: scale all non-center nodes about (cx,cy)
-    // by max_radius, never by independent x/y clamps.
     var maxRadius = 1;
     ids.forEach(function (id) {
       if (id === centerId) { return; }
       var dx = positions[id].x - cx, dy = positions[id].y - cy;
       maxRadius = Math.max(maxRadius, Math.sqrt(dx * dx + dy * dy));
     });
+    // Circular aspect-preserving fit inside viewport radius.
     var fitRadius = Math.min(width, height) / 2 - 42;
     var fitScale = Math.min(1, fitRadius / maxRadius);
     ids.forEach(function (id) {
@@ -3252,7 +4667,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       group.setAttribute("transform", "translate(" + position.x + "," + position.y + ")");
       var circle = svgNode("circle", "node-circle");
       circle.setAttribute("r", String(nodeRadius));
-      circle.setAttribute("fill", TYPE_COLORS[node.type] || "#665c54");
+      circle.setAttribute("fill", TYPE_COLORS[node.type] || "#64748b");
       circle.addEventListener("click", function () { inspectEntity(node, payload); });
       var tip = svgNode("title");
       tip.textContent = node.type + ": " + node.value;
@@ -3276,7 +4691,82 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     svg.appendChild(viewport);
     applyGraphTransform();
     renderCytoscape(visibleNodes, visibleEdges, positions, payload);
+
+    // Auto-select primary subject node so Inspector is immediately informative
+    var stillPresent = state.selectedNode && visibleIds[state.selectedNode.id];
+    if (!stillPresent && visibleNodes.length) {
+      var primary = pickPrimaryNode(visibleNodes, payload);
+      if (primary) { inspectEntity(primary, payload); }
+    }
     clearError();
+  }
+
+  function themeToken(name, fallback) {
+    try {
+      var cs = window.getComputedStyle(document.documentElement);
+      var val = cs.getPropertyValue(name);
+      return (val && val.trim()) ? val.trim() : fallback;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  function cytoscapeStyles() {
+    var cyBg = themeToken("--bg", "#f8fafc");
+    var cyText = themeToken("--text", "#0f172a");
+    var cyMuted = themeToken("--muted", "#64748b");
+    var cyEdge = themeToken("--cy-edge", "#94a3b8");
+    var cyLabelBg = themeToken("--cy-label-bg", "#ffffff");
+    var cyAccent = themeToken("--accent", "#2563eb");
+    var cyCrimson = themeToken("--crimson", "#b91c1c");
+    var cyOchre = themeToken("--ochre", "#b45309");
+    return [
+      {
+        selector: "node",
+        style: {
+          "background-color": "data(color)",
+          "shape": "data(shape)",
+          "width": "data(size)",
+          "height": "data(size)",
+          "label": "data(label)",
+          "color": cyText,
+          "font-size": "11px",
+          "font-weight": "600",
+          "font-family": "Inter, Segoe UI, sans-serif",
+          "text-valign": "bottom",
+          "text-margin-y": 6,
+          "text-background-color": cyLabelBg,
+          "text-background-opacity": 0.92,
+          "text-background-padding": "3px",
+          "text-background-shape": "roundrectangle",
+          "border-width": 2,
+          "border-color": cyBg
+        }
+      },
+      {
+        selector: "edge",
+        style: {
+          "width": "data(width)",
+          "line-color": cyEdge,
+          "target-arrow-color": cyEdge,
+          "target-arrow-shape": "triangle",
+          "curve-style": "bezier",
+          "label": "data(label)",
+          "font-size": "9.5px",
+          "color": cyMuted,
+          "text-background-color": cyLabelBg,
+          "text-background-opacity": 0.92,
+          "text-background-padding": "3px",
+          "text-background-shape": "roundrectangle"
+        }
+      },
+      { selector: "node.hyp", style: { "border-style": "dashed", "border-color": cyOchre } },
+      { selector: "node.matched", style: { "border-width": 4, "border-color": cyAccent } },
+      { selector: "node.path-node", style: { "border-width": 4, "border-color": cyAccent } },
+      { selector: "edge.path-edge", style: { "line-color": cyAccent, "target-arrow-color": cyAccent, "width": 3.5 } },
+      { selector: "edge.contradicted", style: { "line-color": cyCrimson, "target-arrow-color": cyCrimson, "line-style": "dashed" } },
+      { selector: ".dimmed", style: { "opacity": 0.2 } }
+    ];
   }
 
   function syncGraphRendererVisibility() {
@@ -3310,7 +4800,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     visibleNodes.forEach(function (node) {
       nodeMap[node.id] = node;
       var deg = Number(degreeMap[node.id] || 0);
-      var size = Math.round(28 + Math.min(28, deg * 44));
+      var size = Math.round(30 + Math.min(28, deg * 44));
       var matchesSearch = search ?
         (String(node.type) + " " + String(node.value)).toLowerCase().indexOf(search) !== -1 : false;
       var classes = [];
@@ -3320,10 +4810,10 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       elements.push({
         data: {
           id: node.id,
-          label: String(node.value || "").slice(0, 22),
+          label: String(node.value || "").slice(0, 24),
           type: node.type,
           status: node.status,
-          color: TYPE_COLORS[node.type] || "#665c54",
+          color: TYPE_COLORS[node.type] || "#64748b",
           shape: TYPE_SHAPES[node.type] || "ellipse",
           size: size
         },
@@ -3354,51 +4844,22 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       try { state.cy.destroy(); } catch (err) { /* ignore */ }
       state.cy = null;
     }
-    var styleList = [
-      {
-        selector: "node",
-        style: {
-          "background-color": "data(color)",
-          "shape": "data(shape)",
-          "width": "data(size)",
-          "height": "data(size)",
-          "label": "data(label)",
-          "color": "#282828",
-          "font-size": "10px",
-          "font-family": "Inter, Segoe UI, sans-serif",
-          "text-valign": "bottom",
-          "text-margin-y": 5,
-          "border-width": 2,
-          "border-color": "#fbf1c7"
-        }
-      },
-      {
-        selector: "edge",
-        style: {
-          "width": "data(width)",
-          "line-color": "#bdae93",
-          "target-arrow-color": "#bdae93",
-          "target-arrow-shape": "triangle",
-          "curve-style": "bezier",
-          "label": "data(label)",
-          "font-size": "9px",
-          "color": "#665c54",
-          "text-background-color": "#fbf1c7",
-          "text-background-opacity": 0.9
-        }
-      },
-      { selector: "node.hyp", style: { "border-style": "dashed", "border-color": "#b57614" } },
-      { selector: "node.matched", style: { "border-width": 4, "border-color": "#af3a03" } },
-      { selector: "node.path-node", style: { "border-width": 4, "border-color": "#af3a03" } },
-      { selector: "edge.path-edge", style: { "line-color": "#af3a03", "target-arrow-color": "#af3a03", "width": 3.5 } },
-      { selector: "edge.contradicted", style: { "line-color": "#9d0006", "target-arrow-color": "#9d0006", "line-style": "dashed" } },
-      { selector: ".dimmed", style: { "opacity": 0.2 } }
-    ];
+    var useCose = visibleNodes.length > 1 && visibleNodes.length <= 160;
     state.cy = window.cytoscape({
       container: cyEl,
       elements: elements,
-      style: styleList,
-      layout: { name: "preset" },
+      style: cytoscapeStyles(),
+      layout: useCose ? {
+        name: "cose",
+        animate: false,
+        fit: true,
+        padding: 52,
+        nodeRepulsion: 24000,
+        nodeOverlap: 36,
+        idealEdgeLength: 160,
+        gravity: 0.25,
+        numIter: 600
+      } : { name: "preset" },
       minZoom: 0.25,
       maxZoom: 3.5,
       wheelSensitivity: 0.25
@@ -3411,7 +4872,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       var edge = edgeMap[evt.target.id()];
       if (edge && state.payload) { inspectClaim(edge, state.payload); }
     });
-    state.cy.fit(undefined, 28);
+    state.cy.fit(undefined, 40);
   }
 
   function zoomGraph(factor) {
@@ -3429,7 +4890,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     state.graphView.y = 0;
     state.graphView.scale = 1;
     applyGraphTransform();
-    if (state.cy) { state.cy.fit(undefined, 28); }
+    if (state.cy) { state.cy.fit(undefined, 40); }
   }
 
   function configureGraphInteraction() {
@@ -3481,7 +4942,6 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     state.graphView.showEdgeLabels = false;
     if (state.payload) { renderGraph(state.payload); }
     clearError();
-    setStatus("idle");
   }
 
   function firstArtifact(claims, payload) {
@@ -3821,12 +5281,10 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 
   function renderAiLabStatus(data) {
     var preset = String(data.preset || (data.enabled ? (data.provider === "ollama" ? "vram_8gb" : "cloud_byok") : "disabled"));
-    var labPreset = byId("ai-lab-preset");
-    if (labPreset && preset) { labPreset.value = preset; }
     var railPreset = byId("ai-preset");
     if (railPreset && preset) { railPreset.value = preset; }
     var labBadge = byId("ai-lab-badge");
-    if (labBadge) { labBadge.textContent = data.enabled ? (preset + " · " + String(data.provider || "")) : "disabled"; }
+    if (labBadge) { labBadge.textContent = data.enabled ? (preset + " · " + String(data.provider || "")) : "off"; }
 
     var statusEl = byId("ai-models-status");
     if (statusEl) {
@@ -3864,8 +5322,13 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     return api("/api/ai/status" + (probe ? "?probe_local=true" : "")).then(function (data) {
       var enabled = !!data.enabled;
       var provider = String(data.provider || "disabled");
+      var mode = String(data.mode || (!enabled || provider === "disabled" ? "off" :
+        (provider === "local_embedded" ? "local_embedded" :
+          ((provider === "ollama" || provider === "lmstudio") ? "ollama" : "cloud"))));
+      var modeSel = byId("ai-mode-select");
+      if (modeSel) { modeSel.value = mode; }
       var badge = byId("ai-status-badge");
-      if (badge) { badge.textContent = enabled ? provider : "disabled"; }
+      if (badge) { badge.textContent = enabled ? mode : "off"; }
       var enEl = byId("ai-enabled");
       if (enEl) { enEl.checked = enabled; }
       var provEl = byId("ai-provider");
@@ -3884,14 +5347,14 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       if (byId("ai-num-ctx")) { byId("ai-num-ctx").value = String(numCtxVal); }
       if (byId("ai-keep-alive")) { byId("ai-keep-alive").value = String(keepAliveVal); }
       var reachable = !!(data.active || data.available);
-      setText("ai-config-message", "AI status: " + (enabled ? provider : "disabled") +
-        (reachable ? " (active)" : " (idle)"));
+      setText("ai-config-message", enabled ? (provider + (reachable ? " active" : " ready")) : "deterministic only");
       renderAiLabStatus(data);
     }).catch(function () { /* ignore if ai subsystem absent */ });
   }
 
   function saveAiConfig(overrideBody) {
     var body = overrideBody || {
+      mode: byId("ai-mode-select") ? byId("ai-mode-select").value : undefined,
       enabled: byId("ai-enabled") ? !!byId("ai-enabled").checked : false,
       preset: byId("ai-preset") ? byId("ai-preset").value : undefined,
       provider: byId("ai-provider") ? byId("ai-provider").value : "disabled",
@@ -3903,14 +5366,14 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     };
     var apiKey = (!overrideBody && byId("ai-api-key")) ? byId("ai-api-key").value.trim() : "";
     if (apiKey) { body.api_key = apiKey; }
-    setText("ai-config-message", "Saving AI config…");
+    setText("ai-config-message", "Saving…");
     api("/api/ai/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }).then(function (data) {
       if (byId("ai-api-key")) { byId("ai-api-key").value = ""; }
-      setText("ai-config-message", "Saved AI config (" + String(data.provider || body.provider || "updated") + ").");
+      setText("ai-config-message", "Saved (" + String(data.mode || data.provider || "updated") + ")");
       refreshAiStatus(false);
     }).catch(function (err) {
       setText("ai-config-message", String(err.message || err));
@@ -3954,37 +5417,133 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       " · allow_domains: " + domains;
   }
 
+  function renderToolsModal(filterStatus) {
+    var list = byId("tools-health-list");
+    if (!list) { return; }
+    list.textContent = "";
+    var tools = (state.toolsData && state.toolsData.tools) || [];
+    var filtered = filterStatus ? tools.filter(function (t) { return t.ui_status === filterStatus; }) : tools;
+    if (!filtered.length) {
+      list.appendChild(make("p", "muted", "No tools match this filter."));
+      return;
+    }
+    filtered.forEach(function (tool) {
+      var row = make("div", "tool-row");
+      var left = make("div");
+      left.appendChild(make("strong", "mono", tool.tool_id || ""));
+      if (tool.display_name) {
+        left.appendChild(make("span", "muted", " · " + tool.display_name));
+      }
+      row.appendChild(left);
+      var right = make("div", "row");
+      if (tool.mode) {
+        right.appendChild(make("span", "muted mono", String(tool.mode)));
+      }
+      var uiSt = String(tool.ui_status || (tool.available ? "ready" : "missing")).toLowerCase();
+      var badgeCls = "badge CONFIRMED";
+      var label = "READY";
+      if (uiSt === "blocked" || tool.policy_blocked) {
+        badgeCls = "badge BLOCKED";
+        label = "BLOCKED";
+      } else if (uiSt === "needs_key") {
+        badgeCls = "badge SINGLE_SOURCE_LEAD";
+        label = "NEEDS KEY";
+      } else if (uiSt === "missing" || !tool.available) {
+        badgeCls = "badge COLLECTION_FAILURE";
+        label = "MISSING";
+      }
+      right.appendChild(make("span", badgeCls, label));
+      row.appendChild(right);
+      list.appendChild(row);
+    });
+  }
+
+  function openToolsModal(filterStatus) {
+    var modal = byId("tools-modal");
+    if (!modal) { return; }
+    modal.hidden = false;
+    renderToolsModal(filterStatus || "");
+  }
+
+  function closeToolsModal() {
+    var modal = byId("tools-modal");
+    if (modal) { modal.hidden = true; }
+  }
+
   function refreshToolsHealth() {
     api("/api/tools").then(function (data) {
-      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0) + " ready");
-      var list = byId("tools-health-list");
-      if (!list) { return; }
-      list.textContent = "";
-      (data.tools || []).forEach(function (tool) {
-        var row = make("div", "tool-row");
-        row.appendChild(make("span", "mono", tool.tool_id || ""));
-        var badgeCls = tool.available ? "badge CONFIRMED" : "badge COLLECTION_FAILURE";
-        row.appendChild(make("span", badgeCls, tool.available ? "ready" : "missing"));
-        list.appendChild(row);
-      });
+      state.toolsData = data;
+      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0));
+      setText("tools-count-ready", String(data.ready !== undefined ? data.ready : (data.available || 0)));
+      setText("tools-count-blocked", String(data.blocked || 0));
+      setText("tools-count-keys", String(data.needs_key || 0));
+      setText("tools-count-missing", String(data.missing || 0));
+      renderToolsModal("");
     }).catch(function () { /* ignore */ });
   }
 
   function runDoctorCheck() {
-    setText("tools-summary-badge", "running doctor…");
+    setText("tools-summary-badge", "checking…");
     api("/api/doctor", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provision: false })
     }).then(function (data) {
-      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0) + " ok");
+      setText("tools-summary-badge", (data.available || 0) + "/" + (data.total || 0));
       refreshToolsHealth();
     }).catch(function (err) { showError(err); });
+  }
+
+  function selectCaseById(tid) {
+    if (!tid) { return; }
+    state.targetId = tid;
+    state.selectedNode = null;
+    state.pathSourceId = null;
+    setText("target-label", tid);
+    var sel = byId("case-select");
+    if (sel) { sel.value = tid; }
+    renderCasesList();
+    updateDownloads();
+    refreshState();
+  }
+
+  function renderCasesList() {
+    var box = byId("case-list");
+    if (!box) { return; }
+    var filterEl = byId("case-filter");
+    var q = filterEl ? String(filterEl.value || "").trim().toLowerCase() : "";
+    var items = (state.casesList || []).filter(function (item) {
+      if (!q) { return true; }
+      return String(item.target_id || "").toLowerCase().indexOf(q) !== -1
+        || String(item.raw_input || "").toLowerCase().indexOf(q) !== -1;
+    });
+    box.textContent = "";
+    if (!items.length) {
+      box.appendChild(make("div", "muted", q ? "No matching cases." : "No cases yet."));
+      return;
+    }
+    items.forEach(function (item) {
+      var btn = make("button", "case-item" + (item.target_id === state.targetId ? " active" : ""));
+      btn.type = "button";
+      var top = make("div", "row");
+      top.appendChild(make("span", "case-item-title", item.target_id));
+      top.appendChild(make("span", "spacer"));
+      var st = String(item.status || "");
+      top.appendChild(make("span", "badge " + (st === "completed" ? "CONFIRMED" : ""), st));
+      btn.appendChild(top);
+      if (item.raw_input) {
+        btn.appendChild(make("div", "case-item-sub", String(item.raw_input)));
+      }
+      btn.addEventListener("click", function () { selectCaseById(item.target_id); });
+      box.appendChild(btn);
+    });
   }
 
   function refreshCases() {
     return api("/api/investigations").then(function (data) {
       var items = (data && data.investigations) || [];
+      state.casesList = items;
+      renderCasesList();
       ["case-select", "diff-target-select"].forEach(function (selId, idx) {
         var sel = byId(selId);
         if (!sel) { return; }
@@ -4362,13 +5921,15 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         var input = byId(id);
         if (input) { input.value = ""; }
       });
+      refreshToolsHealth();
     }).catch(function (err) {
       setText("api-keys-message", String(err.message || err));
     });
   }
 
   var CHECKLIST_KEY = "ai_osint_quickstart_v2";
-  var THEME_KEY = "ai_osint_theme";
+  var THEME_KEY = "ai_osint_hub_theme";
+  var THEMES = ["clean-light", "warm-paper", "midnight-slate", "gruvbox-dark"];
   var resizeTimer = null;
   var cmdSelectedIdx = 0;
   var cmdFiltered = [];
@@ -4426,29 +5987,39 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     resizeTimer = window.setTimeout(function () {
       if (state.cy) {
         state.cy.resize();
-        state.cy.fit(undefined, 36);
+        state.cy.fit(undefined, 40);
       }
     }, 150);
   }
 
-  function toggleThemeMode() {
-    var root = document.documentElement;
-    var nextDark = root.getAttribute("data-theme") !== "dark";
-    if (nextDark) { root.setAttribute("data-theme", "dark"); }
-    else { root.removeAttribute("data-theme"); }
+  function applyTheme(name) {
+    var chosen = THEMES.indexOf(name) !== -1 ? name : "clean-light";
+    document.documentElement.setAttribute("data-theme", chosen);
+    var sel = byId("theme-select");
+    if (sel) { sel.value = chosen; }
     try {
       if (window.localStorage) {
-        window.localStorage.setItem(THEME_KEY, nextDark ? "dark" : "light");
+        window.localStorage.setItem(THEME_KEY, chosen);
       }
     } catch (err) { /* ignore */ }
+    if (state.cy) {
+      try { state.cy.style(cytoscapeStyles()); } catch (err) { /* ignore */ }
+    }
+  }
+
+  function cycleThemeMode() {
+    var cur = document.documentElement.getAttribute("data-theme") || "clean-light";
+    var idx = THEMES.indexOf(cur);
+    applyTheme(THEMES[(idx + 1) % THEMES.length]);
   }
 
   function restoreThemeMode() {
     try {
-      if (window.localStorage && window.localStorage.getItem(THEME_KEY) === "dark") {
-        document.documentElement.setAttribute("data-theme", "dark");
-      }
-    } catch (err) { /* ignore */ }
+      var saved = window.localStorage ? window.localStorage.getItem(THEME_KEY) : null;
+      applyTheme(saved || "clean-light");
+    } catch (err) {
+      applyTheme("clean-light");
+    }
   }
 
   function loadDemoCase() {
@@ -4461,6 +6032,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     }).then(function (data) {
       if (!data || !data.target_id) { throw new Error("demo returned no target_id"); }
       state.targetId = data.target_id;
+      state.selectedNode = null;
       state.pathSourceId = null;
       state.graphView.shortestPathNodes = {};
       state.graphView.shortestPathEdges = {};
@@ -4470,9 +6042,6 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       updateDownloads();
       return refreshCases().then(function () {
         return refreshState();
-      }).then(function () {
-        fetchTimeline();
-        fetchDossier();
       });
     }).catch(function (err) {
       setStatus("error");
@@ -4529,14 +6098,12 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         var tid = (data && (data.target_id || (data.manifest && data.manifest.target_id))) || null;
         if (!tid) { throw new Error("imported bundle did not return target_id"); }
         state.targetId = tid;
+        state.selectedNode = null;
         setText("target-label", tid);
         setStatus("COMPLETED", true);
         markChecklistStep(1);
         updateDownloads();
-        return refreshCases().then(function () { return refreshState(); }).then(function () {
-          fetchTimeline();
-          fetchDossier();
-        });
+        return refreshCases().then(function () { return refreshState(); });
       }).catch(function (err) {
         setStatus("error");
         showError(err);
@@ -4559,7 +6126,7 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       focus: "in-domains"
     },
     media: {
-      hint: "Preset: Image / Media Forensics — paste an image URL below or launch the Vision & Media Forensics Lab.",
+      hint: "Preset: Image / Media — paste an image URL or start a case to run perceptual-hash & EXIF forensics.",
       focus: "in-urls"
     },
     custom: {
@@ -4630,20 +6197,23 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
 
   function buildCommandItems() {
     var items = [
+      { label: "New Investigation…", category: "Action", run: function () { openNewInvestigationModal(); } },
       { label: "Load Interactive Demo Case (Aurora Meridian)", category: "Action", run: function () { loadDemoCase(); } },
       { label: "Run Next Pivot", category: "Pivot", run: function () { runNextPivot(); } },
       { label: "Step Batch (3x Pivots)", category: "Pivot", run: function () { runBatchPivots(); } },
       { label: "Export Case Bundle (.osintcase.zip)", category: "Bundle", run: function () { exportCaseBundle(); } },
       { label: "Import Case Bundle (.osintcase.zip)", category: "Bundle", run: function () { var f = byId("bundle-file-input"); if (f) { f.click(); } } },
-      { label: "Open 10-Second MCP Setup", category: "MCP", run: function () { openMcpSetup(); } },
+      { label: "Open Tools & Policy Matrix", category: "Tools", run: function () { openToolsModal(""); } },
       { label: "Open API Keys Vault", category: "Settings", run: function () { openApiKeys(); } },
-      { label: "Toggle Light / Dark Theme", category: "View", run: function () { toggleThemeMode(); } },
+      { label: "Open 10-Second MCP Setup", category: "MCP", run: function () { openMcpSetup(); } },
+      { label: "Cycle Color Theme", category: "View", run: function () { cycleThemeMode(); } },
       { label: "Print / Save Dossier PDF", category: "Dossier", run: function () { activateTab("dossier"); window.print(); } },
+      { label: "Switch Tab: Overview", category: "Tab", run: function () { activateTab("overview"); } },
+      { label: "Switch Tab: Visuals & Photos", category: "Tab", run: function () { activateTab("visuals"); } },
       { label: "Switch Tab: Graph", category: "Tab", run: function () { activateTab("graph"); } },
       { label: "Switch Tab: Timeline", category: "Tab", run: function () { activateTab("timeline"); } },
-      { label: "Switch Tab: Telemetry & Pivots", category: "Tab", run: function () { activateTab("telemetry"); } },
-      { label: "Switch Tab: AI & Vision Lab", category: "Tab", run: function () { activateTab("ai"); } },
-      { label: "Switch Tab: Dossier", category: "Tab", run: function () { activateTab("dossier"); } }
+      { label: "Switch Tab: Dossier", category: "Tab", run: function () { activateTab("dossier"); } },
+      { label: "Switch Tab: Logs & Telemetry", category: "Tab", run: function () { activateTab("telemetry"); } }
     ];
     var nodes = (state.payload && state.payload.graph && state.payload.graph.nodes) || [];
     nodes.slice(0, 60).forEach(function (node) {
@@ -4720,9 +6290,11 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       panels[panelIndex].classList.toggle("active",
         panels[panelIndex].id === "tab-" + name);
     }
+    if (name === "overview") { fetchOverview(); }
+    if (name === "visuals") { fetchVisuals(); }
     if (name === "dossier") { fetchDossier(); markChecklistStep(4); }
     if (name === "timeline") { fetchTimeline(); }
-    if (name === "graph" && state.cy) { state.cy.resize(); state.cy.fit(undefined, 36); }
+    if (name === "graph" && state.cy) { state.cy.resize(); state.cy.fit(undefined, 40); }
   }
 
   function wire() {
@@ -4734,6 +6306,22 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     if (batchBtn) { batchBtn.addEventListener("click", runBatchPivots); }
     var clearButton = byId("clear-form");
     if (clearButton) { clearButton.addEventListener("click", clearForm); }
+
+    var openNewBtn = byId("open-new-investigation");
+    if (openNewBtn) { openNewBtn.addEventListener("click", openNewInvestigationModal); }
+    var openEmptyNewBtn = byId("btn-empty-new-inv");
+    if (openEmptyNewBtn) { openEmptyNewBtn.addEventListener("click", openNewInvestigationModal); }
+    var openGraphNewBtn = byId("btn-graph-new-inv");
+    if (openGraphNewBtn) { openGraphNewBtn.addEventListener("click", openNewInvestigationModal); }
+    var closeNewBtn = byId("close-new-investigation");
+    if (closeNewBtn) { closeNewBtn.addEventListener("click", closeNewInvestigationModal); }
+    var newModal = byId("new-investigation-modal");
+    if (newModal) {
+      newModal.addEventListener("click", function (event) {
+        if (event.target === newModal) { closeNewInvestigationModal(); }
+      });
+    }
+
     var activeReconBox = byId("in-active");
     if (activeReconBox) {
       activeReconBox.addEventListener("change", function () {
@@ -4814,6 +6402,11 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       });
     }
     configureGraphInteraction();
+    if (typeof window.ResizeObserver === "function" && byId("cy-graph")) {
+      var ro = new window.ResizeObserver(function () { scheduleCyResize(); });
+      ro.observe(byId("cy-graph"));
+    }
+
     var toggleLeft = byId("toggle-left-rail");
     if (toggleLeft) {
       toggleLeft.addEventListener("click", function () {
@@ -4829,15 +6422,25 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
       });
     }
     window.addEventListener("resize", scheduleCyResize);
-    var toggleTheme = byId("toggle-theme");
-    if (toggleTheme) { toggleTheme.addEventListener("click", toggleThemeMode); }
+    var themeSelect = byId("theme-select");
+    if (themeSelect) {
+      themeSelect.addEventListener("change", function () { applyTheme(themeSelect.value); });
+    }
 
     var loadDemoBtn = byId("btn-load-demo");
     if (loadDemoBtn) { loadDemoBtn.addEventListener("click", loadDemoCase); }
+    var extraDemoBtns = document.querySelectorAll(".js-load-demo");
+    for (var di = 0; di < extraDemoBtns.length; di += 1) {
+      extraDemoBtns[di].addEventListener("click", loadDemoCase);
+    }
+
     var dismissChecklistBtn = byId("dismiss-quickstart");
     if (dismissChecklistBtn) { dismissChecklistBtn.addEventListener("click", dismissChecklist); }
     var exportBundleBtn = byId("export-bundle-btn");
     if (exportBundleBtn) { exportBundleBtn.addEventListener("click", exportCaseBundle); }
+    var dosExportBundleBtn = byId("dossier-export-bundle");
+    if (dosExportBundleBtn) { dosExportBundleBtn.addEventListener("click", exportCaseBundle); }
+
     var bundleFileInput = byId("bundle-file-input");
     if (bundleFileInput) {
       bundleFileInput.addEventListener("change", function () {
@@ -4854,6 +6457,35 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     var importEmptyBtn = byId("btn-import-bundle-empty");
     if (importEmptyBtn && bundleFileInput) {
       importEmptyBtn.addEventListener("click", function () { bundleFileInput.click(); });
+    }
+
+    var visUploadForm = byId("visual-upload-form");
+    if (visUploadForm) { visUploadForm.addEventListener("submit", uploadVisualFile); }
+
+    var openToolsBtn = byId("open-tools-modal");
+    if (openToolsBtn) { openToolsBtn.addEventListener("click", function () { openToolsModal(""); }); }
+    var openToolsDrawerBtn = byId("open-tools-drawer-btn");
+    if (openToolsDrawerBtn) { openToolsDrawerBtn.addEventListener("click", function () { openToolsModal(""); }); }
+    var miniStatBtns = document.querySelectorAll("[data-open-tools]");
+    for (var msi = 0; msi < miniStatBtns.length; msi += 1) {
+      miniStatBtns[msi].addEventListener("click", function (ev) {
+        openToolsModal(ev.currentTarget.getAttribute("data-open-tools"));
+      });
+    }
+    var closeToolsBtn = byId("close-tools-modal");
+    if (closeToolsBtn) { closeToolsBtn.addEventListener("click", closeToolsModal); }
+    var toolsModal = byId("tools-modal");
+    if (toolsModal) {
+      toolsModal.addEventListener("click", function (event) {
+        if (event.target === toolsModal) { closeToolsModal(); }
+      });
+    }
+    var toolsModalKeys = byId("tools-modal-keys-btn");
+    if (toolsModalKeys) {
+      toolsModalKeys.addEventListener("click", function () {
+        closeToolsModal();
+        openApiKeys();
+      });
     }
 
     var openCmdBtn = byId("open-cmd-palette");
@@ -4934,6 +6566,8 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
         closeCommandPalette();
         closeMcpSetup();
         closeApiKeys();
+        closeToolsModal();
+        closeNewInvestigationModal();
         var sm = byId("scope-auth-modal");
         if (sm && !sm.hidden) { closeScopeAuthModal(false); }
       }
@@ -4946,15 +6580,12 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     var dosPrint = byId("dossier-print-btn");
     if (dosPrint) { dosPrint.addEventListener("click", function () { window.print(); }); }
 
+    var caseFilter = byId("case-filter");
+    if (caseFilter) { caseFilter.addEventListener("input", renderCasesList); }
     var caseSelect = byId("case-select");
     if (caseSelect) {
       caseSelect.addEventListener("change", function () {
-        if (!caseSelect.value) { return; }
-        state.targetId = caseSelect.value;
-        setText("target-label", state.targetId);
-        updateDownloads();
-        refreshState();
-        fetchTimeline();
+        if (caseSelect.value) { selectCaseById(caseSelect.value); }
       });
     }
     var refreshCasesBtn = byId("refresh-cases-btn");
@@ -4967,20 +6598,17 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     if (refreshToolsBtn) { refreshToolsBtn.addEventListener("click", refreshToolsHealth); }
     var runDoctorBtn = byId("run-doctor-btn");
     if (runDoctorBtn) { runDoctorBtn.addEventListener("click", runDoctorCheck); }
+
+    var aiModeSel = byId("ai-mode-select");
+    if (aiModeSel) {
+      aiModeSel.addEventListener("change", function () {
+        saveAiConfig({ mode: aiModeSel.value });
+      });
+    }
     var saveAiBtn = byId("save-ai-config");
     if (saveAiBtn) { saveAiBtn.addEventListener("click", function () { saveAiConfig(null); }); }
     var probeAiBtn = byId("refresh-ai-status");
     if (probeAiBtn) { probeAiBtn.addEventListener("click", function () { refreshAiStatus(true); }); }
-    var aiLabApplyBtn = byId("ai-lab-apply-btn");
-    if (aiLabApplyBtn) {
-      aiLabApplyBtn.addEventListener("click", function () {
-        var sel = byId("ai-lab-preset");
-        var preset = sel ? sel.value : "disabled";
-        saveAiConfig({ preset: preset, enabled: preset !== "disabled" });
-      });
-    }
-    var aiLabProbeBtn = byId("ai-lab-probe-btn");
-    if (aiLabProbeBtn) { aiLabProbeBtn.addEventListener("click", function () { refreshAiStatus(true); }); }
     var aiRailPreset = byId("ai-preset");
     if (aiRailPreset) {
       aiRailPreset.addEventListener("change", function () {
@@ -4990,6 +6618,8 @@ a.dl-link:hover { border-color: var(--accent); color: var(--accent); }
     }
     var reflectBtn = byId("run-reflect-btn");
     if (reflectBtn) { reflectBtn.addEventListener("click", runCaseReflection); }
+    var reflectQuickBtn = byId("run-reflect-quick");
+    if (reflectQuickBtn) { reflectQuickBtn.addEventListener("click", runCaseReflection); }
     var mediaBtn = byId("analyze-media-btn");
     if (mediaBtn) { mediaBtn.addEventListener("click", analyzeMedia); }
     var inspectPivotBtn = byId("inspect-pivot-btn");

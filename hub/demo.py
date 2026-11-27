@@ -7,6 +7,8 @@ screenshots can explore the workbench immediately.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import shutil
 import struct
@@ -14,9 +16,12 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageDraw
+
 from hub.erkg.resolution import EntityResolver
 from hub.erkg.store import ERKGStore, default_home
 from hub.investigation.engine import InvestigationPaths
+from hub.tools.builtin.media_forensics import compute_dhash, compute_phash
 from hub.models import (
     PROVENANCE_AI_INFERRED,
     BudgetConfig,
@@ -46,30 +51,62 @@ DEMO_TITLE = "Aurora Meridian Supply-Chain Attribution"
 _BASE_TS = "2026-11-20T09:00:00+00:00"
 
 
-def _synthetic_png_bytes(width: int = 16, height: int = 16) -> bytes:
+def _synthetic_png_bytes(width: int = 128, height: int = 128) -> bytes:
     """Create a deterministic, valid RGBA PNG in pure Python (no network)."""
-    raw_rows = bytearray()
-    for y in range(height):
-        raw_rows.append(0)  # filter type 0
-        for x in range(width):
-            # Gruvbox Material Light terracotta/slate geometric avatar mark
-            if 3 <= x <= 12 and 3 <= y <= 12:
-                raw_rows.extend((175, 58, 3, 255))
-            else:
-                raw_rows.extend((251, 241, 199, 255))
+    return _render_avatar_emblem_png(width=width, height=height)["bytes"]
 
-    def _chunk(tag: bytes, payload: bytes) -> bytes:
-        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
-        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
-    idat = zlib.compress(bytes(raw_rows), level=6)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", ihdr)
-        + _chunk(b"IDAT", idat)
-        + _chunk(b"IEND", b"")
-    )
+def _render_avatar_emblem_png(
+    *,
+    width: int = 128,
+    height: int = 128,
+    variant: str = "avatar",
+    exif_software: str = "GIMP 2.10 (Synthetic Lab)",
+    exif_artist: str = "Elena Vance",
+    exif_datetime: str = "2026:10:14 11:22:08",
+) -> dict[str, Any]:
+    """Generate a crisp 128x128 synthetic PNG via Pillow with optional EXIF + hashes."""
+    if variant == "favicon":
+        img = Image.new("RGB", (width, height), (15, 23, 42))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((10, 10, width - 11, height - 11), radius=24, fill=(17, 24, 39), outline=(15, 118, 110), width=4)
+        draw.ellipse((28, 28, width - 29, height - 29), fill=(15, 118, 110), outline=(181, 118, 20), width=4)
+        draw.polygon([(width // 2, 36), (width - 38, height - 40), (38, height - 40)], fill=(248, 250, 252))
+        draw.ellipse((width // 2 - 10, height // 2 - 2, width // 2 + 10, height // 2 + 18), fill=(175, 58, 3))
+    else:
+        img = Image.new("RGB", (width, height), (248, 250, 252))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((8, 8, width - 9, height - 9), radius=22, fill=(251, 241, 199), outline=(175, 58, 3), width=4)
+        draw.polygon(
+            [(width // 2, 22), (width - 24, height // 2), (width // 2, height - 22), (24, height // 2)],
+            fill=(175, 58, 3),
+        )
+        draw.ellipse((42, 42, width - 43, height - 43), fill=(15, 23, 42))
+        draw.ellipse((54, 54, width - 55, height - 55), fill=(251, 241, 199))
+
+    phash = compute_phash(img) or "a8f3c19e4b2d7055"
+    dhash = compute_dhash(img) or "9c72e41855a3b01f"
+
+    exif = img.getexif()
+    if exif_software:
+        exif[0x0131] = exif_software
+    if exif_artist:
+        exif[0x013B] = exif_artist
+    if exif_datetime:
+        exif[0x9003] = exif_datetime
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", exif=exif)
+    raw = buf.getvalue()
+    return {
+        "bytes": raw,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "width": width,
+        "height": height,
+        "phash": phash,
+        "dhash": dhash,
+    }
 
 
 def _resolve_investigations_root(
@@ -132,7 +169,33 @@ def seed_demo_case(
         shutil.rmtree(case_dir)
 
     paths = InvestigationPaths(case_dir).ensure()
-    png_bytes = _synthetic_png_bytes()
+    media_dir = case_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    gh_asset = _render_avatar_emblem_png(
+        variant="avatar",
+        exif_software="GIMP 2.10 (Synthetic Lab)",
+        exif_artist="Elena Vance",
+        exif_datetime="2026:10:14 11:22:08",
+    )
+    grav_asset = _render_avatar_emblem_png(
+        variant="avatar",
+        exif_software="Gravatar Mirror Cache (Synthetic)",
+        exif_artist="Elena Vance",
+        exif_datetime="2026:10:14 11:22:08",
+    )
+    fav_asset = _render_avatar_emblem_png(
+        variant="favicon",
+        exif_software="Aurora Meridian Badge Studio 2.1",
+        exif_artist="Aurora Ops",
+        exif_datetime="2026:11:02 15:40:00",
+    )
+
+    (media_dir / "aurora_github.png").write_bytes(gh_asset["bytes"])
+    (media_dir / "aurora_gravatar.png").write_bytes(grav_asset["bytes"])
+    (media_dir / "aurora_site_favicon.png").write_bytes(fav_asset["bytes"])
+
+    png_bytes = gh_asset["bytes"]
     png_path, png_sha256, png_size = _write_raw(
         paths.raw, "011_evance_avatar.png", png_bytes
     )
@@ -186,7 +249,7 @@ def seed_demo_case(
                     "avatar_url": "https://aurora-meridian.example/assets/evance-avatar.png",
                     "profile_url": "https://github.com/evance-sec",
                     "repositories": ["https://github.com/evance-sec/meridian-supply-audit"],
-                    "avatar_phash": "a8f3c19e4b2d7055",
+                    "avatar_phash": gh_asset["phash"],
                 },
                 indent=2,
             ),
@@ -280,18 +343,34 @@ def seed_demo_case(
                 {
                     "synthetic": True,
                     "url": "https://aurora-meridian.example/assets/evance-avatar.png",
-                    "local_artifact": png_path.name,
+                    "local_artifact": "media/aurora_github.png",
                     "mime_type": "image/png",
                     "format": "PNG",
-                    "dimensions": [16, 16],
+                    "dimensions": [128, 128],
                     "sha256": png_sha256,
-                    "phash": "a8f3c19e4b2d7055",
-                    "dhash": "9c72e41855a3b01f",
+                    "phash": gh_asset["phash"],
+                    "dhash": gh_asset["dhash"],
                     "exif": {
                         "Software": "GIMP 2.10 (Synthetic Lab)",
                         "Artist": "Elena Vance",
                         "DateTimeOriginal": "2026:10:14 11:22:08",
                     },
+                    "related_media": [
+                        {
+                            "local_file": "media/aurora_gravatar.png",
+                            "platform": "gravatar",
+                            "sha256": grav_asset["sha256"],
+                            "phash": grav_asset["phash"],
+                            "dhash": grav_asset["dhash"],
+                        },
+                        {
+                            "local_file": "media/aurora_site_favicon.png",
+                            "platform": "web",
+                            "sha256": fav_asset["sha256"],
+                            "phash": fav_asset["phash"],
+                            "dhash": fav_asset["dhash"],
+                        },
+                    ],
                 },
                 indent=2,
             ),
@@ -434,7 +513,86 @@ def seed_demo_case(
                 "https://aurora-meridian.example/assets/evance-avatar.png",
                 artifact_id=artifacts["media_forensics"].artifact_id,
                 timestamp="2026-11-20T09:03:18+00:00",
-                metadata={"media_kind": "image", "local_file": "011_evance_avatar.png", "synthetic": True},
+                metadata={
+                    "media_asset": True,
+                    "media_kind": "image",
+                    "platform": "github",
+                    "source_label": "GitHub Avatar",
+                    "source_tool": "media_forensics",
+                    "media_file": "media/aurora_github.png",
+                    "local_file": "media/aurora_github.png",
+                    "filename": "aurora_github.png",
+                    "content_type": "image/png",
+                    "width": 128,
+                    "height": 128,
+                    "phash": gh_asset["phash"],
+                    "dhash": gh_asset["dhash"],
+                    "sha256": gh_asset["sha256"],
+                    "exif": {
+                        "Software": "GIMP 2.10 (Synthetic Lab)",
+                        "Artist": "Elena Vance",
+                        "DateTimeOriginal": "2026:10:14 11:22:08",
+                    },
+                    "synthetic": True,
+                },
+            )
+            gravatar_url, _ = resolver.resolve(
+                DEMO_TARGET_ID,
+                EntityType.URL,
+                "https://www.gravatar.com/avatar/e8c4a1b2c3d4e5f60718293a4b5c6d7e?s=256&d=404",
+                artifact_id=artifacts["media_forensics"].artifact_id,
+                timestamp="2026-11-20T09:03:19+00:00",
+                metadata={
+                    "media_asset": True,
+                    "media_kind": "image",
+                    "platform": "gravatar",
+                    "source_label": "Gravatar Avatar",
+                    "source_tool": "media_forensics",
+                    "media_file": "media/aurora_gravatar.png",
+                    "local_file": "media/aurora_gravatar.png",
+                    "filename": "aurora_gravatar.png",
+                    "content_type": "image/png",
+                    "width": 128,
+                    "height": 128,
+                    "phash": grav_asset["phash"],
+                    "dhash": grav_asset["dhash"],
+                    "sha256": grav_asset["sha256"],
+                    "exif": {
+                        "Software": "Gravatar Mirror Cache (Synthetic)",
+                        "Artist": "Elena Vance",
+                        "DateTimeOriginal": "2026:10:14 11:22:08",
+                    },
+                    "synthetic": True,
+                },
+            )
+            favicon_url, _ = resolver.resolve(
+                DEMO_TARGET_ID,
+                EntityType.URL,
+                "https://aurora-meridian.example/favicon.png",
+                artifact_id=artifacts["media_forensics"].artifact_id,
+                timestamp="2026-11-20T09:03:20+00:00",
+                metadata={
+                    "media_asset": True,
+                    "media_kind": "image",
+                    "platform": "web",
+                    "source_label": "Site Favicon / Conference Badge",
+                    "source_tool": "media_forensics",
+                    "media_file": "media/aurora_site_favicon.png",
+                    "local_file": "media/aurora_site_favicon.png",
+                    "filename": "aurora_site_favicon.png",
+                    "content_type": "image/png",
+                    "width": 128,
+                    "height": 128,
+                    "phash": fav_asset["phash"],
+                    "dhash": fav_asset["dhash"],
+                    "sha256": fav_asset["sha256"],
+                    "exif": {
+                        "Software": "Aurora Meridian Badge Studio 2.1",
+                        "Artist": "Aurora Ops",
+                        "DateTimeOriginal": "2026:11:02 15:40:00",
+                    },
+                    "synthetic": True,
+                },
             )
             avatar_hash, _ = resolver.resolve(
                 DEMO_TARGET_ID,
@@ -442,7 +600,7 @@ def seed_demo_case(
                 png_sha256,
                 artifact_id=artifacts["media_forensics"].artifact_id,
                 timestamp="2026-11-20T09:03:18+00:00",
-                metadata={"algorithm": "sha256", "phash": "a8f3c19e4b2d7055", "synthetic": True},
+                metadata={"algorithm": "sha256", "phash": gh_asset["phash"], "synthetic": True},
             )
             location_ca, _ = resolver.resolve(
                 DEMO_TARGET_ID,
@@ -652,6 +810,29 @@ def seed_demo_case(
                 snippet="Avatar URL linked on profile",
             )
 
+            store.upsert_claim(
+                DEMO_TARGET_ID,
+                email.entity_id,
+                "MENTIONED_IN",
+                object_id=gravatar_url.entity_id,
+                artifact_id=artifacts["media_forensics"].artifact_id,
+                source_tool="media_forensics",
+                timestamp="2026-11-20T09:03:19+00:00",
+                direct=True,
+                snippet="Gravatar profile avatar resolved for e.vance@aurora-meridian.example",
+            )
+            store.upsert_claim(
+                DEMO_TARGET_ID,
+                domain.entity_id,
+                "MENTIONED_IN",
+                object_id=favicon_url.entity_id,
+                artifact_id=artifacts["media_forensics"].artifact_id,
+                source_tool="media_forensics",
+                timestamp="2026-11-20T09:03:20+00:00",
+                direct=True,
+                snippet="Site favicon & conference badge harvested from aurora-meridian.example",
+            )
+
             # Media forensics + EXIF + perceptual hash claims on avatar image
             store.upsert_claim(
                 DEMO_TARGET_ID,
@@ -665,9 +846,10 @@ def seed_demo_case(
                 snippet=f"SHA-256={png_sha256}",
             )
             for attr_key, attr_val in (
-                ("phash", "a8f3c19e4b2d7055"),
-                ("dhash", "9c72e41855a3b01f"),
+                ("phash", gh_asset["phash"]),
+                ("dhash", gh_asset["dhash"]),
                 ("sha256", png_sha256),
+                ("local_file", "media/aurora_github.png"),
                 ("exif_software", "GIMP 2.10 (Synthetic Lab)"),
                 ("exif_artist", "Elena Vance"),
             ):
@@ -682,17 +864,55 @@ def seed_demo_case(
                     direct=True,
                     snippet=f"{attr_key}={attr_val}",
                 )
+            for attr_key, attr_val in (
+                ("phash", grav_asset["phash"]),
+                ("dhash", grav_asset["dhash"]),
+                ("sha256", grav_asset["sha256"]),
+                ("local_file", "media/aurora_gravatar.png"),
+                ("exif_software", "Gravatar Mirror Cache (Synthetic)"),
+                ("exif_artist", "Elena Vance"),
+            ):
+                store.upsert_claim(
+                    DEMO_TARGET_ID,
+                    gravatar_url.entity_id,
+                    f"HAS_ATTRIBUTE:{attr_key}",
+                    object_literal=attr_val,
+                    artifact_id=artifacts["media_forensics"].artifact_id,
+                    source_tool="media_forensics",
+                    timestamp="2026-11-20T09:03:19+00:00",
+                    direct=True,
+                    snippet=f"{attr_key}={attr_val}",
+                )
+            for attr_key, attr_val in (
+                ("phash", fav_asset["phash"]),
+                ("dhash", fav_asset["dhash"]),
+                ("sha256", fav_asset["sha256"]),
+                ("local_file", "media/aurora_site_favicon.png"),
+                ("exif_software", "Aurora Meridian Badge Studio 2.1"),
+                ("exif_artist", "Aurora Ops"),
+            ):
+                store.upsert_claim(
+                    DEMO_TARGET_ID,
+                    favicon_url.entity_id,
+                    f"HAS_ATTRIBUTE:{attr_key}",
+                    object_literal=attr_val,
+                    artifact_id=artifacts["media_forensics"].artifact_id,
+                    source_tool="media_forensics",
+                    timestamp="2026-11-20T09:03:20+00:00",
+                    direct=True,
+                    snippet=f"{attr_key}={attr_val}",
+                )
             # Second source sharing pHash so perceptual correlation lights up
             store.upsert_claim(
                 DEMO_TARGET_ID,
                 profile.entity_id,
                 "HAS_ATTRIBUTE:phash",
-                object_literal="a8f3c19e4b2d7055",
+                object_literal=gh_asset["phash"],
                 artifact_id=artifacts["github_osint"].artifact_id,
                 source_tool="github_osint",
                 timestamp=artifacts["github_osint"].timestamp_utc,
                 direct=True,
-                snippet="avatar_phash=a8f3c19e4b2d7055",
+                snippet=f"avatar_phash={gh_asset['phash']}",
             )
 
             # Explicit CONTRADICTED functional claim (timezone conflict)

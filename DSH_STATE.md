@@ -1099,5 +1099,12 @@ v2.0.0 Public Release: Packaging/Docker/Launchers + Cross-Platform Locator +
   - Independent static security audit: **0 Critical / 0 High / 0 Medium** findings across all release deliverables.
   - Added `tests/test_v2_release.py` covering locator fallbacks, package data, `hub/demo.py`, `hub/bundle.py` round-trip & malicious bundle rejections, AI presets, CLI v2, Web v2 routes, DOM XSS safety, and MCP App fallback.
 
+## v2.1.0 Accuracy, Visuals, Optional `[local-ai]` & Workbench Redesign (2026-11-27)
+
+- Fixed 8 OSINT accuracy issues: `HAS_EMAIL` non-functional, noreply & freemail `provider_infrastructure` tagging + `split_hostname` subdomain handling, automatic `PERSON` unification (`_unify_duplicate_persons` / `merge_entities`), `github_osint` bot filtering & duplicate-handle suppression, `sherlock`/`maigret` generic-path rejection, `phoneinfoga` valid-flag fix, and honest `hydra` `policy_blocked=True`/`ui_status="blocked"` while retaining 32/32 `doctor`.
+- Added SSRF-safe `hub/tools/visual_harvester.py` (`fetch_safe` + `assert_safe_host`, 5 MB cap, Pillow validation, zero SVG, EXIF/pHash/dHash + `<case>/media/` bundle round-trip) and parity `overview`/`visuals`/`upload_visual` routes across `service.py`, `cli.py`, `mcp_server.py`, and `web.py`.
+- Simplified AI to 4 modes (`off` default | `local_embedded` via optional `[local-ai]` `fastembed` | `ollama` | `cloud`) while keeping all legacy presets intact.
+- Redesigned `hub/web.py` for `1280×800`–ultrawide screens with 4 themes (`clean-light` default, `warm-paper`, `midnight-slate`, `gruvbox-dark`), Overview default tab, Visuals & Photos tab, `cose` graph with matte label pills & auto-selected primary subject, cleaner `hub/reporting.py`, enriched offline PNG matching in `hub/demo.py`, and polished repo templates/`README.md`/`docs/ARCHITECTURE.md`/`docs/assets/social-preview.png`.
+
 ## Blockers
 None.

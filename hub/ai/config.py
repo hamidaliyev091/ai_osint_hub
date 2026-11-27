@@ -238,9 +238,13 @@ def build_status_report(
         else config.ollama_keep_alive
     )
 
+    from hub.ai.embeddings import fastembed_availability
+
     active = bool(config.enabled and config.provider != AIProviderKind.DISABLED)
+    embedded_info = fastembed_availability()
     return AIStatusReport(
         enabled=config.enabled,
+        mode=config.mode,
         preset=config.preset,
         provider=config.provider,
         active=active,
@@ -250,6 +254,8 @@ def build_status_report(
         num_ctx=effective_num_ctx,
         keep_alive=effective_keep_alive,
         models={
+            "local_embedded": config.local_embedded_text_model,
+            "local_embedded_vision": config.local_embedded_vision_model,
             "ollama": config.ollama_model,
             "ollama_vision": config.ollama_vision_model,
             "ollama_embedding": config.ollama_embedding_model,
@@ -280,8 +286,10 @@ def build_status_report(
             },
         },
         local_probes=probes,
+        local_embedded=embedded_info,
         hardware_profile={
             "preset": config.preset.value,
+            "mode": config.mode,
             "target_vram_gb": 8,
             "target_ram_gb": 32,
             "num_ctx": effective_num_ctx,
@@ -350,6 +358,36 @@ def update_ai_config(data: dict[str, Any]) -> dict[str, Any]:
     if "preset" in updates and updates["preset"] is not None:
         preset_enum = AIHardwarePreset(str(updates["preset"]).strip().lower())
         _apply_preset_defaults(persisted, preset_enum, explicit_provider)
+
+    # Apply explicit 4-mode switch if supplied ("off" | "local_embedded" | "ollama" | "cloud").
+    if "mode" in updates and updates["mode"] is not None:
+        mode_val = str(updates["mode"]).strip().lower()
+        if mode_val not in {"off", "local_embedded", "ollama", "cloud"}:
+            raise ValueError(f"Unsupported AI mode: {mode_val!r}")
+        updates["mode"] = mode_val
+        if mode_val == "off":
+            persisted["enabled"] = False
+            persisted["provider"] = AIProviderKind.DISABLED.value
+            persisted["preset"] = AIHardwarePreset.DISABLED.value
+        elif mode_val == "local_embedded":
+            persisted["enabled"] = True
+            if not explicit_provider:
+                persisted["provider"] = AIProviderKind.LOCAL_EMBEDDED.value
+        elif mode_val == "ollama":
+            persisted["enabled"] = True
+            if not explicit_provider and str(persisted.get("provider") or "") not in {"ollama", "lmstudio"}:
+                persisted["provider"] = AIProviderKind.OLLAMA.value
+        elif mode_val == "cloud":
+            persisted["enabled"] = True
+            if not explicit_provider and str(persisted.get("provider") or "") not in {"gemini", "deepseek", "openai_compat"}:
+                if persisted.get("gemini_api_key"):
+                    persisted["provider"] = AIProviderKind.GEMINI.value
+                elif persisted.get("deepseek_api_key"):
+                    persisted["provider"] = AIProviderKind.DEEPSEEK.value
+                elif persisted.get("openai_api_key"):
+                    persisted["provider"] = AIProviderKind.OPENAI_COMPAT.value
+                else:
+                    persisted["provider"] = AIProviderKind.GEMINI.value
 
     allowed_fields = set(AIConfig.model_fields)
     for key, value in updates.items():
@@ -432,6 +470,10 @@ def update_ai_config(data: dict[str, Any]) -> dict[str, Any]:
     if persisted.get("enabled") and persisted.get("provider", "disabled") == "disabled":
         if "provider" not in updates:
             persisted["provider"] = AIProviderKind.OLLAMA.value
+
+    # Ensure mode stays synchronized when enabled/provider/preset changed without mode.
+    if "mode" not in updates:
+        persisted.pop("mode", None)
 
     new_config = AIConfig.model_validate(persisted)
     save_ai_config(new_config)

@@ -1,0 +1,39 @@
+name: Bug Report
+description: Report a reproducible bug in AI OSINT Hub
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please verify first that the issue reproduces on the latest commit and does **not** expose real target PII, API keys, or private investigation databases.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Clear summary of observed vs expected behavior (or paste sanitized traceback).
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction steps
+      description: Exact CLI command, Workbench action, or offline snippet using synthetic targets (e.g., `example.com`).
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows 11 (PowerShell 5.1)
+        - Linux
+        - macOS
+        - Docker
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python & Package Version
+      placeholder: "e.g., Python 3.13 / ai-osint-hub 2.1.0"

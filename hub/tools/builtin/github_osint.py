@@ -59,6 +59,29 @@ _USER_KEYS = (
     "html_url", "avatar_url", "public_repos",
 )
 _REPO_KEYS = ("full_name", "html_url", "language", "description", "fork")
+_IGNORED_ACTORS = frozenset({
+    "web-flow",
+    "dependabot",
+    "dependabot[bot]",
+    "github-actions",
+    "github-actions[bot]",
+    "renovate",
+    "renovate[bot]",
+})
+_IGNORED_EMAILS = frozenset({"noreply@github.com"})
+
+
+def _is_ignored_actor(login: str) -> bool:
+    low = str(login or "").strip().lower()
+    return not low or low in _IGNORED_ACTORS or low.endswith("[bot]")
+
+
+def _is_ignored_email(address: str) -> bool:
+    low = str(address or "").strip().lower()
+    if not low or low in _IGNORED_EMAILS:
+        return True
+    local = low.split("@", 1)[0]
+    return local in _IGNORED_ACTORS or local.endswith("[bot]") or "[bot]" in local
 
 
 def _github_token() -> str:
@@ -116,7 +139,7 @@ def _harvest_emails(events: object) -> list[dict[str, str]]:
         for commit in commits:
             author = commit.get("author") if isinstance(commit, dict) else None
             address = str(author.get("email") or "").strip().lower() if isinstance(author, dict) else ""
-            if not address or "@" not in address or address in seen:
+            if not address or "@" not in address or address in seen or _is_ignored_email(address):
                 continue
             seen.add(address)
             emails.append({"email": address, "source": "github:events_commits"})
@@ -145,7 +168,7 @@ def _harvest_commit_search(data: object, source: str) -> dict[str, list]:
         author = commit.get("author") if isinstance(commit, dict) else None
         address = (str(author.get("email") or "").strip().lower()
                    if isinstance(author, dict) else "")
-        if address and "@" in address and address not in seen_emails:
+        if address and "@" in address and address not in seen_emails and not _is_ignored_email(address):
             seen_emails.add(address)
             emails.append({"email": address, "source": source})
         actor_sources = [
@@ -156,7 +179,7 @@ def _harvest_commit_search(data: object, source: str) -> dict[str, list]:
         for actor in actor_sources:
             login = (str(actor.get("login") or "").strip()
                      if isinstance(actor, dict) else "")
-            if login and login.lower() not in seen_logins:
+            if login and not _is_ignored_actor(login) and login.lower() not in seen_logins:
                 seen_logins.add(login.lower())
                 logins.append(login)
         repository = item.get("repository")
@@ -252,7 +275,7 @@ async def _hydrate_login(client, lookup: _Lookup, login: str, *,
                          fallback_user: dict | None = None) -> None:
     """Fetch one discovered login's profile + repos (bounded, non-fatal)."""
     login = str(login or "").strip()
-    if not login or login in lookup.hydrated_logins:
+    if not login or _is_ignored_actor(login) or login in lookup.hydrated_logins:
         return
     lookup.hydrated_logins.add(login)
     profile_result, profile = await _fetch_json(

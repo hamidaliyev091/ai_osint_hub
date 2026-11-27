@@ -200,8 +200,54 @@ _USERNAME_BLOCKLIST = frozenset({
     "about", "search", "profile", "profiles", "user", "users", "login",
     "signup", "signin", "explore", "home", "settings", "help", "contact",
     "search-by-username", "profil", "feed", "share", "intent",
+    "members", "member", "account", "accounts", "register",
 })
+USERNAME_BLOCKLIST = _USERNAME_BLOCKLIST
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]{1,63}$", re.IGNORECASE)
+
+#: Public freemail, relay, and synthetic noreply provider domains.
+#: Never count these as target-owned infrastructure or inflate confidence.
+PROVIDER_INFRASTRUCTURE_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "ymail.com", "icloud.com", "me.com", "mac.com",
+    "proton.me", "protonmail.com", "pm.me", "aol.com", "gmx.com", "gmx.net",
+    "mail.com", "yandex.ru", "yandex.com", "mail.ru", "inbox.ru", "list.ru",
+    "bk.ru", "qq.com", "163.com", "126.com", "users.noreply.github.com",
+    "noreply.github.com", "privaterelay.appleid.com", "mozmail.com",
+    "duck.com", "anonaddy.me", "simplelogin.com",
+})
+
+
+def is_noreply_email(value: str) -> bool:
+    """True for synthetic/noreply email addresses (e.g. *@users.noreply.github.com)."""
+    addr = normalize_email(value)
+    if "@" not in addr:
+        return False
+    local, _, domain = addr.partition("@")
+    if domain in {"users.noreply.github.com", "noreply.github.com"} or domain.endswith(".noreply.github.com"):
+        return True
+    if domain.startswith(("noreply.", "no-reply.")):
+        return True
+    if local in {"noreply", "no-reply", "donotreply", "do-not-reply"}:
+        return True
+    if local.startswith(("noreply+", "noreply.", "noreply-", "no-reply+", "no-reply.", "no-reply-")):
+        return True
+    if "+noreply" in local:
+        return True
+    return False
+
+
+def is_provider_infrastructure_domain(host: str) -> bool:
+    """True for public freemail, relay, or noreply provider infrastructure hosts."""
+    norm = normalize_domain(host)
+    if not norm:
+        return False
+    if norm in PROVIDER_INFRASTRUCTURE_DOMAINS:
+        return True
+    return (
+        norm.startswith(("noreply.", "no-reply."))
+        or norm.endswith(".noreply.github.com")
+    )
 
 
 def is_valid_username(value: str) -> bool:
@@ -509,7 +555,8 @@ def derive_entity_drafts(entity_type: EntityType | str, raw_value: str,
             if primary.entity_type == EntityType.REPOSITORY:
                 host = primary.canonical_value.split("/", 1)[0]
                 drafts.append(_draft(EntityType.DOMAIN, host, derived_from=raw,
-                                     metadata={"role": "repository_host"}))
+                                     metadata={"role": "repository_host",
+                                               "provider_infrastructure": True}))
                 relations.append(RelationDraft(
                     primary.entity_type, primary.raw_value, EdgeType.FOUND_IN,
                     EntityType.DOMAIN, host, {"role": "repository_host"}))
@@ -529,7 +576,10 @@ def derive_entity_drafts(entity_type: EntityType | str, raw_value: str,
             if parts is None:
                 # File/config names (proxies.yaml, keys.json…) are never hostnames.
                 if normalize_domain(raw):
-                    drafts.append(_draft(EntityType.DOMAIN, raw, metadata=metadata))
+                    meta = dict(metadata)
+                    if is_provider_infrastructure_domain(raw):
+                        meta["provider_infrastructure"] = True
+                    drafts.append(_draft(EntityType.DOMAIN, raw, metadata=meta))
                 return drafts, relations
             host, registrable, is_sub = parts
             if etype == EntityType.SUBDOMAIN and not is_sub:
@@ -538,11 +588,19 @@ def derive_entity_drafts(entity_type: EntityType | str, raw_value: str,
             if etype == EntityType.DOMAIN and is_sub:
                 # amass/theHarvester report subdomains as domains; split them.
                 primary_type = EntityType.SUBDOMAIN
-            primary = _draft(primary_type, raw, metadata=metadata, aliases=aliases)
+            primary_meta = dict(metadata)
+            if is_provider_infrastructure_domain(host):
+                primary_meta["provider_infrastructure"] = True
+                if host.startswith(("noreply.", "no-reply.")) or host.endswith(".noreply.github.com"):
+                    primary_meta["is_noreply"] = True
+            primary = _draft(primary_type, raw, metadata=primary_meta, aliases=aliases)
             drafts.append(primary)
             if is_sub:
+                parent_meta: dict[str, Any] = {"role": "registrable_parent"}
+                if is_provider_infrastructure_domain(registrable):
+                    parent_meta["provider_infrastructure"] = True
                 parent = _draft(EntityType.DOMAIN, registrable, derived_from=raw,
-                                metadata={"role": "registrable_parent"})
+                                metadata=parent_meta)
                 drafts.append(parent)
                 relations.append(RelationDraft(
                     primary_type, raw, EdgeType.SUBDOMAIN_OF,
@@ -550,23 +608,44 @@ def derive_entity_drafts(entity_type: EntityType | str, raw_value: str,
             else:
                 # Ensure hostname is canonical (strip www) even for plain domains.
                 drafts[0] = _draft(EntityType.DOMAIN, registrable if not is_sub else raw,
-                                   metadata=metadata, aliases=aliases)
+                                   metadata=primary_meta, aliases=aliases)
             return drafts, relations
 
-        # ── Email: derive the mail domain ──
+        # ── Email: derive the mail domain (respecting subdomain vs domain) ──
         if etype == EntityType.EMAIL:
-            if not _EMAIL_RE.match(normalize_email(raw)):
-                drafts.append(_draft(EntityType.EMAIL, raw, metadata=metadata,
+            norm_email = normalize_email(raw)
+            email_meta = dict(metadata)
+            noreply = is_noreply_email(norm_email)
+            if noreply:
+                email_meta["is_noreply"] = True
+                email_meta["provider_infrastructure"] = True
+            if not _EMAIL_RE.match(norm_email):
+                drafts.append(_draft(EntityType.EMAIL, raw, metadata=email_meta,
                                      aliases=aliases))
                 return drafts, relations
-            primary = _draft(EntityType.EMAIL, raw, metadata=metadata, aliases=aliases)
+            primary = _draft(EntityType.EMAIL, raw, metadata=email_meta, aliases=aliases)
             drafts.append(primary)
             domain = primary.canonical_value.split("@", 1)[1]
-            drafts.append(_draft(EntityType.DOMAIN, domain, derived_from=raw,
-                                 metadata={"role": "mail_domain"}))
-            relations.append(RelationDraft(
-                EntityType.EMAIL, raw, EdgeType.ASSOCIATED_WITH,
-                EntityType.DOMAIN, domain, {"role": "mail_domain"}))
+            domain_meta: dict[str, Any] = {"role": "mail_domain"}
+            if noreply or is_provider_infrastructure_domain(domain):
+                domain_meta["provider_infrastructure"] = True
+            if noreply:
+                domain_meta["is_noreply"] = True
+            host_parts = split_hostname(domain)
+            if host_parts is not None:
+                host, _registrable, is_sub = host_parts
+                host_type = EntityType.SUBDOMAIN if is_sub else EntityType.DOMAIN
+                drafts.append(_draft(host_type, host, derived_from=raw,
+                                     metadata=domain_meta))
+                relations.append(RelationDraft(
+                    EntityType.EMAIL, raw, EdgeType.ASSOCIATED_WITH,
+                    host_type, host, {"role": "mail_domain"}))
+            else:
+                drafts.append(_draft(EntityType.DOMAIN, domain, derived_from=raw,
+                                     metadata=domain_meta))
+                relations.append(RelationDraft(
+                    EntityType.EMAIL, raw, EdgeType.ASSOCIATED_WITH,
+                    EntityType.DOMAIN, domain, {"role": "mail_domain"}))
             return drafts, relations
 
         # ── Username: never persist an e-mail address/URL/generic slug ──
@@ -668,6 +747,9 @@ __all__ = [
     "normalize_organization",
     "is_valid_username",
     "USERNAME_BLOCKLIST",
+    "PROVIDER_INFRASTRUCTURE_DOMAINS",
+    "is_noreply_email",
+    "is_provider_infrastructure_domain",
     "normalize_ip",
     "normalize_asn",
     "normalize_repository",

@@ -268,11 +268,23 @@ class TestClaims:
         store = store_factory()
         artifact, subject = self._setup(store)
         artifact2 = add_artifact(store, "maigret", suffix="2")
-        first = store.upsert_claim(INV, subject, "HAS_EMAIL",
-                                   object_literal="a@example.com",
+        # HAS_EMAIL is multi-valued (non-functional) so multiple verified emails never contradict.
+        e1 = store.upsert_claim(INV, subject, "HAS_EMAIL",
+                                object_literal="a@example.com",
+                                artifact_id=artifact, source_tool="holehe")
+        e2 = store.upsert_claim(INV, subject, "HAS_EMAIL",
+                                object_literal="b@example.com",
+                                artifact_id=artifact2, source_tool="maigret")
+        assert store.list_contradictions(INV) == []
+        assert store.get_claim(e1.claim_id).status != EpistemicStatus.CONTRADICTED
+        assert store.get_claim(e2.claim_id).status != EpistemicStatus.CONTRADICTED
+
+        # Single-valued functional predicates (such as HAS_PHONE) still flag contradictions.
+        first = store.upsert_claim(INV, subject, "HAS_PHONE",
+                                   object_literal="+15550001111",
                                    artifact_id=artifact, source_tool="holehe")
-        second = store.upsert_claim(INV, subject, "HAS_EMAIL",
-                                    object_literal="b@example.com",
+        second = store.upsert_claim(INV, subject, "HAS_PHONE",
+                                    object_literal="+15550002222",
                                     artifact_id=artifact2, source_tool="maigret")
         contradictions = store.list_contradictions(INV)
         assert len(contradictions) == 1

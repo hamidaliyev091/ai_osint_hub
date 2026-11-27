@@ -94,10 +94,10 @@ class TestGeneration:
         store = store_factory()
         investigation, seed = seeded_store(store)
         username = support.entity(store, EntityType.USERNAME, "conflict")
-        support.claim(store, username.entity_id, "HAS_EMAIL",
-                      object_literal="a@example.com", tools=("holehe",))
-        support.claim(store, username.entity_id, "HAS_EMAIL",
-                      object_literal="b@example.com", tools=("maigret",))
+        support.claim(store, username.entity_id, "HAS_PHONE",
+                      object_literal="+15550001111", tools=("holehe",))
+        support.claim(store, username.entity_id, "HAS_PHONE",
+                      object_literal="+15550002222", tools=("maigret",))
         graph = support.graph(store, [seed.entity_id])
         new = HypothesisGenerator(store).generate(
             investigation, graph, available_tool_ids=["mock_username"])

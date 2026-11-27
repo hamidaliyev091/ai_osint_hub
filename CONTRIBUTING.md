@@ -66,7 +66,7 @@ AI_OSINT_HUB_LIVE=1 python -m pytest tests/test_live_smoke.py -q
 - `hub/investigation/` — hypothesis generation, mathematical pivot scoring, stopping rules, quarantined reflection, and investigation engine loop.
 - `hub/ai/` — optional hybrid local/cloud AI & VLM layer (`enabled=False` default).
 - `hub/bundle.py` & `hub/demo.py` — hardened `.osintcase.zip` export/import and synthetic offline demo case.
-- `hub/service.py`, `hub/cli.py`, `hub/mcp_server.py`, `hub/web.py`, `hub/reporting.py` — parity service, CLI, stdio MCP + MCP App, Gruvbox Web Workbench, and evidence-cited dossiers.
+- `hub/service.py`, `hub/cli.py`, `hub/mcp_server.py`, `hub/web.py`, `hub/reporting.py` — parity service (`overview`, `visuals`, `upload_visual`, etc.), CLI, stdio MCP + MCP App, 4-theme Workbench, and evidence-cited dossiers.
 
 ---
 

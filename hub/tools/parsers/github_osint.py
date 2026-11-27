@@ -29,6 +29,31 @@ MAX_ITEMS = 100
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+_IGNORED_LOGINS = frozenset({
+    "web-flow",
+    "dependabot",
+    "dependabot[bot]",
+    "github-actions",
+    "github-actions[bot]",
+    "renovate",
+    "renovate[bot]",
+})
+_IGNORED_EMAILS = frozenset({"noreply@github.com"})
+
+
+def _is_bot_login(login: str) -> bool:
+    low = str(login or "").strip().lower()
+    return bool(low) and (low in _IGNORED_LOGINS or low.endswith("[bot]"))
+
+
+def _is_bot_email(address: str) -> bool:
+    low = str(address or "").strip().lower()
+    if not low:
+        return False
+    if low in _IGNORED_EMAILS:
+        return True
+    local = low.split("@", 1)[0]
+    return local in _IGNORED_LOGINS or local.endswith("[bot]") or "[bot]" in local
 
 
 def parse(raw_stdout: str, target: str = "") -> ParseOutput:
@@ -145,8 +170,10 @@ def _parse(raw_stdout: str, target: str) -> ParseOutput:
     primary_person = ""
     for user in users:
         login = _as_text(user.get("login"))
+        if _is_bot_login(login):
+            continue
         name = _as_text(user.get("name")) or login
-        if not name:
+        if not name or _is_bot_login(name):
             continue
         evidence = (
             f"GitHub public profile login={login or '?'}"
@@ -216,7 +243,7 @@ def _parse(raw_stdout: str, target: str) -> ParseOutput:
     for item in emails[:MAX_ITEMS]:
         address = _as_text(item.get("email")).lower() if isinstance(item, dict) else ""
         source = _as_text(item.get("source")) if isinstance(item, dict) else ""
-        if not address or not _EMAIL_RE.match(address):
+        if not address or not _EMAIL_RE.match(address) or _is_bot_email(address):
             continue
         evidence = f"GitHub public event commit author e-mail: {address}" + (
             f" (source {source})" if source else "")
@@ -226,14 +253,14 @@ def _parse(raw_stdout: str, target: str) -> ParseOutput:
             add_relation(EntityType.PERSON, primary_person, EdgeType.HAS_EMAIL,
                          EntityType.EMAIL, address, 0.75, evidence)
 
-    if queried_username:
+    if queried_username and not _is_bot_login(queried_username):
         evidence = f"GitHub lookup was performed for username {queried_username}"
         add_entity(EntityType.USERNAME, queried_username, 0.70, evidence,
                    metadata={"source": "github:query"})
         if primary_person:
             add_relation(EntityType.PERSON, primary_person, EdgeType.HAS_USERNAME,
                          EntityType.USERNAME, queried_username, 0.70, evidence)
-    if queried_email:
+    if queried_email and not _is_bot_email(queried_email):
         evidence = f"GitHub user search matched e-mail address {queried_email}"
         add_entity(EntityType.EMAIL, queried_email.lower(), 0.75, evidence,
                    metadata={"source": "github:search_query"})

@@ -38,16 +38,60 @@ _SOFT_404_SITES = (
     "giphy", "trello", "discord", "mastodon.cloud", "mastodon.xyz",
     "mstdn.io", "mstdn.social",
 )
+_GENERIC_PATH_SEGMENTS = frozenset({
+    "members", "member", "user", "users", "profile", "profiles",
+    "login", "signup", "signin", "register", "about", "search",
+    "explore", "home", "account", "accounts", "settings", "help",
+    "contact", "faq", "terms", "privacy", "policy", "feed", "share",
+    "intent", "logout", "channel", "status", "watch", "api", "www",
+    "u", "in", "c", "v", "p",
+})
 
 
-def _is_root_only_url(url: str) -> bool:
+def _url_path_segments(url: str) -> list[str]:
     try:
         from urllib.parse import urlsplit
 
         parts = urlsplit(url)
-        return (parts.path or "/") in {"", "/"}
+        return [
+            seg.strip("@").split("?", 1)[0].split("#", 1)[0]
+            for seg in (parts.path or "").split("/")
+            if seg.strip()
+        ]
     except ValueError:
+        return []
+
+
+def _is_root_only_url(url: str) -> bool:
+    return not _url_path_segments(url)
+
+
+def _handle_matches_target(segment: str, target: str) -> bool:
+    if not target:
+        return True
+    clean_target = target.strip().lower().lstrip("@")
+    if not clean_target:
+        return True
+    forms = {clean_target, re.sub(r"[^a-z0-9]", "", clean_target)}
+    clean_seg = (segment or "").strip().lower().lstrip("@")
+    if not clean_seg:
         return False
+    return clean_seg in forms or re.sub(r"[^a-z0-9]", "", clean_seg) in forms
+
+
+def _is_generic_or_mismatched_url(url: str, target: str = "") -> bool:
+    segments = _url_path_segments(url)
+    if not segments:
+        return True
+    final_seg = segments[-1].lower()
+    if final_seg in _GENERIC_PATH_SEGMENTS:
+        return True
+    non_generic = [seg for seg in segments if seg.lower() not in _GENERIC_PATH_SEGMENTS]
+    if not non_generic:
+        return True
+    if target and not _handle_matches_target(final_seg, target):
+        return True
+    return False
 
 
 def _is_soft_404_site(site: str, url: str = "") -> bool:
@@ -111,7 +155,7 @@ def parse(raw_stdout: str, target: str = "") -> ParseOutput:
         site_key = re.sub(r"\s+", " ", site).strip().lower()
         if not site_key or site_key in seen_sites:
             continue
-        if _is_soft_404_site(site_key, url) or _is_root_only_url(url):
+        if _is_soft_404_site(site_key, url) or _is_generic_or_mismatched_url(url, subject_value):
             continue
         seen_sites.add(site_key)
         registered = marker in ("+", "*")

@@ -538,6 +538,27 @@ async def fetch_embeddings(
         return EmbeddingResponse(ok=False, provider=provider.value, status="error",
                                  error="No non-empty texts provided")
 
+    if provider == AIProviderKind.LOCAL_EMBEDDED:
+        import asyncio
+        from hub.ai.embeddings import embed_fastembed_texts
+
+        model = (model_override or config.local_embedded_text_model).strip()
+        vectors = await asyncio.to_thread(embed_fastembed_texts, clean_texts, model_name=model)
+        if vectors is None or len(vectors) != len(clean_texts):
+            return EmbeddingResponse(
+                ok=False,
+                provider="local_embedded",
+                model=model,
+                status="unavailable",
+                error="fastembed is not installed (install with pip install 'ai-osint-hub[local-ai]')",
+            )
+        return EmbeddingResponse(
+            ok=True,
+            vectors=vectors,
+            provider="local_embedded",
+            model=model,
+        )
+
     try:
         async with _make_async_client(config, transport=transport) as client:
             if provider == AIProviderKind.OLLAMA:

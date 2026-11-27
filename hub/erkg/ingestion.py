@@ -17,10 +17,20 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from hub.erkg.resolution import EntityResolver, derive_entity_drafts
+from hub.erkg.resolution import (
+    EntityResolver,
+    derive_entity_drafts,
+    is_noreply_email,
+    is_valid_username,
+)
 from hub.erkg.store import ERKGStore
-from hub.models import EdgeType, Entity, EntityType, param_hash
+from hub.models import EdgeType, Entity, EntityType, EpistemicStatus, param_hash
 from hub.tools.base import EntityCandidate, ParseOutput, RelationCandidate
+
+_ROLE_LOCALPARTS = frozenset({
+    "info", "contact", "admin", "support", "office", "mail", "hr", "sales",
+    "press", "help", "staff", "team", "user", "users", "noreply", "no-reply",
+})
 
 
 @dataclass
@@ -100,7 +110,116 @@ class EvidenceIngestor:
         result.new_claims = max(0, self.store.count_claims(investigation_id) - before_claims)
         result.contradictions = max(
             0, len(self.store.list_contradictions(investigation_id)) - before_contradictions)
+        self._unify_duplicate_persons(investigation_id, timestamp, result)
         return result
+
+    def _unify_duplicate_persons(
+        self,
+        investigation_id: str,
+        timestamp: str,
+        result: IngestResult,
+    ) -> None:
+        """Merge duplicate PERSON nodes sharing a verified unique username or email."""
+        persons = self.store.list_entities(investigation_id, types=[EntityType.PERSON])
+        if len(persons) < 2:
+            return
+        inv = self.store.get_investigation(investigation_id)
+        seed_set = set(inv.seed_entity_ids) if inv is not None else set()
+        entities = {e.entity_id: e for e in self.store.list_entities(investigation_id)}
+        claims = self.store.list_claims(investigation_id)
+
+        ident_map: dict[str, set[str]] = {p.entity_id: set() for p in persons}
+        ignored_statuses = {
+            EpistemicStatus.HYPOTHESIS,
+            EpistemicStatus.CONTRADICTED,
+            EpistemicStatus.COLLECTION_FAILURE,
+        }
+        for claim in claims:
+            if claim.subject_id not in ident_map or claim.status in ignored_statuses:
+                continue
+            if claim.object_id and claim.object_id in entities:
+                obj = entities[claim.object_id]
+                if (
+                    obj.type == EntityType.USERNAME
+                    and claim.predicate in {
+                        EdgeType.HAS_USERNAME.value,
+                        EdgeType.IDENTIFIED_AS.value,
+                        EdgeType.OWNS.value,
+                    }
+                    and is_valid_username(obj.canonical_value)
+                ):
+                    ident_map[claim.subject_id].add(f"u:{obj.canonical_value.lower()}")
+                elif (
+                    obj.type == EntityType.EMAIL
+                    and claim.predicate == EdgeType.HAS_EMAIL.value
+                    and not is_noreply_email(obj.canonical_value)
+                ):
+                    local = obj.canonical_value.split("@", 1)[0].split("+", 1)[0].lower()
+                    if local not in _ROLE_LOCALPARTS:
+                        ident_map[claim.subject_id].add(f"e:{obj.canonical_value.lower()}")
+            elif (
+                claim.predicate == "HAS_ATTRIBUTE:login"
+                and isinstance(claim.object_literal, str)
+                and is_valid_username(claim.object_literal)
+            ):
+                ident_map[claim.subject_id].add(f"u:{claim.object_literal.strip().lower()}")
+
+        parent = {p.entity_id: p.entity_id for p in persons}
+        person_by_id = {p.entity_id: p for p in persons}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def priority(pid: str) -> tuple:
+            ent = person_by_id[pid]
+            prov = str((ent.metadata or {}).get("provenance") or "")
+            return (
+                1 if pid in seed_set else 0,
+                1 if prov == "USER_PROVIDED_SEED" else 0,
+                len(ent.canonical_value.split()),
+                len(ent.canonical_value),
+            )
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            pa, pb = priority(ra), priority(rb)
+            if pa > pb or (pa == pb and (person_by_id[ra].first_seen, ra) <= (person_by_id[rb].first_seen, rb)):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        by_ident: dict[str, list[str]] = {}
+        for pid, keys in ident_map.items():
+            for key in keys:
+                by_ident.setdefault(key, []).append(pid)
+        for pids in by_ident.values():
+            if len(pids) > 1:
+                base = pids[0]
+                for other in pids[1:]:
+                    union(base, other)
+
+        merged_drops: dict[str, str] = {}
+        for pid in list(parent):
+            root = find(pid)
+            if pid != root:
+                self.store.merge_entities(
+                    investigation_id, root, pid, timestamp=timestamp
+                )
+                merged_drops[pid] = root
+
+        if merged_drops and result.new_entity_ids:
+            updated_new: list[str] = []
+            for eid in result.new_entity_ids:
+                if eid in merged_drops:
+                    continue
+                if eid not in updated_new:
+                    updated_new.append(eid)
+            result.new_entity_ids = updated_new
 
     def ingest_entity(self, investigation_id: str, candidate: EntityCandidate, *,
                       artifact_id: str, tool_id: str, timestamp: str) -> tuple[Entity, bool]:

@@ -29,6 +29,11 @@ _LOCATION_LABEL_RE = re.compile(r"\blocation\s*:\s*(.*)$", re.IGNORECASE)
 _COUNTRY_LABEL_RE = re.compile(r"\bcountry\s*:\s*(.*)$", re.IGNORECASE)
 _LIST_ITEM_RE = re.compile(r"^[-*+]\s+(.+)$")
 _VALID_RE = re.compile(r"\bvalid\s*:\s*(true|yes)\b", re.IGNORECASE)
+_VALID_FALSE_RE = re.compile(r"\bvalid\s*:\s*(false|no)\b", re.IGNORECASE)
+_STRUCTURED_PHONE_RE = re.compile(
+    r"\b(?:country|local|e164|international|carrier|location)\s*:\s*([^\r\n]+)",
+    re.IGNORECASE,
+)
 _PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
 _NOISE_VALUES = {"", "unknown", "not found", "n/a", "none", "null", "error", "-"}
 
@@ -166,7 +171,15 @@ def parse(raw_stdout: str, target: str = "") -> ParseOutput:
 
     if subject_value:
         phone_evidence = _evidence_line(text, subject_value.lstrip("+")) or ""
-        attributes = {"valid": bool(_VALID_RE.search(text))}
+        attributes: dict[str, object] = {}
+        if _VALID_FALSE_RE.search(text):
+            attributes["valid"] = False
+        elif _VALID_RE.search(text):
+            attributes["valid"] = True
+        else:
+            structured_hit = any(_clean(m.group(1)) for m in _STRUCTURED_PHONE_RE.finditer(text))
+            if structured_hit:
+                attributes["valid"] = True
         add_entity(EntityType.PHONE, subject_value, 0.90,
                    {"target": target or subject_value}, phone_evidence, attributes)
 

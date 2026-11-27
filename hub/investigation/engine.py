@@ -531,10 +531,11 @@ class InvestigationEngine:
             other = store.get_entity(entity_id)
             if other is None:
                 continue
-            if (derived_domain_ids and entity_id in derived_domain_ids
-                    and other.type in (EntityType.DOMAIN, EntityType.SUBDOMAIN)):
-                # Email-derived domains are associated with the subject, not
-                # personally owned (explicitly supplied domains keep OWNS).
+            if ((derived_domain_ids and entity_id in derived_domain_ids)
+                    or (other.metadata or {}).get("provider_infrastructure")) \
+                    and other.type in (EntityType.DOMAIN, EntityType.SUBDOMAIN):
+                # Email-derived and provider-infrastructure domains are associated
+                # with the subject, not personally owned.
                 predicate = "ASSOCIATED_WITH"
             else:
                 predicate = (person_link.get(other.type, "ASSOCIATED_WITH")
@@ -695,6 +696,10 @@ class InvestigationEngine:
                 if (entity.entity_id in seed_ids
                         and (entity.metadata or {}).get("provenance")
                         == EMAIL_DERIVED_DOMAIN):
+                    continue
+                if (entity.entity_id in seed_ids
+                        and (entity.metadata or {}).get("provider_infrastructure")
+                        and len(seed_ids) > 1):
                     continue
                 if entity.entity_id in seed_ids and entity.type in (
                         EntityType.DOMAIN, EntityType.SUBDOMAIN):
@@ -986,6 +991,14 @@ class InvestigationEngine:
                                 tool_calls=1 if tool_called else 0,
                                 timestamp=timestamp)
 
+        # ── post-iteration visual harvesting (live runs only) ────────
+        if self._runner is None and ledger_status == ExecutionStatus.SUCCESS:
+            await self._maybe_harvest_visuals(
+                store, target_id, paths,
+                tool_id=pivot.tool_id, stdout=stdout, parse_output=parse_output,
+                scope=refreshed.config.scope, timestamp=timestamp,
+            )
+
         # ── post-iteration state for the caller ────────────────────
         graph_after = GraphView(store, target_id,
                                 store.get_investigation(target_id).seed_entity_ids)
@@ -1051,6 +1064,35 @@ class InvestigationEngine:
 
             await run_case_reflection(store, target_id)
         except Exception:  # noqa: BLE001 - missing/offline AI never breaks deterministic core
+            pass
+
+    async def _maybe_harvest_visuals(
+        self,
+        store: ERKGStore,
+        target_id: str,
+        paths: "InvestigationPaths",
+        *,
+        tool_id: str,
+        stdout: str,
+        parse_output: ParseOutput,
+        scope: ScopeConfig,
+        timestamp: str,
+    ) -> None:
+        """SSRF-safe visual harvesting gated to live runs (never fails core loop)."""
+        try:
+            from hub.tools.visual_harvester import harvest_from_tool_output
+
+            await harvest_from_tool_output(
+                store,
+                target_id,
+                paths.media,
+                tool_id=tool_id,
+                stdout=stdout,
+                parse_output=parse_output,
+                scope=scope,
+                timestamp=timestamp,
+            )
+        except Exception:  # noqa: BLE001
             pass
 
     @staticmethod
@@ -1411,6 +1453,12 @@ class InvestigationEngine:
             last_ingest = ingest
             last_pivot = pivot
             last_status = ledger_status
+            if self._runner is None and ledger_status == ExecutionStatus.SUCCESS and capability is not None:
+                await self._maybe_harvest_visuals(
+                    store, target_id, paths,
+                    tool_id=pivot.tool_id, stdout=stdout, parse_output=parse_output,
+                    scope=current_inv.config.scope, timestamp=pivot_ts,
+                )
 
         refreshed = store.get_investigation(target_id)
         assert refreshed is not None
@@ -1513,13 +1561,70 @@ class InvestigationEngine:
             entry.entity_id for entry in ledger
             if entry.status == ExecutionStatus.SUCCESS
         }
+        executed_github_handles = self._executed_github_handles(
+            store, investigation.target_id, graph, ledger
+        )
         open_hypotheses = store.list_hypotheses(
             investigation.target_id, statuses=[HypothesisStatus.OPEN])
         return scorer.rank(graph, open_hypotheses,
                            allowed_tool_ids=available,
                            executed_keys=executed_keys,
                            blocked_tool_ids=blocked,
-                           successful_entity_ids=successful_entities)
+                           successful_entity_ids=successful_entities,
+                           executed_github_handles=executed_github_handles)
+
+    def _executed_github_handles(
+        self,
+        store: ERKGStore,
+        target_id: str,
+        graph: GraphView,
+        ledger: list[ExecutionRecord],
+    ) -> set[str]:
+        """Collect normalized GitHub handles already queried or hydrated in this case."""
+        handles: set[str] = set()
+        artifact_ids: set[str] = set()
+        case_root = self.paths(target_id).root
+        for entry in ledger:
+            if entry.tool_id.lower() != "github_osint":
+                continue
+            if entry.status not in (ExecutionStatus.SUCCESS, ExecutionStatus.EMPTY):
+                continue
+            ent = graph.entities.get(entry.entity_id)
+            if ent is not None:
+                if ent.type == EntityType.USERNAME:
+                    handles.add(ent.canonical_value.strip().lower().lstrip("@"))
+                elif ent.type == EntityType.EMAIL and "@" in ent.canonical_value:
+                    local = ent.canonical_value.split("@", 1)[0].strip().lower()
+                    if local:
+                        handles.add(local)
+            if entry.artifact_id:
+                artifact_ids.add(entry.artifact_id)
+                art = store.get_artifact(entry.artifact_id)
+                if art and art.raw_output_path:
+                    raw_file = case_root / art.raw_output_path
+                    if raw_file.is_file():
+                        try:
+                            payload = json.loads(raw_file.read_text(encoding="utf-8", errors="replace"))
+                            if isinstance(payload, dict):
+                                q = payload.get("query") or {}
+                                if isinstance(q, dict) and q.get("username"):
+                                    handles.add(str(q["username"]).strip().lower().lstrip("@"))
+                                for user in (payload.get("users") or []):
+                                    if isinstance(user, dict) and user.get("login"):
+                                        handles.add(str(user["login"]).strip().lower().lstrip("@"))
+                        except (OSError, ValueError):
+                            pass
+        if artifact_ids:
+            for claim in graph.claims:
+                if not (set(claim.artifact_ids) & artifact_ids):
+                    continue
+                if claim.predicate == "HAS_ATTRIBUTE:login" and isinstance(claim.object_literal, str):
+                    handles.add(claim.object_literal.strip().lower().lstrip("@"))
+                elif claim.predicate in {"HAS_USERNAME", "IDENTIFIED_AS"} and claim.object_id:
+                    obj = graph.entities.get(claim.object_id)
+                    if obj is not None and obj.type == EntityType.USERNAME:
+                        handles.add(obj.canonical_value.strip().lower().lstrip("@"))
+        return {h for h in handles if h}
 
     #: Error codes that permanently trip a tool's circuit breaker in one run.
     _CIRCUIT_BREAKER_CODES = frozenset({
@@ -1807,12 +1912,17 @@ class InvestigationPaths:
         return self.root / "raw"
 
     @property
+    def media(self) -> Path:
+        return self.root / "media"
+
+    @property
     def scratch(self) -> Path:
         return self.root / "scratch"
 
     def ensure(self) -> "InvestigationPaths":
         self.root.mkdir(parents=True, exist_ok=True)
         self.raw.mkdir(parents=True, exist_ok=True)
+        self.media.mkdir(parents=True, exist_ok=True)
         self.scratch.mkdir(parents=True, exist_ok=True)
         return self
 

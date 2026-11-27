@@ -8,7 +8,10 @@ n-gram TF-IDF cosine similarity and Jaro-Winkler string similarity.
 
 from __future__ import annotations
 
+import importlib.util
+import io
 import math
+import threading
 import unicodedata
 from collections import Counter
 from typing import Any, Sequence
@@ -16,8 +19,82 @@ from typing import Any, Sequence
 import httpx
 
 from hub.ai.config import load_ai_config
-from hub.ai.models import AIConfig
+from hub.ai.models import AIConfig, AIProviderKind
 from hub.ai.providers import fetch_embeddings
+
+_FASTEMBED_LOCK = threading.RLock()
+_FASTEMBED_TEXT_MODELS: dict[str, Any] = {}
+_FASTEMBED_IMAGE_MODELS: dict[str, Any] = {}
+
+
+def fastembed_availability() -> dict[str, Any]:
+    """Check whether optional ``fastembed`` (``[local-ai]``) is installed without loading weights."""
+    installed = importlib.util.find_spec("fastembed") is not None
+    return {
+        "available": installed,
+        "text_model": "BAAI/bge-small-en-v1.5",
+        "vision_model": "Qdrant/clip-ViT-B-32-vision",
+        "install_hint": 'pip install "ai-osint-hub[local-ai]"',
+    }
+
+
+def embed_fastembed_texts(
+    texts: Sequence[str],
+    *,
+    model_name: str = "BAAI/bge-small-en-v1.5",
+) -> list[list[float]] | None:
+    """Compute dense embeddings via ``fastembed`` if installed; else return ``None``."""
+    clean = [str(t or "")[:4000] for t in texts if str(t or "").strip()]
+    if not clean:
+        return None
+    try:
+        from fastembed import TextEmbedding
+    except ImportError:
+        return None
+    try:
+        with _FASTEMBED_LOCK:
+            model = _FASTEMBED_TEXT_MODELS.get(model_name)
+            if model is None:
+                model = TextEmbedding(model_name=model_name)
+                _FASTEMBED_TEXT_MODELS[model_name] = model
+        vectors = [list(map(float, vec)) for vec in model.embed(clean)]
+        return vectors if len(vectors) == len(clean) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def embed_image_bytes(
+    raw_bytes: bytes,
+    *,
+    config: AIConfig | None = None,
+    model_name: str = "Qdrant/clip-ViT-B-32-vision",
+) -> list[float] | None:
+    """Compute a CLIP image embedding via ``fastembed`` when ``local_embedded`` is enabled."""
+    cfg = config or load_ai_config()
+    if not cfg.enabled or (cfg.provider != AIProviderKind.LOCAL_EMBEDDED and cfg.mode != "local_embedded"):
+        return None
+    if not raw_bytes:
+        return None
+    try:
+        from fastembed import ImageEmbedding
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        target_model = cfg.local_embedded_vision_model or model_name
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            rgb = img.convert("RGB")
+            with _FASTEMBED_LOCK:
+                model = _FASTEMBED_IMAGE_MODELS.get(target_model)
+                if model is None:
+                    model = ImageEmbedding(model_name=target_model)
+                    _FASTEMBED_IMAGE_MODELS[target_model] = model
+            vecs = list(model.embed([rgb]))
+            if vecs:
+                return [float(x) for x in vecs[0]]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
@@ -202,6 +279,9 @@ async def correlate_texts(
 
 
 __all__ = [
+    "fastembed_availability",
+    "embed_fastembed_texts",
+    "embed_image_bytes",
     "cosine_similarity",
     "jaro_winkler_similarity",
     "char_ngram_tfidf_vectors",

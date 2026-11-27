@@ -7,15 +7,16 @@ deterministic OSINT core runs identically with zero LLM dependencies.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AIProviderKind(str, Enum):
     """Supported local and remote AI inference providers."""
 
     DISABLED = "disabled"
+    LOCAL_EMBEDDED = "local_embedded"
     OLLAMA = "ollama"
     LMSTUDIO = "lmstudio"
     GEMINI = "gemini"
@@ -121,10 +122,15 @@ class AIConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
+    mode: Literal["off", "local_embedded", "ollama", "cloud"] = "off"
     preset: AIHardwarePreset = AIHardwarePreset.DISABLED
     provider: AIProviderKind = AIProviderKind.DISABLED
     num_ctx: int = Field(default=8192, ge=512, le=131072)
     keep_alive: str = "2m"
+
+    # Embedded local AI defaults (fastembed, zero external server)
+    local_embedded_text_model: str = "BAAI/bge-small-en-v1.5"
+    local_embedded_vision_model: str = "Qdrant/clip-ViT-B-32-vision"
 
     # Local consumer-hardware defaults (8 GB VRAM + 32 GB RAM)
     ollama_host: str = "http://127.0.0.1:11434"
@@ -160,6 +166,36 @@ class AIConfig(BaseModel):
     timeout_sec: float = Field(default=30.0, ge=1.0, le=300.0)
     vision_enabled: bool = False
     reflection_enabled: bool = True
+
+    @model_validator(mode="after")
+    def _sync_mode_and_provider(self) -> "AIConfig":
+        mode_set = "mode" in self.model_fields_set
+        provider_set = "provider" in self.model_fields_set
+        enabled_set = "enabled" in self.model_fields_set
+        if mode_set and not provider_set and not enabled_set:
+            if self.mode == "off":
+                self.enabled = False
+                self.provider = AIProviderKind.DISABLED
+            elif self.mode == "local_embedded":
+                self.enabled = True
+                self.provider = AIProviderKind.LOCAL_EMBEDDED
+            elif self.mode == "ollama":
+                self.enabled = True
+                self.provider = AIProviderKind.OLLAMA
+            elif self.mode == "cloud":
+                self.enabled = True
+                self.provider = AIProviderKind.GEMINI
+            return self
+
+        if not self.enabled or self.provider == AIProviderKind.DISABLED:
+            self.mode = "off"
+        elif self.provider == AIProviderKind.LOCAL_EMBEDDED:
+            self.mode = "local_embedded"
+        elif self.provider in {AIProviderKind.OLLAMA, AIProviderKind.LMSTUDIO}:
+            self.mode = "ollama"
+        else:
+            self.mode = "cloud"
+        return self
 
 
 class ReflectionAmbiguousMatch(BaseModel):
@@ -220,6 +256,7 @@ class AIStatusReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool
+    mode: str = "off"
     preset: AIHardwarePreset = AIHardwarePreset.DISABLED
     provider: AIProviderKind
     active: bool
@@ -232,6 +269,7 @@ class AIStatusReport(BaseModel):
     endpoints: dict[str, str] = Field(default_factory=dict)
     credentials: dict[str, dict[str, Any]] = Field(default_factory=dict)
     local_probes: dict[str, Any] = Field(default_factory=dict)
+    local_embedded: dict[str, Any] = Field(default_factory=dict)
     hardware_profile: dict[str, Any] = Field(default_factory=dict)
     presets_catalog: dict[str, dict[str, Any]] = Field(default_factory=dict)
     installed_models: list[str] = Field(default_factory=list)

@@ -136,8 +136,9 @@ class EdgeType(str, Enum):
 
 # Predicates that are functional: a subject may have at most one true value.
 # Conflicting values from independent sources are CONTRADICTED.
+# HAS_EMAIL is intentionally NOT functional: a person/entity can legitimately
+# own multiple email addresses (work, personal, commit emails).
 FUNCTIONAL_PREDICATES = {
-    EdgeType.HAS_EMAIL,
     EdgeType.HAS_PHONE,
     EdgeType.REGISTERED_BY,
     # LOCATED_IN is intentionally NOT functional: locations are hierarchical

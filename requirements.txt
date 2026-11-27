@@ -7,6 +7,9 @@ pyyaml>=6.0
 # Media forensics (EXIF/pHash/dHash)
 Pillow>=10.0
 
+# Optional embedded local AI (text + CLIP embeddings): pip install ".[local-ai]"
+# fastembed>=0.4.0
+
 # Development / verification
 # pytest>=8.0
 

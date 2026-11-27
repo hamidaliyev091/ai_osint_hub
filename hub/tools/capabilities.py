@@ -476,6 +476,8 @@ def available_tool_ids(*, force: bool = False) -> set[str]:
     """Tool ids that are executable *and* credential/auth ready for pivots."""
     available: set[str] = set()
     for cap in all_capabilities():
+        if cap.execution_mode == ExecutionMode.INTRUSIVE_BLOCKED:
+            continue
         status = health_check(cap.tool_id, force=force)
         if (status is not None and status.available
                 and status.auth_ready
@@ -554,6 +556,17 @@ def export_cli_table_rows(*, force_health: bool = False) -> list[dict[str, Any]]
     rows = []
     for cap in all_capabilities():
         status = health_check(cap.tool_id, force=force_health)
+        avail = bool(status and status.available)
+        auth_status = status.auth_status if status else "NOT_REQUIRED"
+        policy_blocked = cap.execution_mode == ExecutionMode.INTRUSIVE_BLOCKED
+        if policy_blocked:
+            ui_status = "blocked"
+        elif not avail:
+            ui_status = "missing"
+        elif auth_status in {"MISSING_KEY", "PARTIAL"}:
+            ui_status = "needs_key"
+        else:
+            ui_status = "ready"
         rows.append({
             "tool_id": cap.tool_id,
             "display_name": cap.display_name,
@@ -563,15 +576,17 @@ def export_cli_table_rows(*, force_health: bool = False) -> list[dict[str, Any]]
             "reliability": cap.reliability,
             "timeout_sec": cap.timeout_sec,
             "rate_limit_rps": cap.rate_limit_rps,
-            "available": bool(status and status.available),
+            "available": avail,
             "resolver": status.resolver if status else "",
             "binary_path": status.binary_path if status else "",
             "health_detail": status.detail if status else "",
-            "auth_status": status.auth_status if status else "NOT_REQUIRED",
+            "auth_status": auth_status,
             "auth_detail": status.auth_detail if status else "",
             "auth_ready": bool(status and status.auth_ready) if status else True,
             "requires_env": list(cap.invocation.api_key_envs),
             "authorization_required": cap.authorization_required,
+            "policy_blocked": policy_blocked,
+            "ui_status": ui_status,
         })
     return rows
 

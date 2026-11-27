@@ -388,9 +388,14 @@ def render_markdown(dossier: dict[str, Any]) -> str:
     for status in ("CONFIRMED", "CORROBORATED", "SINGLE_SOURCE_LEAD",
                    "HYPOTHESIS", "CONTRADICTED", "COLLECTION_FAILURE"):
         lines.append(f"| {status} | {summary['claim_statuses'].get(status, 0)} |")
+    entity_types = summary.get("entity_types") or {}
+    entity_coverage = ", ".join(
+        f"{entity_type}: {entity_types[entity_type]}"
+        for entity_type in sorted(entity_types)
+    ) or "none"
     lines += [
         "",
-        f"**Entity coverage:** {json.dumps(summary['entity_types'], sort_keys=True)}",
+        f"**Entity coverage:** {entity_coverage}",
         "",
         "**Core objectives:**",
         "",
@@ -851,6 +856,13 @@ footer {{
         parts.append(f'<tr><td><span class="badge {status}">{status}</span></td>'
                      f'<td>{_h(statuses.get(status, 0))}</td></tr>')
     parts.append("</table>")
+    entity_types = summary.get("entity_types") or {}
+    if entity_types:
+        chips = " ".join(
+            f'<span class="badge">{_h(entity_type)}: {_h(entity_types[entity_type])}</span>'
+            for entity_type in sorted(entity_types)
+        )
+        parts.append(f'<p><b>Entity coverage:</b> {chips}</p>')
     objectives = summary.get("objectives") or []
     if objectives:
         parts.append("<h3>Core objectives</h3><ul>")

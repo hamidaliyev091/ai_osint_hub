@@ -58,6 +58,9 @@ _TOKEN_RE = re.compile(
 _TEXT_RAW_EXTENSIONS = frozenset({
     ".txt", ".json", ".log", ".md", ".csv", ".tsv", ".xml", ".html", ".yaml", ".yml",
 })
+_SAFE_MEDIA_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico",
+})
 
 
 def _validate_target_id(target_id: Any) -> str:
@@ -370,6 +373,23 @@ def export_case_bundle(
                 }
                 archive_entries.append((arc_name, raw_bytes))
 
+        media_dir = case_dir / "media"
+        if media_dir.is_dir():
+            for child in sorted(media_dir.iterdir(), key=lambda p: p.name):
+                if child.is_symlink() or not child.is_file():
+                    continue
+                if not _SAFE_RAW_NAME_RE.match(child.name) or child.name in {".", ".."}:
+                    continue
+                if child.suffix.lower() not in _SAFE_MEDIA_EXTENSIONS:
+                    continue
+                media_bytes = child.read_bytes()
+                arc_name = f"media/{child.name}"
+                files_manifest[arc_name] = {
+                    "sha256": _sha256_bytes(media_bytes),
+                    "size": len(media_bytes),
+                }
+                archive_entries.append((arc_name, media_bytes))
+
         if len(archive_entries) + 1 > MAX_BUNDLE_MEMBERS:
             raise ValueError(
                 f"Bundle member count ({len(archive_entries) + 1}) exceeds MAX_BUNDLE_MEMBERS ({MAX_BUNDLE_MEMBERS})"
@@ -429,6 +449,13 @@ def _validate_archive_member(info: zipfile.ZipInfo) -> str:
     if name in {"manifest.json", "erkg.sqlite3"}:
         return name
     if len(parts) == 2 and parts[0] == "raw" and _SAFE_RAW_NAME_RE.match(parts[1]):
+        return name
+    if (
+        len(parts) == 2
+        and parts[0] == "media"
+        and _SAFE_RAW_NAME_RE.match(parts[1])
+        and Path(parts[1]).suffix.lower() in _SAFE_MEDIA_EXTENSIONS
+    ):
         return name
     raise ValueError(f"Unexpected bundle member path: {name!r}")
 
@@ -543,6 +570,7 @@ def import_case_bundle(
         staged_case = Path(staging_parent) / "case"
         staged_case.mkdir(parents=True, exist_ok=True)
         (staged_case / "raw").mkdir(exist_ok=True)
+        (staged_case / "media").mkdir(exist_ok=True)
         (staged_case / "scratch").mkdir(exist_ok=True)
 
         try:

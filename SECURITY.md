@@ -6,7 +6,8 @@ AI OSINT Hub is an autonomous intelligence collection and correlation engine des
 
 | Version | Supported | Notes |
 |---|---|---|
-| `2.0.x` | Yes | Current release (ERKG SQLite/WAL, 32-tool runtime, Gruvbox Workbench, `.osintcase.zip` bundles, optional AI layer) |
+| `2.1.x` | Yes | Current release (Overview/Visuals Workbench, 4 themes, SSRF-safe media harvesting, optional `[local-ai]` ONNX, ERKG SQLite/WAL, 32-tool runtime, `.osintcase.zip` bundles) |
+| `2.0.x` | Security fixes only | Prior v2.0 release |
 | `< 2.0.0` | No | Legacy v1 JSON-file orchestrator (deprecated; `hub.orchestrate` compatibility shim only) |
 
 ---
@@ -49,9 +50,10 @@ Scope and execution-mode rules are enforced deterministically in Python before a
 - Registered secrets are scrubbed (`[REDACTED:<PROVIDER>]`) from tool stdout/stderr, error messages, evidence artifacts, SQLite records, CLI/MCP responses, and Web UI payloads. Only masked previews are returned over APIs.
 - AI configuration never harvests credentials from `~/.dsh/.credentials.yaml`, `~/.claude/`, or `~/.codex/`.
 
-### 6. Web Workbench & MCP App XSS / CSP Safety (`hub/web.py`, `hub/reporting.py`, `hub/mcp_server.py`)
+### 6. Web Workbench, Visual Harvester & MCP App XSS / CSP / Media Safety (`hub/web.py`, `hub/tools/visual_harvester.py`, `hub/reporting.py`, `hub/mcp_server.py`)
 
-- Embedded UIs and standalone HTML dossiers build DOM nodes strictly via `document.createElement` and `textContent` — zero `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, or `eval`.
+- Embedded UIs and standalone HTML dossiers build DOM nodes strictly via `document.createElement`, `replaceChildren`, and `textContent` — zero `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, or `eval`.
+- Automatic image harvesting and user uploads validate size (`<= 5 MB`), `fetch_safe` + `assert_safe_host` SSRF rules across redirect hops, MIME + Pillow image decoding, and reject SVG/HTML markup; `/api/investigations/{id}/media/{filename}` enforces strict basename containment and `X-Content-Type-Options: nosniff`.
 - Rendered Markdown links enforce an explicit `http:`, `https:`, and `mailto:` scheme allowlist; `javascript:`, `data:`, and `vbscript:` URIs are stripped.
 - All external vendor assets (`cytoscape.min.js`) are bundled locally with zero runtime CDN calls, and standalone HTML dossiers emit strict Content-Security-Policy (`CSP`) headers.
 

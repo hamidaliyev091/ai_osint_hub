@@ -25,7 +25,7 @@ from typing import Any, Optional
 from hub.bundle import BUNDLE_EXTENSION
 from hub.service import InvestigationService
 
-CLI_VERSION = "2.0.0"
+CLI_VERSION = "2.1.0"
 
 
 def _configure_stdio() -> None:
@@ -590,6 +590,62 @@ def cmd_ai(service: InvestigationService, args) -> int:
     return 0
 
 
+def cmd_overview(service: InvestigationService, args) -> int:
+    result = service.overview(args.target_id)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    subj = result.get("subject") or {}
+    counts = result.get("counts") or {}
+    print(f"Overview {result['target_id']} — {subj.get('name') or result.get('raw_input', '')}")
+    print(
+        f"  accounts={counts.get('accounts', 0)} emails={counts.get('emails', 0)} "
+        f"phones={counts.get('phones', 0)} domains={counts.get('domains', 0)} "
+        f"repos={counts.get('repos', 0)} visuals={counts.get('visuals', 0)} "
+        f"alerts={counts.get('alerts', 0)}"
+    )
+    for acc in result.get("accounts", [])[:12]:
+        print(f"  [{acc['status']}] {acc['platform']}: {acc['url'] or acc['handle']} ({acc['confidence']:.2f})")
+    return 0
+
+
+def cmd_visuals(service: InvestigationService, args) -> int:
+    if getattr(args, "upload", None):
+        upload_path = Path(args.upload).expanduser()
+        if not upload_path.is_file():
+            err = {"status": "error", "errors": [f"file not found: {upload_path}"]}
+            if args.json:
+                _print_json(err)
+            else:
+                print(f"ERROR: file not found: {upload_path}", file=sys.stderr)
+            return 1
+        result = service.upload_visual(
+            args.target_id,
+            upload_path.name,
+            upload_path.read_bytes(),
+            source_label=getattr(args, "label", None) or "uploaded",
+        )
+    else:
+        result = service.visuals(args.target_id)
+    if args.json:
+        _print_json(result)
+        return 1 if _is_error(result) else 0
+    if _is_error(result):
+        print("ERROR: " + "; ".join(result.get("errors", ["unknown error"])), file=sys.stderr)
+        return 1
+    items = result.get("items") or ([result["item"]] if result.get("item") else [])
+    print(f"Visuals for {result['target_id']} ({len(items)} item(s)):")
+    for item in items:
+        print(
+            f"  {item.get('filename') or item.get('id')} [{item.get('source_label')}] "
+            f"{item.get('width')}x{item.get('height')} phash={item.get('phash') or '-'}"
+        )
+    return 0
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Parser
 # ════════════════════════════════════════════════════════════════════════
@@ -804,6 +860,18 @@ def build_parser() -> argparse.ArgumentParser:
     ai_reflect.add_argument("--provider", default=None)
     ai_reflect.add_argument("--json", action="store_true")
     ai_reflect.set_defaults(handler=cmd_ai)
+
+    overview_cmd = subparsers.add_parser("overview", help="human-friendly case overview")
+    overview_cmd.add_argument("target_id")
+    overview_cmd.add_argument("--json", action="store_true")
+    overview_cmd.set_defaults(handler=cmd_overview)
+
+    visuals_cmd = subparsers.add_parser("visuals", help="list or upload case visual/photo forensics")
+    visuals_cmd.add_argument("target_id")
+    visuals_cmd.add_argument("--upload", default=None, help="path to an image file to inspect and attach")
+    visuals_cmd.add_argument("--label", default="uploaded", help="source label for uploaded image")
+    visuals_cmd.add_argument("--json", action="store_true")
+    visuals_cmd.set_defaults(handler=cmd_visuals)
     return parser
 
 
