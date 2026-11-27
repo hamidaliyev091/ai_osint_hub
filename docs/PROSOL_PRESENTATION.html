@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI OSINT Hub v2.1.0 — Technical Presentation for PROSOL</title>
+<style>
+  :root {
+    --bg-primary: #0b1120;
+    --bg-surface: #111827;
+    --bg-card: #1f2937;
+    --border-subtle: #374151;
+    --text-primary: #f3f4f6;
+    --text-muted: #9ca3af;
+    --accent: #2563eb;
+    --accent-glow: rgba(37, 99, 235, 0.25);
+    --accent-emerald: #10b981;
+    --accent-amber: #f59e0b;
+    --accent-rose: #ef4444;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+
+  [data-theme="light"] {
+    --bg-primary: #f8fafc;
+    --bg-surface: #ffffff;
+    --bg-card: #f1f5f9;
+    --border-subtle: #e2e8f0;
+    --text-primary: #0f172a;
+    --text-muted: #64748b;
+    --accent: #2563eb;
+    --accent-glow: rgba(37, 99, 235, 0.12);
+    --accent-emerald: #059669;
+    --accent-amber: #d97706;
+    --accent-rose: #dc2626;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+
+  /* Top Navigation Bar */
+  header.pres-header {
+    height: 54px;
+    padding: 0 1.5rem;
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    z-index: 50;
+  }
+  .pres-title {
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .pres-pill {
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    background: var(--accent-glow);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    border: 1px solid var(--accent);
+  }
+  .pres-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+  .btn-tool {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    transition: all 0.15s ease;
+  }
+  .btn-tool:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* Presentation Viewport */
+  main.deck-viewport {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+  }
+
+  .slide-container {
+    width: 100%;
+    max-width: 1200px;
+    height: 100%;
+    max-height: 720px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 3rem;
+    display: none;
+    flex-direction: column;
+    justify-content: space-between;
+    box-shadow: 0 20px 40px -15px rgba(0,0,0,0.4);
+    animation: fadeIn 0.25s ease-out;
+    overflow-y: auto;
+  }
+  .slide-container.active {
+    display: flex;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Slide Typography & Content */
+  .slide-header {
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: 1.25rem;
+    margin-bottom: 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .slide-header h2 {
+    font-size: 1.85rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+  }
+  .slide-header .slide-cat {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+  .slide-body {
+    flex: 1;
+    overflow-y: auto;
+    font-size: 1.05rem;
+    line-height: 1.6;
+    color: var(--text-primary);
+  }
+
+  /* Grid Layouts inside slides */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.75rem;
+    align-items: center;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+  }
+  .grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+  }
+
+  .card-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 1.25rem;
+  }
+  .card-box h3 {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    color: var(--accent);
+  }
+  .card-box p {
+    font-size: 0.92rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+
+  ul.feature-list {
+    list-style: none;
+    margin-top: 0.5rem;
+  }
+  ul.feature-list li {
+    position: relative;
+    padding-left: 1.5rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.98rem;
+  }
+  ul.feature-list li::before {
+    content: "✓";
+    position: absolute;
+    left: 0;
+    top: 0;
+    color: var(--accent-emerald);
+    font-weight: 900;
+  }
+
+  /* Table styling */
+  table.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    margin: 1rem 0;
+  }
+  table.data-table th, table.data-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  table.data-table th {
+    background: var(--bg-card);
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  /* Code block */
+  pre.code-block {
+    background: #000;
+    color: #4ade80;
+    padding: 1rem 1.25rem;
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    overflow-x: auto;
+    border: 1px solid var(--border-subtle);
+    margin: 1rem 0;
+  }
+
+  .img-preview {
+    width: 100%;
+    max-height: 380px;
+    object-fit: contain;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    background: #000;
+  }
+
+  /* Footer & Speaker Notes */
+  footer.pres-footer {
+    height: 48px;
+    padding: 0 1.5rem;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .progress-bar-wrap {
+    flex: 1;
+    max-width: 300px;
+    height: 6px;
+    background: var(--bg-card);
+    border-radius: 9999px;
+    overflow: hidden;
+    margin: 0 1.5rem;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    width: 8%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
+
+  /* Speaker Notes Drawer */
+  #speaker-notes-panel {
+    display: none;
+    background: rgba(17, 24, 39, 0.95);
+    border-top: 2px solid var(--accent);
+    color: #f3f4f6;
+    padding: 1rem 2rem;
+    font-size: 0.9rem;
+    max-height: 160px;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
+  #speaker-notes-panel.open {
+    display: block;
+  }
+  .notes-badge {
+    color: var(--accent-amber);
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.25rem;
+  }
+</style>
+</head>
+<body data-theme="dark">
+
+<!-- Top Navigation Bar -->
+<header class="pres-header">
+  <div class="pres-title">
+    <span>AI OSINT HUB</span>
+    <span class="pres-pill">v2.1.0</span>
+    <span style="color: var(--text-muted); font-size: 0.8rem; font-weight: normal; margin-left: 0.5rem;">
+      PROSOL Technical Evaluation Deck
+    </span>
+  </div>
+  <div class="pres-controls">
+    <button class="btn-tool" onclick="toggleNotes()" title="Toggle Speaker Notes (Key: N)">
+      <span>📝</span> Notes <span style="font-size: 0.7rem; color: var(--text-muted);">[N]</span>
+    </button>
+    <button class="btn-tool" onclick="toggleTheme()" title="Toggle Light/Dark Theme (Key: T)">
+      <span>🌓</span> Theme <span style="font-size: 0.7rem; color: var(--text-muted);">[T]</span>
+    </button>
+    <button class="btn-tool" onclick="toggleFullScreen()" title="Fullscreen (Key: F)">
+      <span>⛶</span> Fullscreen <span style="font-size: 0.7rem; color: var(--text-muted);">[F]</span>
+    </button>
+    <button class="btn-tool" onclick="prevSlide()" title="Previous Slide (Key: ←)">◀ Prev</button>
+    <button class="btn-tool" style="background: var(--accent); color: #fff; border-color: var(--accent);" onclick="nextSlide()" title="Next Slide (Key: → or Space)">Next ▶</button>
+  </div>
+</header>
+
+<!-- Main Slide Deck Viewport -->
+<main class="deck-viewport">
+
+  <!-- SLIDE 1: Title -->
+  <div class="slide-container active" data-notes="Good morning/afternoon team PROSOL. Today I am presenting AI OSINT Hub — an autonomous threat intelligence collection, entity resolution, and attribution workbench. I built this platform to tackle the real engineering bottlenecks in modern CTI: tool fragmentation, hallucination risks, noisy false positives, and operational compliance.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Candidate Technical Presentation — PROSOL</div>
+        <h2>AI OSINT Hub: Enterprise-Grade OSINT Engine</h2>
+      </div>
+      <span class="pres-pill">01 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div>
+        <h3 style="font-size: 1.4rem; margin-bottom: 0.75rem; color: var(--accent);">
+          Autonomous Threat Attribution & Intelligence Collection Platform
+        </h3>
+        <p style="margin-bottom: 1.25rem; color: var(--text-muted);">
+          Engineered as a zero-LLM deterministic foundation with mathematical confidence scoring, SQLite WAL transactions, 32 integrated reconnaissance capabilities, automated visual forensics, and code-enforced defensive boundaries.
+        </p>
+        <ul class="feature-list">
+          <li><strong>Presenter:</strong> Hamid Aliyev</li>
+          <li><strong>Target Opportunity:</strong> Cyber Threat Intelligence (CTI) / Security Automation</li>
+          <li><strong>Repository:</strong> github.com/hamidaliyev091/ai_osint_hub</li>
+          <li><strong>Status:</strong> v2.1.0 Released • 745 Automated Tests • 32/32 Tools Verified</li>
+        </ul>
+      </div>
+      <div class="card-box" style="text-align: center; display: flex; flex-direction: column; justify-content: center; align-items: center; background: rgba(37,99,235,0.05); border: 2px dashed var(--accent);">
+        <img src="assets/social-preview.png" alt="AI OSINT Hub Preview" style="width: 100%; border-radius: 8px; margin-bottom: 1rem; border: 1px solid var(--border-subtle);"/>
+        <div style="font-weight: 700; font-size: 1.05rem;">Recruiter-Grade Security Workbench</div>
+        <div style="font-size: 0.85rem; color: var(--text-muted);">Built for 13" Laptops to 24/7 SOC Ultrawide Monitors</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 2: Problem Statement -->
+  <div class="slide-container" data-notes="Modern OSINT and CTI teams face massive friction. Analysts spend 80% of their time manually copy-pasting terminal output between 15 disconnected CLI tools. Meanwhile, recently hyped 'AI agents' hallucinate relationships, invent non-existent accounts, and lack any cryptographic chain of custody. Furthermore, uncontrolled scraping scripts risk SSRF against corporate infrastructure.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Industry Context & Pain Points</div>
+        <h2>The Core Problem in Modern Threat Intelligence</h2>
+      </div>
+      <span class="pres-pill">02 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div class="card-box" style="border-left: 4px solid var(--accent-rose);">
+        <h3>⚠️ The Status Quo in Most SOCs</h3>
+        <ul class="feature-list" style="margin-top: 1rem;">
+          <li><strong>Tool Fragmentation:</strong> Analysts juggle 10–20 disparate CLIs (theHarvester, holehe, sherlock, shodan), manual note-taking, and broken terminal logs.</li>
+          <li><strong>"AI Wrapper" Hallucinations:</strong> Unchecked LLMs generate plausible but fabricated email addresses, aliases, and IP mappings with zero proof.</li>
+          <li><strong>Synthetic Accounts & Noise:</strong> Bot committers (web-flow) and generic paths (/members) contaminate threat actor identity graphs.</li>
+          <li><strong>Defensive Risks:</strong> Fragile scraping scripts cause SSRF leaks, loopback hits, or unintended active attacks violating client engagement scope.</li>
+        </ul>
+      </div>
+      <div class="card-box" style="border-left: 4px solid var(--accent-emerald);">
+        <h3>🛡️ The AI OSINT Hub Solution</h3>
+        <ul class="feature-list" style="margin-top: 1rem;">
+          <li><strong>Unified Execution:</strong> Single-command autonomous orchestrator coordinating 32 tools through a hardened runtime.</li>
+          <li><strong>Deterministic Ground Truth:</strong> Closed 6-state epistemic model where NO claim can exist without cryptographic SHA-256 evidence.</li>
+          <li><strong>Automated Entity Unification:</strong> Single-subject ERKG automatically merges verified handles and suppresses bot noise.</li>
+          <li><strong>Code-Enforced Security Gates:</strong> Pre-spawn SSRF guards (assert_safe_host), strict Hydra auto-blocking, and untrusted data quarantine.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 3: System Architecture -->
+  <div class="slide-container" data-notes="Here is the core 5-layer pipeline. Notice that the entire collection and resolution pipeline is strictly unidirectional. Clues enter intake, pass through our scope and SSRF policy gate, execute across our 32-tool runtime, get ingested as immutable SHA-256 evidence artifacts, and resolve inside SQLite WAL. Presentation interfaces like Web UI and Stdio FastMCP share 100% parity over this exact engine.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">System Engineering</div>
+        <h2>5-Layer Deterministic Pipeline Architecture</h2>
+      </div>
+      <span class="pres-pill">03 / 12</span>
+    </div>
+    <div class="slide-body">
+      <div class="grid-4" style="margin-bottom: 1.5rem;">
+        <div class="card-box">
+          <div style="font-size: 0.75rem; color: var(--accent); font-weight: 700;">STAGE 1</div>
+          <h3 style="font-size: 1rem;">Multi-Clue Intake</h3>
+          <p>Extracts names, emails, handles, domains, and phone numbers with transliteration preservation.</p>
+        </div>
+        <div class="card-box">
+          <div style="font-size: 0.75rem; color: var(--accent); font-weight: 700;">STAGE 2</div>
+          <h3 style="font-size: 1rem;">Policy & Scope Gate</h3>
+          <p>SSRF enforcement, RFC 1918 blocking, redirect verification, and active-recon policy blocks.</p>
+        </div>
+        <div class="card-box">
+          <div style="font-size: 0.75rem; color: var(--accent); font-weight: 700;">STAGE 3</div>
+          <h3 style="font-size: 1rem;">Hardened Runtime</h3>
+          <p>32 collectors across native HTTP, authenticated APIs, managed sandboxed CLIs, and WSL2.</p>
+        </div>
+        <div class="card-box">
+          <div style="font-size: 0.75rem; color: var(--accent); font-weight: 700;">STAGE 4 & 5</div>
+          <h3 style="font-size: 1rem;">ERKG Store & UI</h3>
+          <p>Atomic SQLite WAL transactions, 6-state epistemics, visual forensics, and multi-theme UI.</p>
+        </div>
+      </div>
+      <div class="card-box" style="background: var(--bg-primary); border: 1px solid var(--border-subtle);">
+        <h4 style="color: var(--accent); margin-bottom: 0.5rem; font-size: 0.95rem;">Key Architecture Invariants:</h4>
+        <div style="display: flex; gap: 1.5rem; font-size: 0.88rem; color: var(--text-muted);">
+          <div>🔒 <strong>Evidence Precondition:</strong> No non-hypothesis claim without a SHA-256 artifact.</div>
+          <div>⚡ <strong>Atomicity:</strong> One iteration = One single SQLite transaction.</div>
+          <div>🛡️ <strong>Zero Shell:</strong> Subprocesses execute via shell=False and stdin=DEVNULL.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 4: Epistemic Model & Accuracy -->
+  <div class="slide-container" data-notes="A critical differentiator is our epistemic model. In v2.1.0, we eliminated false contradictions: HAS_EMAIL is non-functional because legitimate targets have multiple corporate and personal emails. We also implemented _unify_duplicate_persons to merge disparate accounts sharing verified handles into a single identity, preventing fragmented graphs.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Mathematical Truth Engine</div>
+        <h2>Closed 6-State Epistemic Model & Entity Resolution</h2>
+      </div>
+      <span class="pres-pill">04 / 12</span>
+    </div>
+    <div class="slide-body">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Epistemic Status</th>
+            <th>Operational Meaning in PROSOL Investigations</th>
+            <th>Evidence Requirement</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="pres-pill" style="border-color: var(--accent-emerald); color: var(--accent-emerald);">CONFIRMED</span></td>
+            <td>Indisputable ground truth cited in official client briefs.</td>
+            <td>Direct user seed clue OR multi-source cryptographic match.</td>
+          </tr>
+          <tr>
+            <td><span class="pres-pill" style="border-color: var(--accent); color: var(--accent);">CORROBORATED</span></td>
+            <td>High-confidence corroborated fact verified across independent tools.</td>
+            <td>$\ge 2$ independent tool collectors confirming exact predicate.</td>
+          </tr>
+          <tr>
+            <td><span class="pres-pill" style="border-color: var(--accent-amber); color: var(--accent-amber);">SINGLE_SOURCE_LEAD</span></td>
+            <td>Unverified lead requiring analyst follow-up.</td>
+            <td>1 tool output; clearly flagged with source artifact.</td>
+          </tr>
+          <tr>
+            <td><span class="pres-pill">HYPOTHESIS</span></td>
+            <td>Bounded speculative permutation (e.g. probable email handles).</td>
+            <td>Artifact-free candidate; confidence capped at $\le 0.35$.</td>
+          </tr>
+          <tr>
+            <td><span class="pres-pill" style="border-color: var(--accent-rose); color: var(--accent-rose);">CONTRADICTED</span></td>
+            <td>Mutually exclusive conflict detected on a functional predicate.</td>
+            <td>Alerts analyst immediately for human-in-the-loop review.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="card-box" style="margin-top: 1rem;">
+        <h4 style="color: var(--accent); font-size: 0.95rem; margin-bottom: 0.35rem;">v2.1.0 Precision Enhancements:</h4>
+        <p style="font-size: 0.88rem; color: var(--text-muted);">
+          • <strong>Multi-Valued HAS_EMAIL:</strong> Eliminates artificial contradictions when a target has both personal and work emails.<br/>
+          • <strong>Entity Deduplication:</strong> <code>_unify_duplicate_persons</code> links verified GitHub/Twitter handles directly to the primary subject.<br/>
+          • <strong>Infrastructure Tagging:</strong> <code>gmail.com</code> and <code>*@users.noreply.github.com</code> tagged as infrastructure to avoid fake ownership claims.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 5: Defensive Security -->
+  <div class="slide-container" data-notes="Security and compliance are non-negotiable at PROSOL. AI OSINT Hub includes code-enforced pre-spawn SSRF checks that validate hostnames, block loopback and RFC 1918 ranges, and re-validate every single redirect hop. We also deliberately policy-block intrusive attack tools like Hydra, displaying them honestly as BLOCKED so analysts never run unauthorized attacks.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Enterprise Security Posture</div>
+        <h2>Defensive Boundaries & SSRF Sandboxing</h2>
+      </div>
+      <span class="pres-pill">05 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div class="card-box">
+        <h3>🔒 Pre-Spawn SSRF Guard (assert_safe_host)</h3>
+        <ul class="feature-list" style="margin-top: 0.75rem;">
+          <li><strong>Loopback Blocking:</strong> Instantly rejects <code>127.0.0.0/8</code> and <code>::1</code>.</li>
+          <li><strong>Private Subnet Isolation:</strong> Blocks RFC 1918 internal subnets (<code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>).</li>
+          <li><strong>Cloud Metadata Protection:</strong> Forbids AWS/GCP link-local IPs (<code>169.254.169.254</code>).</li>
+          <li><strong>Redirect Hop Re-validation:</strong> Manual redirect loops re-run full IP validation on every HTTP 30x response.</li>
+        </ul>
+      </div>
+      <div class="card-box">
+        <h3>🛡️ Policy Gating & Prompt Injection Defense</h3>
+        <ul class="feature-list" style="margin-top: 0.75rem;">
+          <li><strong>Hydra Policy Block:</strong> Intrusive brute-force tools are strictly gated (<code>INTRUSIVE_BLOCKED</code>) and show honestly as <code>BLOCKED</code>.</li>
+          <li><strong>Shell-Free Execution:</strong> Zero <code>shell=True</code>. All subprocesses run via <code>stdin=DEVNULL</code>, eliminating command injection.</li>
+          <li><strong>Prompt Injection Quarantine:</strong> External scraped strings are sanitized and isolated inside <code>&lt;untrusted_osint_data&gt;</code> tags.</li>
+          <li><strong>Zero Client XSS:</strong> Web UI uses safe DOM text assignment with zero <code>innerHTML</code> or <code>eval</code>.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 6: Visual Forensics -->
+  <div class="slide-container" data-notes="Visual intelligence was a major focus in v2.1.0. The engine automatically harvests avatars from GitHub, Gravatar, and social OpenGraph tags in a safe, size-capped sandbox. It then extracts EXIF/GPS metadata and computes 64-bit perceptual hashes (dHash and pHash). This allows the system to automatically prove that two disparate accounts belong to the same threat actor, even if they used different pseudonyms.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">v2.1.0 Innovation</div>
+        <h2>Visual Forensics & Cross-Platform Avatar Correlation</h2>
+      </div>
+      <span class="pres-pill">06 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div>
+        <h3 style="color: var(--accent); margin-bottom: 0.75rem;">Automated Perceptual Hashing (pHash)</h3>
+        <p style="color: var(--text-muted); font-size: 0.92rem; margin-bottom: 1rem;">
+          When investigating threat actors across forums, GitHub, and social media, avatars are often resized or re-encoded. Perceptual hashing calculates visual frequency fingerprints invariant to scaling or compression.
+        </p>
+        <div class="card-box" style="font-size: 0.88rem; font-family: var(--font-mono); margin-bottom: 1rem;">
+          <div>[GitHub Avatar]  -> 0x8f7e3c1a9b2d4e6f</div>
+          <div>[Gravatar Photo] -> 0x8f7e3c1a9b2d4e6f</div>
+          <div style="color: var(--accent-emerald); font-weight: 700; margin-top: 4px;">=> Distance: 0 (Exact Visual Match Detected)</div>
+        </div>
+        <ul class="feature-list">
+          <li>Extracts EXIF camera metadata and GPS coordinates when available.</li>
+          <li>Supports manual analyst drag-and-drop file upload for local forensics.</li>
+          <li>Preserved in cryptographic <code>.osintcase.zip</code> export bundles.</li>
+        </ul>
+      </div>
+      <div>
+        <img src="assets/workbench-visuals.png" alt="Visuals Workbench" class="img-preview"/>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 7: 32-Tool Capability Matrix -->
+  <div class="slide-container" data-notes="We support 32 specialized capabilities across 4 tiers. Tier 1 requires zero external binaries and runs completely Python-native. Tier 2 connects to Shodan, Censys, and GitHub with automated key redaction. Tier 3 provisions managed virtual environments with redirected home directories to prevent workstation contamination. Tier 4 provides network inspection via Windows or native WSL2 bridging.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Reconnaissance Depth</div>
+        <h2>32-Tool Enterprise Capability Matrix</h2>
+      </div>
+      <span class="pres-pill">07 / 12</span>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2" style="margin-bottom: 1.25rem;">
+        <div class="card-box">
+          <h3 style="font-size: 1rem;">Tier 1: 13 Passive Native Collectors</h3>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Pure async HTTP, zero external binaries, instant readiness:</p>
+          <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-emerald);">
+            dns_lookup • virustotal • tls_cert • rdap • crtsh • asn_bgp • favicon_hash • media_forensics • photon • wayback • gravatar • openpgp • ahmia
+          </div>
+        </div>
+        <div class="card-box">
+          <h3 style="font-size: 1rem;">Tier 2: Authenticated Intelligence APIs</h3>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Key vault with automatic redaction from logs and artifacts:</p>
+          <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent);">
+            shodan_lookup • censys_lookup (v3 Platform) • github_osint
+          </div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card-box">
+          <h3 style="font-size: 1rem;">Tier 3: Managed Sandboxed OSINT CLIs</h3>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Isolated venvs with redirected user home directories:</p>
+          <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-amber);">
+            theharvester • holehe • sherlock • maigret • phoneinfoga • ghunt • h8mail
+          </div>
+        </div>
+        <div class="card-box">
+          <h3 style="font-size: 1rem;">Tier 4: System & Network Diagnostics</h3>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Windows PATH with seamless WSL2 Ubuntu fallback:</p>
+          <div style="font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted);">
+            whois • dig • nmap (passive) • traceroute • snscrape
+          </div>
+        </div>
+      </div>
+      <div style="margin-top: 1rem; text-align: center; font-size: 0.85rem; color: var(--text-muted);">
+        Verified via <code>python -m hub.cli doctor</code>: <strong>32/32 Available & Healthy</strong> on the reference host.
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 8: Enterprise Workbench UI -->
+  <div class="slide-container" data-notes="Our web interface was rebuilt from the ground up for SOC ergonomics. It works equally well on a 13-inch analyst laptop in the field or an ultrawide SOC command wall. It includes 4 enterprise themes, with Clean Light as the default Linear-style palette. The Overview tab highlights verified accounts first, the Cytoscape graph prevents label collision with solid matte pills, and dossiers export instantly to HTML or zip.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Analyst Ergonomics</div>
+        <h2>Enterprise Workbench UI: Multi-Screen & 4 Themes</h2>
+      </div>
+      <span class="pres-pill">08 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div>
+        <h3 style="color: var(--accent); margin-bottom: 0.5rem;">Designed for SOC Production</h3>
+        <ul class="feature-list" style="margin-bottom: 1rem;">
+          <li><strong>Overview First:</strong> Verified accounts, emails, and repositories highlighted immediately.</li>
+          <li><strong>Cytoscape 'cose' Graph:</strong> Force-directed spring relaxation with solid matte label pills ensuring zero label collision.</li>
+          <li><strong>Responsive Layout:</strong> Flexbox rail + container architecture scales cleanly from 1280×800 to 4K ultrawides.</li>
+          <li><strong>1-Click Export:</strong> Print-ready HTML dossiers and cryptographically hashed <code>.osintcase.zip</code> bundles.</li>
+        </ul>
+        <div class="card-box">
+          <div style="font-weight: 700; font-size: 0.9rem; margin-bottom: 0.25rem;">4 Enterprise Themes:</div>
+          <div style="font-size: 0.82rem; color: var(--text-muted);">
+            • <strong>Clean Light (Default):</strong> Crisp white/slate Linear style.<br/>
+            • <strong>Midnight Slate:</strong> Low-contrast 24/7 dark watch floor mode.<br/>
+            • <strong>Warm Paper:</strong> Soft reading parchment.<br/>
+            • <strong>Gruvbox Dark:</strong> Classic terminal contrast.
+          </div>
+        </div>
+      </div>
+      <div>
+        <img src="assets/workbench-overview.png" alt="Workbench Overview" class="img-preview"/>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 9: Pragmatic AI Integration -->
+  <div class="slide-container" data-notes="We deliberately rejected the '10,000 configuration knobs' approach to AI. By default, the engine uses ZERO LLMs—everything runs deterministically. When AI is enabled, we offer [local-ai] via fastembed ONNX Runtime, requiring no external processes or GPU. Crucially, any AI insight is strictly tagged AI_INFERRED with confidence capped at 0.35, ensuring AI acts as an assistant, never an unverified authority.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Balanced Machine Learning</div>
+        <h2>Pragmatic, Local-First AI Integration</h2>
+      </div>
+      <span class="pres-pill">09 / 12</span>
+    </div>
+    <div class="slide-body grid-3">
+      <div class="card-box">
+        <h3 style="font-size: 1.05rem;">1. Deterministic Core (Default)</h3>
+        <p style="font-size: 0.88rem; color: var(--text-muted); margin-top: 0.5rem;">
+          <strong>Zero LLM dependencies.</strong> Entity resolution, confidence math, and graph building execute 100% via SQLite and deterministic Python rules. Zero token cost, zero latency, zero hallucinations.
+        </p>
+      </div>
+      <div class="card-box" style="border: 1px solid var(--accent);">
+        <h3 style="font-size: 1.05rem; color: var(--accent);">2. Built-in [local-ai] (ONNX)</h3>
+        <p style="font-size: 0.88rem; color: var(--text-muted); margin-top: 0.5rem;">
+          Powered by <code>fastembed</code>. Runs completely local text embeddings and CLIP visual similarity inside the Python process. <strong>No Ollama daemon, no external server, no GPU needed.</strong>
+        </p>
+      </div>
+      <div class="card-box">
+        <h3 style="font-size: 1.05rem;">3. BYOK Cloud / Local LLMs</h3>
+        <p style="font-size: 0.88rem; color: var(--text-muted); margin-top: 0.5rem;">
+          Supports Ollama, LM Studio, Google Gemini, DeepSeek, and OpenAI-compatible endpoints for executive briefing synthesis. All outputs strictly bounded as <code>AI_INFERRED</code>.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 10: Live Demo Script -->
+  <div class="slide-container" data-notes="For the live demo during the interview, I follow this 3-step sequence. First, run 'python -m hub.cli doctor' to prove all 32 tools are healthy. Second, run 'python -m hub.cli demo' to seed our synthetic case. Third, run 'python -m hub.cli web --open' to launch the browser. In 60 seconds, the interviewers see the unified subject card, the pHash avatar match, and the interactive graph.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Technical Demonstration</div>
+        <h2>Live Demonstration Script (5-Minute Walkthrough)</h2>
+      </div>
+      <span class="pres-pill">10 / 12</span>
+    </div>
+    <div class="slide-body">
+      <p style="color: var(--text-muted); margin-bottom: 1rem;">
+        Complete, deterministic offline demonstration script using synthetic case <code>case_demo_aurora</code>:
+      </p>
+      <pre class="code-block">
+# 1. Verify system toolchain integrity (Expected: 32/32 AVAILABLE)
+python -m hub.cli doctor
+
+# 2. Seed synthetic demonstration case (Aurora Vance - Threat Actor Profile)
+python -m hub.cli demo
+
+# 3. Launch Web Workbench with automated browser opening
+python -m hub.cli web --open
+      </pre>
+      <div class="grid-3" style="margin-top: 1rem;">
+        <div class="card-box">
+          <strong>Step 1: Overview Tab</strong>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">Demonstrate unified identity card, verified accounts (GitHub, Twitter, Keybase), and email infrastructure separation.</p>
+        </div>
+        <div class="card-box">
+          <strong>Step 2: Visuals Tab</strong>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">Show the exact perceptual hash match between GitHub and Gravatar avatars proving cross-platform attribution.</p>
+        </div>
+        <div class="card-box">
+          <strong>Step 3: Graph & Export</strong>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">Navigate the Cytoscape correlation graph and trigger 1-click export of the HTML client dossier.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SLIDE 11: Value to PROSOL -->
+  <div class="slide-container" data-notes="How does this directly benefit PROSOL? In CTI, it slashes threat actor profiling from 4 hours to 90 seconds. In Incident Response, it rapidly assesses external footprints of leaked employee credentials. In Red Teaming, it enforces auditable passive boundaries. And in SOC operations, it produces client-ready executive dossiers with zero extra formatting.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Operational Alignment</div>
+        <h2>Direct Value Proposition for PROSOL Business Units</h2>
+      </div>
+      <span class="pres-pill">11 / 12</span>
+    </div>
+    <div class="slide-body">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>PROSOL Department</th>
+            <th>Current Operational Friction</th>
+            <th>AI OSINT Hub Value Delivery</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Cyber Threat Intelligence (CTI)</strong></td>
+            <td>Manual actor profiling takes 3–5 hours across browser tabs.</td>
+            <td>Automated pivot engine correlates handles, emails, and PGP keys in <strong>&lt; 90 seconds</strong>.</td>
+          </tr>
+          <tr>
+            <td><strong>Incident Response & DFIR</strong></td>
+            <td>Assessing external exposure of leaked executive credentials is slow.</td>
+            <td>Rapidly maps exposed GitHub repositories, public keys, and corporate email infrastructure.</td>
+          </tr>
+          <tr>
+            <td><strong>Red Team & Pen Testing</strong></td>
+            <td>Passive recon risks exceeding authorized scope or triggering alerts.</td>
+            <td>Enforces strict passive-first rules, pre-spawn SSRF checks, and immutable execution ledgers.</td>
+          </tr>
+          <tr>
+            <td><strong>SOC & MDR Reporting</strong></td>
+            <td>Formatting client-facing attribution reports consumes analyst hours.</td>
+            <td>Generates presentation-grade HTML/PDF dossiers with cryptographic evidence citations.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- SLIDE 12: Candidate Defense & Conclusion -->
+  <div class="slide-container" data-notes="In conclusion, I am excited about the opportunity to bring this level of architecture and security engineering to PROSOL. I don't just run tools—I design scalable, hardened platforms that make analysts faster and client deliverables more accurate. Thank you, and I look forward to your questions.">
+    <div class="slide-header">
+      <div>
+        <div class="slide-cat">Interview Conclusion</div>
+        <h2>Why Hamid Aliyev is Ready for PROSOL</h2>
+      </div>
+      <span class="pres-pill">12 / 12</span>
+    </div>
+    <div class="slide-body grid-2">
+      <div>
+        <h3 style="color: var(--accent); margin-bottom: 0.75rem;">Engineering & Security Excellence:</h3>
+        <ul class="feature-list" style="margin-bottom: 1.25rem;">
+          <li><strong>Deep Systems Architecture:</strong> Proven ability to architect asynchronous Python engines, SQLite transaction models, and multi-tier tool execution pipelines.</li>
+          <li><strong>Defensive-First Mindset:</strong> Built-in SSRF validation, policy gates, input sanitization, and cryptographic auditing in every module.</li>
+          <li><strong>Production-Tested Quality:</strong> 745 automated tests, 32/32 healthy tools, clean Docker builds, and zero regression failures.</li>
+          <li><strong>Operational Empathy:</strong> Designed with deep respect for analyst workflows, ergonomics, and actionable client reporting.</li>
+        </ul>
+        <div style="font-size: 1rem; font-weight: 700; color: var(--accent-emerald);">
+          Ready to contribute to PROSOL's national and enterprise mission on Day One.
+        </div>
+      </div>
+      <div class="card-box" style="display: flex; flex-direction: column; justify-content: center; background: rgba(37,99,235,0.05);">
+        <h4 style="color: var(--accent); margin-bottom: 0.5rem;">Anticipated Technical Defense:</h4>
+        <div style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5;">
+          <strong>Q: "Why not use Maltego?"</strong><br/>
+          A: Maltego is a manual UI visualizer with proprietary licenses. AI OSINT Hub is an autonomous async engine with mathematical truth scoring and zero vendor lock-in.<br/><br/>
+          <strong>Q: "How do you protect investigator OPSEC?"</strong><br/>
+          A: Passive tools query replicated public indices without touching target servers. All HTTP traffic supports corporate SOCKS5/VPN proxy routing.
+        </div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- Bottom Speaker Notes Panel (Toggled via 'N' or button) -->
+<div id="speaker-notes-panel">
+  <div class="notes-badge">SPEAKER NOTES (Private Rehearsal View)</div>
+  <div id="notes-content">Loading speaker notes...</div>
+</div>
+
+<!-- Bottom Presentation Footer -->
+<footer class="pres-footer">
+  <div>
+    <strong>AI OSINT Hub v2.1.0</strong> • Presentation for PROSOL
+  </div>
+  <div class="progress-bar-wrap">
+    <div class="progress-bar-fill" id="progress-bar"></div>
+  </div>
+  <div>
+    Slide <span id="current-slide-num">1</span> of <span id="total-slide-num">12</span>
+  </div>
+</footer>
+
+<script>
+  let currentSlide = 0;
+  const slides = document.querySelectorAll('.slide-container');
+  const totalSlides = slides.length;
+  document.getElementById('total-slide-num').textContent = totalSlides;
+
+  function updateSlide() {
+    slides.forEach((s, idx) => {
+      s.classList.toggle('active', idx === currentSlide);
+    });
+    document.getElementById('current-slide-num').textContent = currentSlide + 1;
+    const pct = ((currentSlide + 1) / totalSlides) * 100;
+    document.getElementById('progress-bar').style.width = pct + '%';
+    
+    // Update speaker notes
+    const activeSlide = slides[currentSlide];
+    const notes = activeSlide.getAttribute('data-notes') || 'No specific notes for this slide.';
+    document.getElementById('notes-content').textContent = notes;
+  }
+
+  function nextSlide() {
+    if (currentSlide < totalSlides - 1) {
+      currentSlide++;
+      updateSlide();
+    }
+  }
+
+  function prevSlide() {
+    if (currentSlide > 0) {
+      currentSlide--;
+      updateSlide();
+    }
+  }
+
+  function toggleNotes() {
+    const panel = document.getElementById('speaker-notes-panel');
+    panel.classList.toggle('open');
+  }
+
+  function toggleTheme() {
+    const current = document.body.getAttribute('data-theme') || 'dark';
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.body.setAttribute('data-theme', next);
+  }
+
+  function toggleFullScreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    }
+  }
+
+  // Keyboard navigation
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') {
+      e.preventDefault();
+      nextSlide();
+    } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+      e.preventDefault();
+      prevSlide();
+    } else if (e.key.toLowerCase() === 'n') {
+      toggleNotes();
+    } else if (e.key.toLowerCase() === 't') {
+      toggleTheme();
+    } else if (e.key.toLowerCase() === 'f') {
+      toggleFullScreen();
+    }
+  });
+
+  // Initialize
+  updateSlide();
+</script>
+
+</body>
+</html>
